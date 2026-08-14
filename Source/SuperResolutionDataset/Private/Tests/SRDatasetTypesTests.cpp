@@ -24,6 +24,12 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("LR larger than HR is rejected"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
+	Job.AuxiliaryCaptureOrder = ESRDatasetAuxiliaryCaptureOrder::LowResolutionFirst;
+	TestFalse(TEXT("Low-resolution-first rejects a derived LR image with no render submission"), Job.Validate(Error));
+	Job.LRMode = ESRDatasetLRMode::NativeRender;
+	TestTrue(TEXT("Low-resolution-first accepts an independently rendered LR view"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
 	Job.StreamingWaitSeconds = 0.0f;
 	TestFalse(TEXT("Enabled streaming barrier rejects a zero timeout"), Job.Validate(Error));
 	Job.bBlockOnStreamingBeforeCapture = false;

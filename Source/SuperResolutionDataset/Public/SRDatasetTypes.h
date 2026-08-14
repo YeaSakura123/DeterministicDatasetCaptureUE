@@ -40,6 +40,17 @@ enum class ESRDatasetReplayPass : uint8
 };
 
 /**
+ * Order of the isolated SceneCapture submissions around a logical sample.
+ * Running the same job once per order is the capture-order invariance gate.
+ */
+UENUM(BlueprintType)
+enum class ESRDatasetAuxiliaryCaptureOrder : uint8
+{
+	HighResolutionFirst,
+	LowResolutionFirst
+};
+
+/**
  * A serializable capture job. The same struct is accepted by Blueprint and by
  * the -SRDatasetJob=<json-file> command-line entry point.
  */
@@ -107,6 +118,13 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
 	ESRDatasetResizeFilter ResizeFilter = ESRDatasetResizeFilter::CubicMitchell;
+
+	/**
+	 * Controls the actual isolated SceneCapture submission order. LowResolutionFirst
+	 * is intended for the paired capture-order validation and requires NativeRender.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation")
+	ESRDatasetAuxiliaryCaptureOrder AuxiliaryCaptureOrder = ESRDatasetAuxiliaryCaptureOrder::HighResolutionFirst;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
 	bool bCaptureDepth = true;

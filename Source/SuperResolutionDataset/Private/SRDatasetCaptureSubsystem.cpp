@@ -1227,18 +1227,34 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 	}
 	else
 	{
-		RenderSubmissions.Add(TEXT("hr"), NextRenderSubmissionId++);
-		if (ActiveJob.bCaptureReferenceHR)
+		const auto RecordHighResolutionSubmissions = [&]()
 		{
-			RenderSubmissions.Add(TEXT("hr_reference"), NextRenderSubmissionId++);
+			RenderSubmissions.Add(TEXT("hr"), NextRenderSubmissionId++);
+			if (ActiveJob.bCaptureReferenceHR)
+			{
+				RenderSubmissions.Add(TEXT("hr_reference"), NextRenderSubmissionId++);
+			}
+		};
+		const auto RecordLowResolutionSubmissions = [&]()
+		{
+			if (ActiveJob.LRMode == ESRDatasetLRMode::NativeRender)
+			{
+				RenderSubmissions.Add(TEXT("lr"), NextRenderSubmissionId++);
+			}
+			if (ActiveJob.bCaptureDepth)
+			{
+				RenderSubmissions.Add(TEXT("depth"), NextRenderSubmissionId++);
+			}
+		};
+		if (ActiveJob.AuxiliaryCaptureOrder == ESRDatasetAuxiliaryCaptureOrder::LowResolutionFirst)
+		{
+			RecordLowResolutionSubmissions();
+			RecordHighResolutionSubmissions();
 		}
-		if (ActiveJob.LRMode == ESRDatasetLRMode::NativeRender)
+		else
 		{
-			RenderSubmissions.Add(TEXT("lr"), NextRenderSubmissionId++);
-		}
-		if (ActiveJob.bCaptureDepth)
-		{
-			RenderSubmissions.Add(TEXT("depth"), NextRenderSubmissionId++);
+			RecordHighResolutionSubmissions();
+			RecordLowResolutionSubmissions();
 		}
 		if (!CaptureRig->CaptureFrame(
 			ActiveJob,
@@ -1487,6 +1503,10 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		MotionTimeSpanFrames * ActiveJob.GetFixedDeltaSeconds());
 	Frame->SetBoolField(TEXT("motionTrainingUsable"), !bIntermediateReplay);
 	Frame->SetBoolField(TEXT("endpointPreviousTransformOverride"), ActiveJob.bUseLastCapturedEndpointTransforms);
+	Frame->SetStringField(
+		TEXT("auxiliaryCaptureOrder"),
+		StaticEnum<ESRDatasetAuxiliaryCaptureOrder>()->GetNameStringByValue(
+			static_cast<int64>(ActiveJob.AuxiliaryCaptureOrder)));
 	Frame->SetNumberField(TEXT("simulationTick"), FrameNumber);
 	Frame->SetNumberField(TEXT("simulationTimeS"), TimeSeconds);
 	Frame->SetNumberField(TEXT("deltaTimeS"), ActiveJob.GetFixedDeltaSeconds());
@@ -1537,23 +1557,23 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		TEXT("sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_state_cascade_component_state_not_particle_payload"));
 
 	TArray<TSharedPtr<FJsonValue>> SubmissionArray;
-	for (const TCHAR* Modality : {
-		TEXT("hr"), TEXT("hr_reference"), TEXT("lr"), TEXT("depth"), TEXT("main_view_temporal") })
+	TArray<FString> SubmissionModalities;
+	RenderSubmissions.GetKeys(SubmissionModalities);
+	SubmissionModalities.Sort([&RenderSubmissions](const FString& Left, const FString& Right)
 	{
-		const int64* SubmissionId = RenderSubmissions.Find(Modality);
-		if (!SubmissionId)
-		{
-			continue;
-		}
+		return RenderSubmissions.FindChecked(Left) < RenderSubmissions.FindChecked(Right);
+	});
+	for (const FString& Modality : SubmissionModalities)
+	{
 		TSharedRef<FJsonObject> Submission = MakeShared<FJsonObject>();
 		Submission->SetStringField(TEXT("modality"), Modality);
-		Submission->SetNumberField(TEXT("renderSubmissionId"), *SubmissionId);
+		Submission->SetNumberField(TEXT("renderSubmissionId"), RenderSubmissions.FindChecked(Modality));
 		Submission->SetBoolField(TEXT("simulationAdvance"), false);
 		Submission->SetStringField(
 			TEXT("viewState"),
-			FCString::Strcmp(Modality, TEXT("main_view_temporal")) == 0
+			Modality == TEXT("main_view_temporal")
 				? TEXT("player_main_view")
-				: FString(Modality) + TEXT("_scene_capture"));
+				: Modality + TEXT("_scene_capture"));
 		SubmissionArray.Add(MakeShared<FJsonValueObject>(Submission));
 	}
 	Frame->SetArrayField(TEXT("renderSubmissions"), SubmissionArray);
@@ -1898,7 +1918,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.3.1"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.3.2"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -1988,6 +2008,13 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Contract->SetStringField(
 		TEXT("replayPass"),
 		StaticEnum<ESRDatasetReplayPass>()->GetNameStringByValue(static_cast<int64>(ActiveJob.ReplayPass)));
+	Contract->SetStringField(
+		TEXT("auxiliaryCaptureOrder"),
+		StaticEnum<ESRDatasetAuxiliaryCaptureOrder>()->GetNameStringByValue(
+			static_cast<int64>(ActiveJob.AuxiliaryCaptureOrder)));
+	Contract->SetStringField(
+		TEXT("captureOrderInvarianceProtocol"),
+		TEXT("separate_process_high_resolution_first_vs_low_resolution_first_normalized_provenance_and_numeric_comparison"));
 	Contract->SetBoolField(TEXT("uncapturedMainViewSuppressed"), ActiveJob.bSuppressMainViewOnUncapturedFrames);
 	Contract->SetStringField(
 		TEXT("endpointPreviousTransformScope"),

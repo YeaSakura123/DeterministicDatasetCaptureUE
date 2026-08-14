@@ -60,6 +60,12 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("bCaptureTemporalDiagnostics requires LRMode=NativeRender so Velocity, Depth and HDR Color come from the real LR view.");
 		return false;
 	}
+	if (AuxiliaryCaptureOrder == ESRDatasetAuxiliaryCaptureOrder::LowResolutionFirst &&
+		LRMode != ESRDatasetLRMode::NativeRender)
+	{
+		OutError = TEXT("LowResolutionFirst requires LRMode=NativeRender because a derived LR image has no independent render submission to reorder.");
+		return false;
+	}
 	if (bCaptureMainViewTemporalDiagnostics && !bCaptureTemporalDiagnostics)
 	{
 		OutError = TEXT("bCaptureMainViewTemporalDiagnostics requires bCaptureTemporalDiagnostics=true.");

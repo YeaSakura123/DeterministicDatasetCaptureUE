@@ -24,7 +24,8 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Isolated non-jittered native HR and 2x-4x supersampled/downsampled reference HR.
 - [x] After-tonemap, pre-Slate/UI display-resolution Main View color.
 - [x] Logical-frame/render-submission IDs and per-frame engine/GPU/CVar/content/shader provenance.
-- [ ] Complete pixel-domain Main View/native/reference comparison and capture-order invariance.
+- [ ] Complete pixel-domain Main View/native/reference comparison.
+- [x] Prove auxiliary capture-order invariance with actual reversed submissions and a paired-process hard gate.
 - [x] Record the GPU View Uniform Mip bias, fixed LOD/scalability CVar profile, streaming barrier and resident-texture state hash.
 - [x] Export experimental motion-reprojected history rejection plus a per-pixel validity mask, with reset/ID/static-depth semantic tests.
 - [ ] Export production disocclusion, instance ID, normals, albedo and material/semantic IDs.
@@ -89,3 +90,14 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - Captured scope: 81 actors, 99 components, two skeletal components and 178 component-space bones.
 - Scene hashes changed between logical frames and matched exactly across processes.
 - Seven ticking actors without `SRDatasetControllable` are listed by path/class for preflight audit.
+
+## Version 0.3.2 capture-order invariance snapshot
+
+- UE 5.7 Development Editor build passed; automation job validation passed 1/1 with zero test warnings/errors.
+- Actual order A: `HR -> Reference -> LR -> Depth -> Main View`.
+- Actual order B: `LR -> Depth -> HR -> Reference -> Main View`.
+- Standalone order-A dataset: 406/406 required checks.
+- Paired order comparison: 574/574 required checks.
+- All 30 non-color modality/frame pairs were byte-exact; worst HUD-less color was 59.1 dB PSNR.
+- FG endpoint/intermediate regressions passed 410/410 and 213/213 checks; the assembled pair passed 103/103 integrity checks and remains intentionally uncertified.
+- This closes the deterministic semantic-fixture gate, not yet the required non-fixture production-scene coverage gate.

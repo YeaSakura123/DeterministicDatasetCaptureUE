@@ -20,6 +20,7 @@
   },
   "lRMode": "NativeRender",
   "resizeFilter": "CubicMitchell",
+  "auxiliaryCaptureOrder": "HighResolutionFirst",
   "bCaptureDepth": true,
   "bCaptureTemporalDiagnostics": true,
   "bCaptureMainViewTemporalDiagnostics": true,
