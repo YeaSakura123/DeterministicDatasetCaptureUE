@@ -40,6 +40,21 @@ protected:
 	virtual bool DoesSupportWorldType(const EWorldType::Type WorldType) const override;
 
 private:
+	struct FSceneStateSummary
+	{
+		FString Sha1;
+		int32 ActorCount = 0;
+		int32 ComponentCount = 0;
+		int32 SkeletalComponentCount = 0;
+		int32 BoneCount = 0;
+		int32 FXComponentCount = 0;
+		int32 NiagaraComponentCount = 0;
+		int32 ControllableActorCount = 0;
+		int32 UncontrolledTickingActorCount = 0;
+		TArray<FString> ControllableActors;
+		TArray<FString> UncontrolledTickingActors;
+	};
+
 	struct FNiagaraComponentState
 	{
 		uint8 AgeUpdateMode = 0;
@@ -71,6 +86,7 @@ private:
 	void SnapshotProvenance();
 	bool EnsureStreamingReady(FString& OutError);
 	FString ComputeStreamingStateSha1(int32& OutTextureCount, int32& OutPendingTextureCount) const;
+	FSceneStateSummary ComputeSceneStateSummary() const;
 	void DiscoverAndControlNiagara(float TimeSeconds);
 	void RestoreNiagara();
 	void NotifyControllablesPrepare();

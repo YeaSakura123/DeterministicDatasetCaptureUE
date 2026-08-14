@@ -424,6 +424,22 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                 streaming_hashes_valid and len(set(streaming_values)) == 1,
                 json.dumps(streaming_hashes, sort_keys=True),
             )
+            scene_hashes = pair.get("sceneStateSha1", {})
+            scene_values = [str(scene_hashes.get(phase, "")) for phase in ("t0", "tau", "t1")]
+            scene_hashes_valid = all(
+                len(value) == 40
+                and all(character in "0123456789ABCDEFabcdef" for character in value)
+                for value in scene_values
+            )
+            add_check(
+                checks,
+                f"{prefix}.scene_state_timeline",
+                scene_hashes_valid
+                and len(set(scene_values)) == 3
+                and pair.get("sceneStateHashScope")
+                == "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_state_cascade_component_state_not_particle_payload",
+                json.dumps(scene_hashes, sort_keys=True),
+            )
 
             files = pair.get("files", {})
             hashes = pair.get("sha1", {})

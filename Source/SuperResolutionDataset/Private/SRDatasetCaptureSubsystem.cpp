@@ -11,6 +11,7 @@
 #include "Dom/JsonObject.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
+#include "Components/SkinnedMeshComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/Texture2D.h"
 #include "EngineUtils.h"
@@ -35,6 +36,7 @@
 #include "NiagaraCommon.h"
 #include "NiagaraComponent.h"
 #include "NiagaraSystem.h"
+#include "Particles/ParticleSystemComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "Rendering/MotionVectorSimulation.h"
 #include "TextureResource.h"
@@ -726,6 +728,146 @@ FString USRDatasetCaptureSubsystem::ComputeStreamingStateSha1(
 	return HashString(FString::Join(TextureStateLines, TEXT("\n")));
 }
 
+USRDatasetCaptureSubsystem::FSceneStateSummary USRDatasetCaptureSubsystem::ComputeSceneStateSummary() const
+{
+	FSceneStateSummary Summary;
+	if (!GetWorld())
+	{
+		return Summary;
+	}
+
+	const auto TransformString = [](const FTransform& Transform)
+	{
+		const FMatrix Matrix = Transform.ToMatrixWithScale();
+		FString Value;
+		for (int32 Row = 0; Row < 4; ++Row)
+		{
+			for (int32 Column = 0; Column < 4; ++Column)
+			{
+				if (!Value.IsEmpty())
+				{
+					Value += TEXT(",");
+				}
+				Value += FString::Printf(TEXT("%.17g"), Matrix.M[Row][Column]);
+			}
+		}
+		return Value;
+	};
+
+	TArray<FString> StateLines;
+	for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!IsValid(Actor))
+		{
+			continue;
+		}
+
+		++Summary.ActorCount;
+		const bool bControllable = Actor->GetClass()->ImplementsInterface(
+			USRDatasetControllable::StaticClass());
+		Summary.ControllableActorCount += bControllable ? 1 : 0;
+		Summary.UncontrolledTickingActorCount +=
+			Actor->IsActorTickEnabled() && !bControllable ? 1 : 0;
+		if (bControllable)
+		{
+			Summary.ControllableActors.Add(FString::Printf(
+				TEXT("%s|%s"), *Actor->GetPathName(), *Actor->GetClass()->GetPathName()));
+		}
+		if (Actor->IsActorTickEnabled() && !bControllable)
+		{
+			Summary.UncontrolledTickingActors.Add(FString::Printf(
+				TEXT("%s|%s"), *Actor->GetPathName(), *Actor->GetClass()->GetPathName()));
+		}
+		StateLines.Add(FString::Printf(
+			TEXT("actor|%s|class=%s|transform=%s|hidden=%d|tick=%d|controllable=%d"),
+			*Actor->GetPathName(),
+			*Actor->GetClass()->GetPathName(),
+			*TransformString(Actor->GetActorTransform()),
+			Actor->IsHidden() ? 1 : 0,
+			Actor->IsActorTickEnabled() ? 1 : 0,
+			bControllable ? 1 : 0));
+
+		TInlineComponentArray<UActorComponent*> Components;
+		Actor->GetComponents(Components);
+		for (UActorComponent* Component : Components)
+		{
+			if (!IsValid(Component))
+			{
+				continue;
+			}
+			++Summary.ComponentCount;
+			const USceneComponent* SceneComponent = Cast<USceneComponent>(Component);
+			StateLines.Add(FString::Printf(
+				TEXT("component|%s|class=%s|active=%d|registered=%d|tick=%d|visible=%d|transform=%s"),
+				*Component->GetPathName(),
+				*Component->GetClass()->GetPathName(),
+				Component->IsActive() ? 1 : 0,
+				Component->IsRegistered() ? 1 : 0,
+				Component->PrimaryComponentTick.IsTickFunctionEnabled() ? 1 : 0,
+				SceneComponent && SceneComponent->IsVisible() ? 1 : 0,
+				SceneComponent ? *TransformString(SceneComponent->GetComponentTransform()) : TEXT("none")));
+
+			if (const USkinnedMeshComponent* Skinned = Cast<USkinnedMeshComponent>(Component))
+			{
+				++Summary.SkeletalComponentCount;
+				const TArray<FTransform>& BoneTransforms = Skinned->GetComponentSpaceTransforms();
+				Summary.BoneCount += BoneTransforms.Num();
+				StateLines.Add(FString::Printf(
+					TEXT("skinned|%s|asset=%s|bones=%d|revision=%u"),
+					*Skinned->GetPathName(),
+					Skinned->GetSkinnedAsset() ? *Skinned->GetSkinnedAsset()->GetPathName() : TEXT("none"),
+					BoneTransforms.Num(),
+					Skinned->GetBoneTransformRevisionNumber()));
+				for (int32 BoneIndex = 0; BoneIndex < BoneTransforms.Num(); ++BoneIndex)
+				{
+					StateLines.Add(FString::Printf(
+						TEXT("bone|%s|index=%d|name=%s|componentSpace=%s"),
+						*Skinned->GetPathName(),
+						BoneIndex,
+						*Skinned->GetBoneName(BoneIndex).ToString(),
+						*TransformString(BoneTransforms[BoneIndex])));
+				}
+			}
+
+			if (const UNiagaraComponent* Niagara = Cast<UNiagaraComponent>(Component))
+			{
+				++Summary.FXComponentCount;
+				++Summary.NiagaraComponentCount;
+				StateLines.Add(FString::Printf(
+					TEXT("niagara|%s|asset=%s|active=%d|ageMode=%d|desiredAge=%.9g|seedOffset=%d|forceSolo=%d|seekDelta=%.9g|maxSimTime=%.9g"),
+					*Niagara->GetPathName(),
+					Niagara->GetAsset() ? *Niagara->GetAsset()->GetPathName() : TEXT("none"),
+					Niagara->IsActive() ? 1 : 0,
+					static_cast<int32>(Niagara->GetAgeUpdateMode()),
+					Niagara->GetDesiredAge(),
+					Niagara->GetRandomSeedOffset(),
+					Niagara->GetForceSolo() ? 1 : 0,
+					Niagara->GetSeekDelta(),
+					Niagara->GetMaxSimTime()));
+			}
+			else if (const UParticleSystemComponent* Cascade = Cast<UParticleSystemComponent>(Component))
+			{
+				++Summary.FXComponentCount;
+				StateLines.Add(FString::Printf(
+					TEXT("cascade|%s|asset=%s|active=%d"),
+					*Cascade->GetPathName(),
+					Cascade->GetFXSystemAsset() ? *Cascade->GetFXSystemAsset()->GetPathName() : TEXT("none"),
+					Cascade->IsActive() ? 1 : 0));
+			}
+		}
+	}
+
+	StateLines.Sort([](const FString& Left, const FString& Right)
+	{
+		return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+	});
+	Summary.ControllableActors.Sort();
+	Summary.UncontrolledTickingActors.Sort();
+	Summary.Sha1 = HashString(FString::Join(StateLines, TEXT("\n")));
+	return Summary;
+}
+
 void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds)
 {
 	if (World != GetWorld() || !SRDataset::Private::IsRunningState(Status.State))
@@ -1364,6 +1506,35 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	Frame->SetNumberField(
 		TEXT("streamingRequestsWanting"),
 		IStreamingManager::HasShutdown() ? -1 : IStreamingManager::Get().GetNumWantingResources());
+	const FSceneStateSummary SceneState = ComputeSceneStateSummary();
+	Frame->SetStringField(TEXT("sceneStateSha1"), SceneState.Sha1);
+	Frame->SetNumberField(TEXT("sceneActorCount"), SceneState.ActorCount);
+	Frame->SetNumberField(TEXT("sceneComponentCount"), SceneState.ComponentCount);
+	Frame->SetNumberField(TEXT("sceneSkeletalComponentCount"), SceneState.SkeletalComponentCount);
+	Frame->SetNumberField(TEXT("sceneBoneCount"), SceneState.BoneCount);
+	Frame->SetNumberField(TEXT("sceneFXComponentCount"), SceneState.FXComponentCount);
+	Frame->SetNumberField(TEXT("sceneNiagaraComponentCount"), SceneState.NiagaraComponentCount);
+	Frame->SetNumberField(TEXT("sceneControllableActorCount"), SceneState.ControllableActorCount);
+	Frame->SetNumberField(
+		TEXT("sceneUncontrolledTickingActorCount"),
+		SceneState.UncontrolledTickingActorCount);
+	const auto StringArray = [](const TArray<FString>& Values)
+	{
+		TArray<TSharedPtr<FJsonValue>> JsonValues;
+		JsonValues.Reserve(Values.Num());
+		for (const FString& Value : Values)
+		{
+			JsonValues.Add(MakeShared<FJsonValueString>(Value));
+		}
+		return JsonValues;
+	};
+	Frame->SetArrayField(TEXT("sceneControllableActors"), StringArray(SceneState.ControllableActors));
+	Frame->SetArrayField(
+		TEXT("sceneUncontrolledTickingActors"),
+		StringArray(SceneState.UncontrolledTickingActors));
+	Frame->SetStringField(
+		TEXT("sceneStateHashScope"),
+		TEXT("sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_state_cascade_component_state_not_particle_payload"));
 
 	TArray<TSharedPtr<FJsonValue>> SubmissionArray;
 	for (const TCHAR* Modality : {
@@ -1727,7 +1898,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.3.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.3.1"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),

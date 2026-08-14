@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 5,
-	"VersionName": "0.3.0",
+	"Version": 6,
+	"VersionName": "0.3.1",
 	"FriendlyName": "Super Resolution Dataset",
 	"Description": "Deterministic scene replay with synchronized spatial, temporal, semantic and experimental frame-generation dataset capture.",
 	"Category": "Rendering",

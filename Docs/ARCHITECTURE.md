@@ -70,6 +70,8 @@ For a candidate scene:
 
 Cross-GPU bit-identical floating-point rendering is not guaranteed by Unreal. Training-set provenance should therefore also pin GPU model/driver, RHI, engine changelist, project commit and console-variable profile.
 
+Each frame also records a CPU scene-state SHA-1. Its sorted canonical input covers Actor identity/class/transform/visibility/tick/interface ownership, SceneComponent state/transforms, every current component-space skeletal bone transform, Niagara asset/age mode/desired age/seed/solo/seek settings and Cascade asset/activity. Actor paths that tick without `SRDatasetControllable` are emitted as an audit list. This proves the declared CPU/component state replays; it deliberately excludes Niagara/Cascade GPU particle payloads, material/WPO shader state, Chaos internal solver state and opaque third-party buffers.
+
 ## Temporal certification boundary
 
 The implementation now captures pre-exposed linear HDR Color, decoded raw Velocity and coverage, camera-completed current-to-previous Motion, device/linear depth plus validity, current/previous jitter, exact jittered/unjittered matrices, exposure/pre-exposure, reactive/transparency masks, Object ID and isolated HR native/reference outputs. It also blocks on engine streaming before the first sample, hashes sorted `UTexture2D` residency state per frame, snapshots Mip/LOD/streaming CVars and reads the actual material texture Mip bias from each GPU View Uniform. `nr-sr-data-v2` nevertheless remains disabled until production disocclusion, capture-order invariance, Main View/reference pixel-domain comparison and non-fixture scene coverage all pass. Adding placeholder metadata or renaming a SceneCapture output is not acceptable.
