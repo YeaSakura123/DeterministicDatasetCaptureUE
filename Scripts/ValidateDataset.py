@@ -33,6 +33,9 @@ TEMPORAL_MODALITIES = (
     "depth_device_raw",
     "depth_view_linear_meters",
     "depth_valid",
+    "depth_previous_reprojected_device",
+    "history_rejection_mask",
+    "history_rejection_valid",
     "translucency_after_dof_raw",
     "transparency_mask",
     "reactive_mask",
@@ -40,7 +43,13 @@ TEMPORAL_MODALITIES = (
 )
 REFERENCE_MODALITIES = ("color_hr_reference_scene_hdr",)
 HUDLESS_MODALITIES = ("color_main_view_hudless_after_tonemap",)
-MASK_MODALITIES = {"velocity_coverage", "motion_valid", "depth_valid"}
+MASK_MODALITIES = {
+    "velocity_coverage",
+    "motion_valid",
+    "depth_valid",
+    "history_rejection_mask",
+    "history_rejection_valid",
+}
 COLOR_MODALITIES = {"hr", "lr", "color_lr_scene_hdr"}
 COLOR_MODALITIES.add("color_hr_native_scene_hdr")
 COLOR_MODALITIES.add("color_hr_reference_scene_hdr")
@@ -507,11 +516,61 @@ def validate_temporal_frame(
     depth_device = pixels["depth_device_raw"][..., 0]
     depth_linear = pixels["depth_view_linear_meters"][..., 0]
     depth_valid = pixels["depth_valid"][..., 0]
+    depth_previous_reprojected = pixels["depth_previous_reprojected_device"][..., 0]
+    history_rejection = pixels["history_rejection_mask"][..., 0]
+    history_rejection_valid = pixels["history_rejection_valid"][..., 0]
     add_check(checks, f"{prefix}.velocity_coverage_channel", bool(np.array_equal(velocity_raw[..., 2], velocity_coverage)), "velocity_raw.B == velocity_coverage.R")
     add_check(checks, f"{prefix}.motion_coverage_channel", bool(np.array_equal(motion_full[..., 2], velocity_coverage)), "motion_full.B == velocity_coverage.R")
     add_check(checks, f"{prefix}.motion_valid_channel", bool(np.array_equal(motion_full[..., 3], motion_valid)), "motion_full.A == motion_valid.R")
     add_check(checks, f"{prefix}.velocity_valid_channel", bool(np.array_equal(velocity_raw[..., 3], motion_valid)), "velocity_raw.A == motion_valid.R")
     add_check(checks, f"{prefix}.invalid_depth_zero", bool(np.all(depth_linear[depth_valid == 0.0] == 0.0)), "linear depth is zero where invalid")
+    add_check(
+        checks,
+        f"{prefix}.previous_reprojected_depth_finite_nonnegative",
+        bool(np.isfinite(depth_previous_reprojected).all() and np.min(depth_previous_reprojected) >= 0.0),
+        f"min={float(np.min(depth_previous_reprojected)):.9g} max={float(np.max(depth_previous_reprojected)):.9g}",
+    )
+    add_check(
+        checks,
+        f"{prefix}.history_rejection_contract",
+        temporal.get("historyRejectionDefinition")
+        == "one_rejects_previous_history_at_motion_reprojected_pixel"
+        and temporal.get("historyRejectionSource")
+        == "custom_stencil_identity_else_static_camera_depth_reprojection_v1"
+        and temporal.get("historyRejectionTrainingUsable") is True
+        and temporal.get("historyRejectionRequiresValidityMask") is True
+        and temporal.get("historyRejectionProductionCertified") is False,
+        json.dumps(
+            {
+                key: temporal.get(key)
+                for key in (
+                    "historyRejectionDefinition",
+                    "historyRejectionSource",
+                    "historyRejectionTrainingUsable",
+                    "historyRejectionRequiresValidityMask",
+                    "historyRejectionProductionCertified",
+                )
+            },
+            sort_keys=True,
+        ),
+    )
+    if frame.get("reset") is True:
+        add_check(
+            checks,
+            f"{prefix}.history_rejection_reset",
+            bool(np.all(history_rejection == 1.0) and np.all(history_rejection_valid == 1.0)),
+            f"reject_mean={float(np.mean(history_rejection)):.9g} valid_mean={float(np.mean(history_rejection_valid)):.9g}",
+        )
+    else:
+        add_check(
+            checks,
+            f"{prefix}.history_rejection_nontrivial",
+            bool(
+                np.any((history_rejection == 0.0) & (history_rejection_valid == 1.0))
+                and np.any(history_rejection == 1.0)
+            ),
+            f"reject_fraction={float(np.mean(history_rejection)):.9g} valid_fraction={float(np.mean(history_rejection_valid)):.9g}",
+        )
 
     translucency = pixels["translucency_after_dof_raw"]
     transparency = pixels["transparency_mask"][..., 0]
@@ -1182,6 +1241,36 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
             int(np.count_nonzero(newly_occluded)) >= 4,
             f"newly_occluded_pixels={int(np.count_nonzero(newly_occluded))}",
         )
+        history_rejection = current_pixels["history_rejection_mask"][..., 0]
+        history_rejection_valid = current_pixels["history_rejection_valid"][..., 0]
+        stable_background = (previous_ids == background_id) & (current_ids == background_id)
+        revealed_count = int(np.count_nonzero(newly_revealed))
+        revealed_rejected = int(
+            np.count_nonzero(
+                newly_revealed
+                & (history_rejection == 1.0)
+                & (history_rejection_valid == 1.0)
+            )
+        )
+        stable_kept = int(
+            np.count_nonzero(
+                stable_background
+                & (history_rejection == 0.0)
+                & (history_rejection_valid == 1.0)
+            )
+        )
+        add_check(
+            checks,
+            f"frame_{frame_id:06d}.semantic_fixture.revealed_history_rejected",
+            revealed_count >= 4 and revealed_rejected / revealed_count >= 0.8,
+            f"revealed={revealed_count} rejected_valid={revealed_rejected}",
+        )
+        add_check(
+            checks,
+            f"frame_{frame_id:06d}.semantic_fixture.stable_history_retained",
+            stable_kept >= 8,
+            f"stable_background_kept_valid={stable_kept}",
+        )
 
     if compare is not None:
         other_manifest_path = compare / "manifest.json" if compare.is_dir() else compare
@@ -1300,7 +1389,7 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
         "checks": checks,
         "statistics": stats,
         "replayMetrics": replay_metrics,
-        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. When the semantic fixture is enabled it also validates object-motion direction/magnitude, 1/10/100 m depth, nonzero After-DOF transparency, and known occlusion/disocclusion geometry. Cross-replay checks require exact temporal/native-HR/reference-HR/HUD-less/semantic metadata. Capture-order invariance, a production disocclusion buffer, and Main View/reference-HR pixel equivalence remain separate gates.",
+        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. When the semantic fixture is enabled it also validates object-motion direction/magnitude, 1/10/100 m depth, nonzero After-DOF transparency, known occlusion/disocclusion geometry, and the experimental history-rejection signal. Cross-replay checks require exact temporal/native-HR/reference-HR/HUD-less/semantic metadata. Capture-order invariance, production certification of disocclusion for unlabeled/deforming geometry, and Main View/reference-HR pixel equivalence remain separate gates.",
     }
     return report, passed
 

@@ -253,6 +253,8 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
                 ("depth_t1", endpoint_dir, frame1, "depth_view_linear_meters"),
                 ("motion_1_to_0", endpoint_dir, frame1, "motion_full_current_to_previous"),
                 ("motion_valid_1_to_0", endpoint_dir, frame1, "motion_valid"),
+                ("history_rejection_1_to_0", endpoint_dir, frame1, "history_rejection_mask"),
+                ("history_rejection_valid_1_to_0", endpoint_dir, frame1, "history_rejection_valid"),
                 ("object_id_t0", endpoint_dir, frame0, "object_id"),
                 ("object_id_tau", intermediate_dir, frame_tau, "object_id"),
                 ("object_id_t1", endpoint_dir, frame1, "object_id"),
@@ -348,6 +350,13 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
                     "origin": "top_left",
                     "jitterRemoved": True,
                     "resolution": "render",
+                },
+                "historyRejection1To0": {
+                    "definition": "one_rejects_t0_history_at_t1_motion_reprojected_pixel",
+                    "source": "custom_stencil_identity_else_static_camera_depth_reprojection_v1",
+                    "validity": "history_rejection_valid_1_to_0",
+                    "resolution": "render",
+                    "productionCertified": False,
                 },
                 "objectId": {
                     "source": "custom_stencil_uint8_zero_unlabeled",
