@@ -1,0 +1,17 @@
+Binaries/
+Intermediate/
+Saved/
+.vs/
+.idea/
+.vscode/
+*.sln
+*.suo
+*.user
+*.VC.db
+*.dll
+*.lib
+*.pdb
+*.obj
+*.log
+Thumbs.db
+.DS_Store

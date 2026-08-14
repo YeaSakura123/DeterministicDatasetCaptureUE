@@ -1,0 +1,30 @@
+{
+  "jobName": "first_person_smoke",
+  "expectedMap": "/Game/FirstPerson/Lvl_FirstPerson",
+  "startFrame": 0,
+  "endFrame": 0,
+  "frameStep": 1,
+  "captureFrameRateNumerator": 30,
+  "captureFrameRateDenominator": 1,
+  "warmupFrames": 2,
+  "hRResolution": {
+    "x": 128,
+    "y": 72
+  },
+  "lRResolution": {
+    "x": 64,
+    "y": 36
+  },
+  "lRMode": "DownsampleFromHR",
+  "resizeFilter": "CubicMitchell",
+  "bCaptureDepth": true,
+  "outputDirectory": "Saved/SRDataset/smoke",
+  "bResume": false,
+  "bWriteManifestEveryFrame": true,
+  "randomSeed": 1337,
+  "bControlNiagara": true,
+  "bForceNiagaraDeterminism": true,
+  "bEnableChaosDeterminism": true,
+  "bDisableMotionBlur": true,
+  "bAutoQuit": true
+}
