@@ -1,13 +1,13 @@
 {
   "contractVersion": "spatial-sr-data-v1",
-  "jobName": "first_person_smoke",
+  "jobName": "first_person_main_view_temporal_diagnostics",
   "expectedMap": "/Game/FirstPerson/Lvl_FirstPerson",
   "startFrame": 0,
-  "endFrame": 0,
+  "endFrame": 1,
   "frameStep": 1,
   "captureFrameRateNumerator": 30,
   "captureFrameRateDenominator": 1,
-  "warmupFrames": 2,
+  "warmupFrames": 32,
   "hRResolution": {
     "x": 128,
     "y": 72
@@ -16,10 +16,12 @@
     "x": 64,
     "y": 36
   },
-  "lRMode": "DownsampleFromHR",
+  "lRMode": "NativeRender",
   "resizeFilter": "CubicMitchell",
   "bCaptureDepth": true,
-  "outputDirectory": "Saved/SRDataset/smoke",
+  "bCaptureTemporalDiagnostics": true,
+  "bCaptureMainViewTemporalDiagnostics": true,
+  "outputDirectory": "Saved/SRDataset/main_view_diagnostics",
   "bResume": false,
   "bWriteManifestEveryFrame": true,
   "randomSeed": 1337,

@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 2,
-	"VersionName": "0.1.1",
+	"Version": 3,
+	"VersionName": "0.2.0",
 	"FriendlyName": "Super Resolution Dataset",
-	"Description": "Deterministic scene replay and synchronized HR, LR, depth dataset capture.",
+	"Description": "Deterministic scene replay with synchronized spatial, temporal, semantic and experimental frame-generation dataset capture.",
 	"Category": "Rendering",
 	"CreatedBy": "UnrealCodeDemo",
 	"CanContainContent": false,
@@ -13,7 +13,7 @@
 		{
 			"Name": "SuperResolutionDataset",
 			"Type": "Runtime",
-			"LoadingPhase": "Default"
+			"LoadingPhase": "PostConfigInit"
 		}
 	],
 	"Plugins": [

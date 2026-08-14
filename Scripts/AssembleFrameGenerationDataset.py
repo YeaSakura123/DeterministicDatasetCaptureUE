@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Assemble isolated FG endpoint/intermediate replays without inventing missing buffers."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Any
+
+
+ENDPOINT_ROLE = "FrameGenerationEndpoints"
+INTERMEDIATE_ROLE = "FrameGenerationIntermediate"
+INTENTIONAL_CVAR_DIFFERENCES = {
+    "r.MotionVectorSimulation": {
+        "endpoints": "1",
+        "intermediate": "0",
+        "reason": (
+            "Endpoint replay preserves the last captured component transforms so t1 motion spans "
+            "the complete t0-to-t1 interval; the isolated intermediate replay must not do so."
+        ),
+    },
+}
+
+
+def sha1(path: Path) -> str:
+    digest = hashlib.sha1()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def canonical_sha1(value: Any) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest().upper()
+
+
+def require_capture(dataset: Path, role: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest_path = dataset / "manifest.json"
+    report_path = dataset / "validation_report.json"
+    if not manifest_path.is_file() or not report_path.is_file():
+        raise ValueError(f"capture and validation report are required: {dataset}")
+    manifest = load_json(manifest_path)
+    report = load_json(report_path)
+    if manifest.get("state") != "Completed":
+        raise ValueError(f"capture is not complete: {dataset}")
+    if manifest.get("replayPass") != role:
+        raise ValueError(f"expected replayPass={role}, found {manifest.get('replayPass')}: {dataset}")
+    required_failures = [
+        check for check in report.get("checks", [])
+        if check.get("required", True) and not check.get("passed", False)
+    ]
+    if report.get("formatAndIntegrityGate") != "pass" or required_failures:
+        raise ValueError(f"validation gate did not pass: {dataset}")
+    return manifest, report
+
+
+def compatible(endpoint: dict[str, Any], intermediate: dict[str, Any]) -> dict[str, Any]:
+    endpoint_job = endpoint["job"]
+    intermediate_job = intermediate["job"]
+    fields = (
+        "expectedMap",
+        "captureFrameRateNumerator",
+        "captureFrameRateDenominator",
+        "hRResolution",
+        "lRResolution",
+        "randomSeed",
+        "bDisableMotionBlur",
+        "bLockExposure",
+        "bForceSynchronousRendering",
+        "bEnableSemanticValidationFixture",
+    )
+    mismatches = [name for name in fields if endpoint_job.get(name) != intermediate_job.get(name)]
+    if mismatches:
+        raise ValueError(f"endpoint/intermediate job mismatch: {mismatches}")
+    endpoint_provenance = endpoint.get("provenance", {})
+    intermediate_provenance = intermediate.get("provenance", {})
+    provenance_fields = (
+        "engineVersion",
+        "engineChangelist",
+        "buildVersion",
+        "projectName",
+        "rhi",
+        "gpuAdapter",
+        "gpuVendorId",
+        "gpuDeviceId",
+        "contentMapSha1",
+        "shaderSourceSha1",
+    )
+    mismatches = [
+        name for name in provenance_fields
+        if endpoint_provenance.get(name) != intermediate_provenance.get(name)
+    ]
+    if mismatches:
+        raise ValueError(f"endpoint/intermediate provenance mismatch: {mismatches}")
+
+    endpoint_cvars = endpoint_provenance.get("cvars")
+    intermediate_cvars = intermediate_provenance.get("cvars")
+    if not isinstance(endpoint_cvars, dict) or not isinstance(intermediate_cvars, dict):
+        raise ValueError("both source replays must contain a provenance.cvars object")
+
+    all_cvar_names = sorted(set(endpoint_cvars) | set(intermediate_cvars))
+    unexpected_cvar_differences = [
+        name
+        for name in all_cvar_names
+        if name not in INTENTIONAL_CVAR_DIFFERENCES
+        and endpoint_cvars.get(name) != intermediate_cvars.get(name)
+    ]
+    if unexpected_cvar_differences:
+        raise ValueError(
+            "endpoint/intermediate CVar mismatch outside the declared replay isolation exceptions: "
+            f"{unexpected_cvar_differences}"
+        )
+
+    for name, expected in INTENTIONAL_CVAR_DIFFERENCES.items():
+        endpoint_value = str(endpoint_cvars.get(name))
+        intermediate_value = str(intermediate_cvars.get(name))
+        if endpoint_value != expected["endpoints"] or intermediate_value != expected["intermediate"]:
+            raise ValueError(
+                f"intentional CVar difference {name} has unexpected values: "
+                f"endpoints={endpoint_value}, intermediate={intermediate_value}"
+            )
+
+    normalized_cvars = {
+        name: endpoint_cvars[name]
+        for name in sorted(endpoint_cvars)
+        if name not in INTENTIONAL_CVAR_DIFFERENCES
+    }
+    return {
+        "normalizedCVarProfileSha1": canonical_sha1(normalized_cvars),
+        "intentionalCVarDifferences": INTENTIONAL_CVAR_DIFFERENCES,
+    }
+
+
+def source_file(dataset: Path, frame: dict[str, Any], modality: str) -> Path:
+    relative = frame.get("files", {}).get(modality)
+    if not relative:
+        raise ValueError(f"frame {frame.get('logicalFrameId')} lacks modality {modality}")
+    path = dataset / relative
+    if not path.is_file():
+        raise ValueError(f"missing source file: {path}")
+    expected_hash = str(frame.get("sha1", {}).get(modality, "")).upper()
+    actual_hash = sha1(path)
+    if not expected_hash or actual_hash != expected_hash:
+        raise ValueError(f"source hash mismatch: {path}")
+    return path
+
+
+def copy_modality(
+    staging: Path,
+    pair_name: str,
+    output_modality: str,
+    dataset: Path,
+    frame: dict[str, Any],
+    source_modality: str,
+    files: dict[str, str],
+    hashes: dict[str, str],
+) -> None:
+    source = source_file(dataset, frame, source_modality)
+    extension = source.suffix.lower()
+    relative = Path(output_modality) / f"{pair_name}{extension}"
+    destination = staging / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    files[output_modality] = relative.as_posix()
+    hashes[output_modality] = sha1(destination)
+
+
+def unjittered_camera(frame: dict[str, Any]) -> dict[str, Any]:
+    temporal = frame["temporalDiagnostics"]
+    return {
+        "viewToClip": temporal["viewToClipCurrentUnjittered"],
+        "translatedWorldToView": temporal["translatedWorldToViewCurrent"],
+        "viewToTranslatedWorld": temporal["viewToTranslatedWorldCurrent"],
+        "translatedWorldToClip": temporal["translatedWorldToClipCurrentUnjittered"],
+        "worldViewOriginHigh": temporal["worldViewOriginHighCurrent"],
+        "worldViewOriginLow": temporal["worldViewOriginLowCurrent"],
+        "matrixLayout": temporal["matrixLayout"],
+        "matrixVectorConvention": temporal["matrixVectorConvention"],
+        "coordinateSystem": temporal["coordinateSystem"],
+        "clipZRange": temporal["clipZRange"],
+        "nearPlane": temporal["nearPlane"],
+        "reversedZ": temporal["reversedZ"],
+        "infiniteFar": temporal["infiniteFar"],
+    }
+
+
+def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> None:
+    endpoint, endpoint_report = require_capture(endpoint_dir, ENDPOINT_ROLE)
+    intermediate, intermediate_report = require_capture(intermediate_dir, INTERMEDIATE_ROLE)
+    compatibility = compatible(endpoint, intermediate)
+    endpoint_job = endpoint["job"]
+    if output_dir.exists():
+        raise ValueError(f"output already exists; choose a new directory: {output_dir}")
+
+    endpoint_frames = sorted(endpoint.get("frames", []), key=lambda frame: int(frame["logicalFrameId"]))
+    intermediate_by_id = {
+        int(frame["logicalFrameId"]): frame for frame in intermediate.get("frames", [])
+    }
+    if len(endpoint_frames) < 2:
+        raise ValueError("at least two endpoint frames are required")
+
+    staging = output_dir.with_name(output_dir.name + ".building")
+    if staging.exists():
+        raise ValueError(f"stale staging directory exists: {staging}")
+    staging.mkdir(parents=True)
+    pairs: list[dict[str, Any]] = []
+    try:
+        for pair_index, (frame0, frame1) in enumerate(zip(endpoint_frames, endpoint_frames[1:])):
+            t0 = int(frame0["logicalFrameId"])
+            t1 = int(frame1["logicalFrameId"])
+            if int(frame1.get("motionPreviousLogicalFrameId", -1)) != t0:
+                raise ValueError(f"endpoint motion at frame {t1} does not point to frame {t0}")
+            tau_candidates = [frame_id for frame_id in intermediate_by_id if t0 < frame_id < t1]
+            if len(tau_candidates) != 1:
+                raise ValueError(f"pair {t0}->{t1} requires exactly one intermediate, found {tau_candidates}")
+            tau_frame_id = tau_candidates[0]
+            frame_tau = intermediate_by_id[tau_frame_id]
+            tau = (tau_frame_id - t0) / (t1 - t0)
+            if abs(tau - 0.5) > 1e-9:
+                raise ValueError(f"v1 requires tau=0.5, found {tau}")
+
+            pair_name = f"pair_{pair_index:06d}"
+            files: dict[str, str] = {}
+            hashes: dict[str, str] = {}
+            mappings = (
+                ("scene_color_hudless_t0", endpoint_dir, frame0, "color_main_view_hudless_after_tonemap"),
+                ("scene_color_hudless_tau", intermediate_dir, frame_tau, "color_main_view_hudless_after_tonemap"),
+                ("scene_color_hudless_t1", endpoint_dir, frame1, "color_main_view_hudless_after_tonemap"),
+                ("depth_t0", endpoint_dir, frame0, "depth_view_linear_meters"),
+                ("depth_tau", intermediate_dir, frame_tau, "depth_view_linear_meters"),
+                ("depth_t1", endpoint_dir, frame1, "depth_view_linear_meters"),
+                ("motion_1_to_0", endpoint_dir, frame1, "motion_full_current_to_previous"),
+                ("motion_valid_1_to_0", endpoint_dir, frame1, "motion_valid"),
+                ("object_id_t0", endpoint_dir, frame0, "object_id"),
+                ("object_id_tau", intermediate_dir, frame_tau, "object_id"),
+                ("object_id_t1", endpoint_dir, frame1, "object_id"),
+                ("reactive_mask_t0", endpoint_dir, frame0, "reactive_mask"),
+                ("reactive_mask_tau", intermediate_dir, frame_tau, "reactive_mask"),
+                ("reactive_mask_t1", endpoint_dir, frame1, "reactive_mask"),
+                ("transparency_mask_t0", endpoint_dir, frame0, "transparency_mask"),
+                ("transparency_mask_tau", intermediate_dir, frame_tau, "transparency_mask"),
+                ("transparency_mask_t1", endpoint_dir, frame1, "transparency_mask"),
+            )
+            for output_modality, dataset, frame, source_modality in mappings:
+                copy_modality(
+                    staging, pair_name, output_modality, dataset, frame, source_modality, files, hashes
+                )
+
+            pairs.append({
+                "pairId": pair_index,
+                "baseFrameId": t0,
+                "t0LogicalFrameId": t0,
+                "tauLogicalFrameId": tau_frame_id,
+                "t1LogicalFrameId": t1,
+                "tau": tau,
+                "deltaTimeS": float(frame1["simulationTimeS"]) - float(frame0["simulationTimeS"]),
+                "endpointMotionDefinition": "previous_pixel = current_pixel + motion_1_to_0",
+                "endpointMotionUnit": "display_pixel",
+                "intermediateHistoryIsolated": True,
+                "endpointPreviousState": {
+                    "t1PreviousLogicalFrameId": int(frame1["motionPreviousLogicalFrameId"]),
+                    "timeSpanS": float(frame1["motionTimeSpanS"]),
+                    "componentTransformOverride": bool(frame1["endpointPreviousTransformOverride"]),
+                },
+                "cameraT0Unjittered": unjittered_camera(frame0),
+                "cameraT1Unjittered": unjittered_camera(frame1),
+                "exposure": {
+                    "t0": frame0["temporalDiagnostics"]["exposure"],
+                    "tau": frame_tau["temporalDiagnostics"]["exposure"],
+                    "t1": frame1["temporalDiagnostics"]["exposure"],
+                },
+                "preExposure": {
+                    "t0": frame0["temporalDiagnostics"]["preExposure"],
+                    "tau": frame_tau["temporalDiagnostics"]["preExposure"],
+                    "t1": frame1["temporalDiagnostics"]["preExposure"],
+                },
+                "reset": {
+                    "t0": bool(frame0.get("reset", False)),
+                    "tau": bool(frame_tau.get("reset", False)),
+                    "t1": bool(frame1.get("reset", False)),
+                },
+                "resetReason": {
+                    "t0": frame0.get("resetReason", "none"),
+                    "tau": frame_tau.get("resetReason", "none"),
+                    "t1": frame1.get("resetReason", "none"),
+                },
+                "files": files,
+                "sha1": hashes,
+            })
+
+        manifest = {
+            "schemaVersion": 1,
+            "contractVersion": "nr-fg-data-v1",
+            "certificationStatus": "experimental_uncertified",
+            "frameGenerationCertified": False,
+            "tau": 0.5,
+            "renderSize": [endpoint_job["lRResolution"]["x"], endpoint_job["lRResolution"]["y"]],
+            "displaySize": [endpoint_job["hRResolution"]["x"], endpoint_job["hRResolution"]["y"]],
+            "baseFrameRate": {
+                "numerator": endpoint_job["captureFrameRateNumerator"],
+                "denominator": endpoint_job["captureFrameRateDenominator"],
+            },
+            "uiSeparated": False,
+            "motionBlur": "off",
+            "bufferSemantics": {
+                "sceneColorHudless": {
+                    "pipelineStage": "after_tonemap_before_ui",
+                    "resolution": "display",
+                    "uiIncluded": False,
+                    "hudIncluded": False,
+                    "encoding": "tonemapper_output_device_encoded",
+                },
+                "depth": {
+                    "encoding": "linear_view_meters",
+                    "resolution": "render",
+                    "validity": "finite_positive_values_with_source_depth_valid_gate",
+                },
+                "motion1To0": {
+                    "definition": "previous_pixel = current_pixel + motion_1_to_0",
+                    "unit": "display_pixel",
+                    "origin": "top_left",
+                    "jitterRemoved": True,
+                    "resolution": "render",
+                },
+                "objectId": {
+                    "source": "custom_stencil_uint8_zero_unlabeled",
+                    "resolution": "render",
+                },
+            },
+            "sourceReplays": {
+                "endpoints": str(endpoint_dir.resolve()),
+                "intermediate": str(intermediate_dir.resolve()),
+                "endpointValidation": {
+                    "validatorVersion": endpoint_report.get("validatorVersion"),
+                    "checksPassed": endpoint_report.get("checksPassed"),
+                    "checksTotal": endpoint_report.get("checksTotal"),
+                },
+                "intermediateValidation": {
+                    "validatorVersion": intermediate_report.get("validatorVersion"),
+                    "checksPassed": intermediate_report.get("checksPassed"),
+                    "checksTotal": intermediate_report.get("checksTotal"),
+                },
+            },
+            "provenance": {
+                **compatibility,
+                "endpointReplay": endpoint.get("provenance", {}),
+                "intermediateReplay": intermediate.get("provenance", {}),
+            },
+            "missingRequirements": [
+                "motion_0_to_1_independently_captured",
+                "ui_color_alpha_t0_tau_t1",
+                "skeletal_bone_endpoint_motion_validation",
+                "wpo_and_animated_material_endpoint_motion_validation",
+                "production_disocclusion_masks",
+                "hudless_in_world_ui_residue_validation",
+            ],
+            "pairs": pairs,
+        }
+        manifest_path = staging / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(staging, output_dir)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--endpoints", type=Path, required=True)
+    parser.add_argument("--intermediate", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        assemble(args.endpoints.resolve(), args.intermediate.resolve(), args.output.resolve())
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"Assembled experimental FG dataset: {args.output.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

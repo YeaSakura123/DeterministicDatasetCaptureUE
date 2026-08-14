@@ -13,6 +13,7 @@ param(
 
 $resolvedProject = (Resolve-Path -LiteralPath $Project -ErrorAction Stop).Path
 $resolvedJob = (Resolve-Path -LiteralPath $Job -ErrorAction Stop).Path
+$jobDescriptor = Get-Content -Raw -LiteralPath $resolvedJob | ConvertFrom-Json
 
 if ([string]::IsNullOrWhiteSpace($Editor)) {
     $projectDescriptor = Get-Content -Raw -LiteralPath $resolvedProject | ConvertFrom-Json
@@ -54,6 +55,12 @@ $arguments = @(
     '-SRDatasetAutoQuit'
     '-log'
 )
+
+if ($jobDescriptor.bCaptureMainViewTemporalDiagnostics -eq $true) {
+    $arguments += "-ResX=$($jobDescriptor.hRResolution.x)"
+    $arguments += "-ResY=$($jobDescriptor.hRResolution.y)"
+    $arguments += '-ForceRes'
+}
 
 Write-Host "Starting deterministic dataset capture: $resolvedJob"
 & $resolvedEditor @arguments
