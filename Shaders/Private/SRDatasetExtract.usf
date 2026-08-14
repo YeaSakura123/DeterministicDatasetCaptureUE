@@ -70,6 +70,7 @@ float4 GetMetadataValue(uint Row, uint Column)
 	if (Row == 18 && Column == 1) return View.BufferSizeAndInvSize;
 	if (Row == 18 && Column == 2) return float4(View.ResolutionFractionAndInv, 0.0f, 0.0f);
 	if (Row == 19 && Column == 0) return float4(View.FrameNumber, View.StateFrameIndex, View.StateFrameIndexMod8, 0.0f);
+	if (Row == 20 && Column == 0) return float4(View.MaterialTextureMipBias, 0.0f, 0.0f, 0.0f);
 	return 0.0f;
 }
 
@@ -121,7 +122,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		OutObjectId[Pixel] = float4(float(CustomStencil), 0.0f, 0.0f, 1.0f);
 	}
 
-	if (Pixel.x < 4 && Pixel.y < 20)
+	if (Pixel.x < 4 && Pixel.y < 21)
 	{
 		OutMetadata[Pixel] = GetMetadataValue(Pixel.y, Pixel.x);
 	}
@@ -137,7 +138,7 @@ void CopyColorCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		OutSceneColor[Pixel] = InputSceneColor.Load(int3(InputPixel, 0));
 	}
 
-	if (Pixel.x < 4 && Pixel.y < 20)
+	if (Pixel.x < 4 && Pixel.y < 21)
 	{
 		OutMetadata[Pixel] = GetMetadataValue(Pixel.y, Pixel.x);
 	}

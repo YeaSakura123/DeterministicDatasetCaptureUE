@@ -191,7 +191,7 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterTonemap_RenderThread(
 		FClearValueBinding::Black,
 		TexCreate_ShaderResource | TexCreate_UAV);
 	const FRDGTextureDesc MetadataDesc = FRDGTextureDesc::Create2D(
-		FIntPoint(4, 20),
+		FIntPoint(4, 21),
 		PF_A32B32G32R32F,
 		FClearValueBinding::Black,
 		TexCreate_ShaderResource | TexCreate_UAV);
@@ -211,7 +211,9 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterTonemap_RenderThread(
 		RDG_EVENT_NAME("SRDataset Extract Tonemapped HUD-less Color"),
 		ComputeShader,
 		Parameters,
-		FComputeShaderUtils::GetGroupCount(OutputSize, FIntPoint(8, 8)));
+		FComputeShaderUtils::GetGroupCount(
+			FIntPoint(FMath::Max(OutputSize.X, 4), FMath::Max(OutputSize.Y, 21)),
+			FIntPoint(8, 8)));
 
 	TUniquePtr<FPendingReadbacks> NewReadbacks = MakeUnique<FPendingReadbacks>();
 	NewReadbacks->Size = OutputSize;
@@ -265,7 +267,7 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterDOF_RenderThread(
 		FClearValueBinding::Black,
 		TexCreate_ShaderResource | TexCreate_UAV);
 	const FRDGTextureDesc MetadataDesc = FRDGTextureDesc::Create2D(
-		FIntPoint(4, 20),
+		FIntPoint(4, 21),
 		PF_A32B32G32R32F,
 		FClearValueBinding::Black,
 		TexCreate_ShaderResource | TexCreate_UAV);
@@ -313,7 +315,9 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterDOF_RenderThread(
 		RDG_EVENT_NAME("SRDataset Extract Temporal Inputs"),
 		ComputeShader,
 		Parameters,
-		FComputeShaderUtils::GetGroupCount(OutputSize, FIntPoint(8, 8)));
+		FComputeShaderUtils::GetGroupCount(
+			FIntPoint(FMath::Max(OutputSize.X, 4), FMath::Max(OutputSize.Y, 21)),
+			FIntPoint(8, 8)));
 
 	TUniquePtr<FPendingReadbacks> NewReadbacks = MakeUnique<FPendingReadbacks>();
 	NewReadbacks->Size = OutputSize;
@@ -373,7 +377,7 @@ bool FSRDatasetViewExtension::WaitAndTakeCapture(FSRDatasetTemporalCaptureResult
 				ReadFloatTexture(*Readbacks->ObjectId, Readbacks->Size, Result->ObjectId);
 			}
 			TArray<FLinearColor> MetadataPixels;
-			ReadFloatTexture(*Readbacks->Metadata, FIntPoint(4, 20), MetadataPixels);
+			ReadFloatTexture(*Readbacks->Metadata, FIntPoint(4, 21), MetadataPixels);
 			DecodeMetadata(MetadataPixels, Result->Metadata);
 		});
 	FlushRenderingCommands();
@@ -433,7 +437,7 @@ void FSRDatasetViewExtension::DecodeMetadata(
 	const TArray<FLinearColor>& Pixels,
 	FSRDatasetTemporalFrameMetadata& OutMetadata)
 {
-	if (Pixels.Num() != 80)
+	if (Pixels.Num() != 84)
 	{
 		return;
 	}
@@ -499,6 +503,7 @@ void FSRDatasetViewExtension::DecodeMetadata(
 	OutMetadata.BufferSize = FIntPoint(FMath::RoundToInt(Buffer.R), FMath::RoundToInt(Buffer.G));
 	OutMetadata.ResolutionFraction = Resolution.R;
 	OutMetadata.InvResolutionFraction = Resolution.G;
+	OutMetadata.MaterialTextureMipBias = Pixels[20 * 4 + 0].R;
 	OutMetadata.RenderFrameNumber = static_cast<uint32>(FMath::Max(0, FMath::RoundToInt(Frame.R)));
 	OutMetadata.StateFrameIndex = static_cast<uint32>(FMath::Max(0, FMath::RoundToInt(Frame.G)));
 	OutMetadata.StateFrameIndexMod8 = static_cast<uint32>(FMath::Max(0, FMath::RoundToInt(Frame.B)));

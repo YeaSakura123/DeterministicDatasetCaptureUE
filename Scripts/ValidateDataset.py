@@ -66,6 +66,10 @@ REPLAY_METADATA_FIELDS = (
     "resetReason",
     "timeSeconds",
     "resumed",
+    "streamingStateSha1",
+    "streamingTextureCount",
+    "pendingStreamingTextureCount",
+    "streamingRequestsWanting",
     "renderSubmissions",
     "semanticValidationFixture",
     "camera",
@@ -191,6 +195,54 @@ def matrix(values: Any) -> np.ndarray:
     return array.reshape(4, 4) if array.shape == (16,) else np.full((4, 4), np.nan)
 
 
+def expected_automatic_view_mip_bias(resolution_fraction: float, cvars: dict[str, Any]) -> float:
+    """Mirror UE's automatic material texture Mip-bias calculation for spatial upscale views."""
+    if not math.isfinite(resolution_fraction) or resolution_fraction <= 0.0:
+        return math.nan
+    offset = float(cvars.get("r.ViewTextureMipBias.Offset", 0.0))
+    minimum = float(cvars.get("r.ViewTextureMipBias.Min", -4.0))
+    quantization = float(cvars.get("r.ViewTextureMipBias.Quantization", 0.0))
+    bias = -max(-math.log2(resolution_fraction), 0.0) + offset
+    bias = min(max(max(bias, minimum), -4.0), 4.0)
+    if quantization > 0.0:
+        step = 8.0 / quantization
+        bias = math.ceil(bias / step) * step
+    return bias
+
+
+def validate_mip_bias_metadata(
+    checks: list[dict[str, Any]],
+    prefix: str,
+    metadata: dict[str, Any],
+    expected_automatic: float,
+    expected_global: float,
+) -> None:
+    automatic = float(metadata.get("automaticViewMipBias", math.nan))
+    global_bias = float(metadata.get("globalMipMapLODBias", math.nan))
+    effective = float(metadata.get("effectiveMaterialTextureMipBias", math.nan))
+    add_check(
+        checks,
+        f"{prefix}.automatic_view_mip_bias",
+        math.isfinite(automatic)
+        and math.isclose(automatic, expected_automatic, rel_tol=0.0, abs_tol=2e-4),
+        f"expected={expected_automatic:.9g} actual={automatic:.9g}",
+    )
+    add_check(
+        checks,
+        f"{prefix}.global_mipmap_lod_bias",
+        math.isfinite(global_bias)
+        and math.isclose(global_bias, expected_global, rel_tol=0.0, abs_tol=1e-6),
+        f"expected={expected_global:.9g} actual={global_bias:.9g}",
+    )
+    add_check(
+        checks,
+        f"{prefix}.effective_material_texture_mip_bias",
+        math.isfinite(effective)
+        and math.isclose(effective, automatic + global_bias, rel_tol=0.0, abs_tol=1e-6),
+        f"automatic={automatic:.9g} global={global_bias:.9g} effective={effective:.9g}",
+    )
+
+
 def validate_temporal_frame(
     checks: list[dict[str, Any]],
     frame: dict[str, Any],
@@ -199,10 +251,17 @@ def validate_temporal_frame(
     lr_size: tuple[int, int],
     hr_size: tuple[int, int],
     main_view: bool,
+    cvars: dict[str, Any],
 ) -> None:
     frame_id = int(frame["logicalFrameId"])
     prefix = f"frame_{frame_id:06d}"
     expected_fraction = lr_size[0] / hr_size[0]
+    expected_main_mip_bias = expected_automatic_view_mip_bias(expected_fraction, cvars)
+    # The isolated native/reference SceneCapture views are rendered at their full
+    # target extent and do not opt into the Main View's automatic spatial-upscale
+    # texture bias. Their View Uniform must therefore report zero here.
+    expected_full_resolution_mip_bias = 0.0
+    global_mip_bias = float(cvars.get("r.MipMapLODBias", 0.0))
     motion_previous_frame = int(frame.get("motionPreviousLogicalFrameId", frame_id))
 
     add_check(checks, f"{prefix}.render_size_contract", tuple(temporal.get("renderSize", ())) == lr_size, str(temporal.get("renderSize")))
@@ -212,6 +271,13 @@ def validate_temporal_frame(
         f"{prefix}.resolution_fraction",
         math.isclose(float(temporal.get("resolutionFraction", math.nan)), expected_fraction, rel_tol=0.0, abs_tol=1e-6),
         f"expected={expected_fraction} actual={temporal.get('resolutionFraction')}",
+    )
+    validate_mip_bias_metadata(
+        checks,
+        f"{prefix}.temporal",
+        temporal,
+        expected_main_mip_bias,
+        global_mip_bias,
     )
     add_check(
         checks,
@@ -236,6 +302,13 @@ def validate_temporal_frame(
     native_hr = frame.get("nativeHRDiagnostics")
     add_check(checks, f"{prefix}.native_hr_metadata", isinstance(native_hr, dict), "present")
     if isinstance(native_hr, dict):
+        validate_mip_bias_metadata(
+            checks,
+            f"{prefix}.native_hr",
+            native_hr,
+            expected_full_resolution_mip_bias,
+            global_mip_bias,
+        )
         native_jitter = np.asarray(native_hr.get("jitterCurrentNDC", (math.nan, math.nan)), dtype=np.float64)
         native_jittered = matrix(native_hr.get("viewToClipCurrentJittered"))
         native_unjittered = matrix(native_hr.get("viewToClipCurrentUnjittered"))
@@ -267,6 +340,13 @@ def validate_temporal_frame(
     reference_enabled = bool(frame.get("referenceHRDiagnostics"))
     if reference_enabled:
         reference = frame["referenceHRDiagnostics"]
+        validate_mip_bias_metadata(
+            checks,
+            f"{prefix}.reference_hr",
+            reference,
+            expected_full_resolution_mip_bias,
+            global_mip_bias,
+        )
         scale = int(reference.get("spatialScalePerAxis", 0))
         source_size = (hr_size[0] * scale, hr_size[1] * scale)
         reference_jitter = np.asarray(reference.get("jitterCurrentNDC", (math.nan, math.nan)), dtype=np.float64)
@@ -325,6 +405,13 @@ def validate_temporal_frame(
 
     hudless = frame.get("hudlessColorDiagnostics")
     if isinstance(hudless, dict):
+        validate_mip_bias_metadata(
+            checks,
+            f"{prefix}.hudless",
+            hudless,
+            expected_main_mip_bias,
+            global_mip_bias,
+        )
         add_check(
             checks,
             f"{prefix}.hudless_display_size",
@@ -689,6 +776,39 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
         value = str(provenance.get(name, ""))
         valid_hash = len(value) == 40 and all(character in "0123456789ABCDEFabcdef" for character in value)
         add_check(checks, f"provenance.{name}", valid_hash, value)
+    streaming_hash = str(provenance.get("streamingStateAfterBarrierSha1", ""))
+    valid_streaming_hash = len(streaming_hash) == 40 and all(
+        character in "0123456789ABCDEFabcdef" for character in streaming_hash
+    )
+    streaming_barrier_enabled = job.get("bBlockOnStreamingBeforeCapture", True) is True
+    streaming_requests = int(provenance.get("streamingRequestsAfterBarrier", -1))
+    streaming_texture_count = int(provenance.get("streamingTextureCountAfterBarrier", -1))
+    pending_streaming_texture_count = int(
+        provenance.get("pendingStreamingTextureCountAfterBarrier", -1)
+    )
+    add_check(
+        checks,
+        "provenance.streaming_barrier",
+        provenance.get("streamingBarrierEnabled") is streaming_barrier_enabled
+        and provenance.get("streamingBarrierComplete") is True
+        and (not streaming_barrier_enabled or streaming_requests == 0),
+        json.dumps(
+            {
+                "enabled": provenance.get("streamingBarrierEnabled"),
+                "complete": provenance.get("streamingBarrierComplete"),
+                "requests": streaming_requests,
+            },
+            sort_keys=True,
+        ),
+    )
+    add_check(
+        checks,
+        "provenance.streaming_state",
+        valid_streaming_hash
+        and streaming_texture_count > 0
+        and pending_streaming_texture_count >= 0,
+        f"sha1={streaming_hash} textures={streaming_texture_count} pending={pending_streaming_texture_count}",
+    )
     cvars = provenance.get("cvars", {})
     cvar_lines = [f"{name}={value}" for name, value in sorted(cvars.items())]
     canonical_cvar_profile = str(provenance.get("cvarProfileCanonical", ""))
@@ -764,6 +884,30 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
             f"frame_{frame_id:06d}.endpoint_transform_role",
             endpoint_override is expected_endpoint_override,
             f"expected={expected_endpoint_override} actual={endpoint_override}",
+        )
+        frame_streaming_hash = str(frame.get("streamingStateSha1", ""))
+        valid_frame_streaming_hash = len(frame_streaming_hash) == 40 and all(
+            character in "0123456789ABCDEFabcdef" for character in frame_streaming_hash
+        )
+        add_check(
+            checks,
+            f"frame_{frame_id:06d}.streaming_state",
+            valid_frame_streaming_hash
+            and int(frame.get("streamingTextureCount", -1)) > 0
+            and int(frame.get("pendingStreamingTextureCount", -1)) >= 0
+            and int(frame.get("streamingRequestsWanting", -1)) >= 0,
+            json.dumps(
+                {
+                    key: frame.get(key)
+                    for key in (
+                        "streamingStateSha1",
+                        "streamingTextureCount",
+                        "pendingStreamingTextureCount",
+                        "streamingRequestsWanting",
+                    )
+                },
+                sort_keys=True,
+            ),
         )
         motion_span_frames = int(frame.get("motionTimeSpanFrames", -1))
         motion_span_seconds = float(frame.get("motionTimeSpanS", math.nan))
@@ -884,7 +1028,9 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
                     valid = isinstance(value, (int, float)) and math.isfinite(value) and value > 0
                     add_check(checks, f"frame_{frame_id:06d}.{name}.positive", valid, str(value))
 
-                validate_temporal_frame(checks, frame, temporal, frame_pixels, lr_size, hr_size, main_view)
+                validate_temporal_frame(
+                    checks, frame, temporal, frame_pixels, lr_size, hr_size, main_view, cvars
+                )
                 temporal_records.append((frame_id, temporal, bool(frame.get("reset", False))))
                 if job.get("bEnableSemanticValidationFixture", False):
                     fixture = frame.get("semanticValidationFixture")

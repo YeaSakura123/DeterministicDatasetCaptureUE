@@ -7,10 +7,12 @@
 
 #include "Camera/CameraComponent.h"
 #include "Camera/PlayerCameraManager.h"
+#include "ContentStreaming.h"
 #include "Dom/JsonObject.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/Engine.h"
+#include "Engine/Texture2D.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/PlayerController.h"
@@ -35,6 +37,7 @@
 #include "NiagaraSystem.h"
 #include "Kismet/GameplayStatics.h"
 #include "Rendering/MotionVectorSimulation.h"
+#include "TextureResource.h"
 #include "DynamicRHI.h"
 #include "RHIGlobals.h"
 #include "Serialization/JsonSerializer.h"
@@ -186,6 +189,11 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 	PendingMainViewTimeSeconds = 0.0;
 	PendingMainViewHashes.Reset();
 	PendingMainViewRenderSubmissions.Reset();
+	bStreamingBarrierComplete = false;
+	StreamingRequestsAfterBarrier = INDEX_NONE;
+	StreamingTextureCountAfterBarrier = 0;
+	PendingStreamingTextureCountAfterBarrier = 0;
+	StreamingStateAfterBarrierSha1.Reset();
 
 	if (!PrepareJob(OutError))
 	{
@@ -572,8 +580,24 @@ void USRDatasetCaptureSubsystem::SnapshotProvenance()
 		TEXT("r.SceneCulling.Async.Query"),
 		TEXT("r.SceneCulling.Async.Update"),
 		TEXT("r.ScreenPercentage"),
+		TEXT("r.StaticMeshLODDistanceScale"),
+		TEXT("r.SkeletalMeshLODBias"),
+		TEXT("r.ParticleLODBias"),
+		TEXT("foliage.LODDistanceScale"),
+		TEXT("r.Nanite.ViewMeshLODBias.Enable"),
+		TEXT("r.Nanite.ViewMeshLODBias.Offset"),
+		TEXT("r.Nanite.ViewMeshLODBias.Min"),
+		TEXT("r.Streaming.Boost"),
+		TEXT("r.Streaming.FullyLoadUsedTextures"),
+		TEXT("r.Streaming.LimitPoolSizeToVRAM"),
+		TEXT("r.Streaming.MipBias"),
 		TEXT("r.Streaming.PoolSize"),
+		TEXT("r.Streaming.UseAllMips"),
+		TEXT("r.Streaming.UseFixedPoolSize"),
 		TEXT("r.TemporalAA.Upsampling"),
+		TEXT("r.ViewTextureMipBias.Min"),
+		TEXT("r.ViewTextureMipBias.Offset"),
+		TEXT("r.ViewTextureMipBias.Quantization"),
 		TEXT("r.ViewDistanceScale"),
 		TEXT("sg.AntiAliasingQuality"),
 		TEXT("sg.EffectsQuality"),
@@ -622,6 +646,81 @@ void USRDatasetCaptureSubsystem::SnapshotProvenance()
 		ShaderSourceSha1 = HashFile(FPaths::Combine(
 			Plugin->GetBaseDir(), TEXT("Shaders/Private/SRDatasetExtract.usf")));
 	}
+}
+
+bool USRDatasetCaptureSubsystem::EnsureStreamingReady(FString& OutError)
+{
+	if (bStreamingBarrierComplete)
+	{
+		return true;
+	}
+	if (IStreamingManager::HasShutdown())
+	{
+		OutError = TEXT("The engine streaming manager is unavailable before dataset capture.");
+		return false;
+	}
+
+	FStreamingManagerCollection& StreamingManager = IStreamingManager::Get();
+	StreamingRequestsAfterBarrier = ActiveJob.bBlockOnStreamingBeforeCapture
+		? StreamingManager.StreamAllResources(ActiveJob.StreamingWaitSeconds)
+		: StreamingManager.GetNumWantingResources();
+	if (ActiveJob.bBlockOnStreamingBeforeCapture && StreamingRequestsAfterBarrier > 0)
+	{
+		OutError = FString::Printf(
+			TEXT("Streaming barrier timed out after %.3f seconds with %d request(s) still in flight."),
+			ActiveJob.StreamingWaitSeconds,
+			StreamingRequestsAfterBarrier);
+		return false;
+	}
+
+	StreamingStateAfterBarrierSha1 = ComputeStreamingStateSha1(
+		StreamingTextureCountAfterBarrier,
+		PendingStreamingTextureCountAfterBarrier);
+	bStreamingBarrierComplete = true;
+	UE_LOG(
+		LogSRDataset,
+		Display,
+		TEXT("Streaming barrier ready: requests=%d textures=%d pendingTextures=%d stateSha1=%s"),
+		StreamingRequestsAfterBarrier,
+		StreamingTextureCountAfterBarrier,
+		PendingStreamingTextureCountAfterBarrier,
+		*StreamingStateAfterBarrierSha1);
+	return true;
+}
+
+FString USRDatasetCaptureSubsystem::ComputeStreamingStateSha1(
+	int32& OutTextureCount,
+	int32& OutPendingTextureCount) const
+{
+	TArray<FString> TextureStateLines;
+	OutTextureCount = 0;
+	OutPendingTextureCount = 0;
+	for (TObjectIterator<UTexture2D> It; It; ++It)
+	{
+		const UTexture2D* Texture = *It;
+		if (!IsValid(Texture) || Texture->HasAnyFlags(RF_ClassDefaultObject))
+		{
+			continue;
+		}
+		const FTextureResource* Resource = Texture->GetResource();
+		const bool bPending = Texture->HasPendingInitOrStreaming();
+		++OutTextureCount;
+		OutPendingTextureCount += bPending ? 1 : 0;
+		TextureStateLines.Add(FString::Printf(
+			TEXT("%s|%dx%d|assetMips=%d|residentMips=%d|streamable=%d|pending=%d"),
+			*Texture->GetPathName(),
+			Texture->GetSizeX(),
+			Texture->GetSizeY(),
+			Texture->GetNumMips(),
+			Resource ? Resource->GetCurrentMipCount() : 0,
+			Texture->IsStreamable() ? 1 : 0,
+			bPending ? 1 : 0));
+	}
+	TextureStateLines.Sort([](const FString& Left, const FString& Right)
+	{
+		return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+	});
+	return HashString(FString::Join(TextureStateLines, TEXT("\n")));
 }
 
 void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds)
@@ -689,6 +788,16 @@ void USRDatasetCaptureSubsystem::HandleWorldPostActorTick(UWorld* World, ELevelT
 			Status.CurrentFrame = ActiveJob.StartFrame;
 		}
 		return;
+	}
+
+	if (!bStreamingBarrierComplete)
+	{
+		FString Error;
+		if (!EnsureStreamingReady(Error))
+		{
+			FinishCapture(ESRDatasetCaptureState::Failed, Error);
+			return;
+		}
 	}
 
 	if (ShouldCaptureFrame(Status.CurrentFrame))
@@ -1222,6 +1331,16 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	Frame->SetStringField(TEXT("resetReason"), bFirstCapturedFrame ? TEXT("job_start") : TEXT("none"));
 	Frame->SetNumberField(TEXT("timeSeconds"), TimeSeconds);
 	Frame->SetBoolField(TEXT("resumed"), bResumed);
+	int32 StreamingTextureCount = 0;
+	int32 PendingStreamingTextureCount = 0;
+	Frame->SetStringField(
+		TEXT("streamingStateSha1"),
+		ComputeStreamingStateSha1(StreamingTextureCount, PendingStreamingTextureCount));
+	Frame->SetNumberField(TEXT("streamingTextureCount"), StreamingTextureCount);
+	Frame->SetNumberField(TEXT("pendingStreamingTextureCount"), PendingStreamingTextureCount);
+	Frame->SetNumberField(
+		TEXT("streamingRequestsWanting"),
+		IStreamingManager::HasShutdown() ? -1 : IStreamingManager::Get().GetNumWantingResources());
 
 	TArray<TSharedPtr<FJsonValue>> SubmissionArray;
 	for (const TCHAR* Modality : {
@@ -1376,6 +1495,16 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				MakeShared<FJsonValueNumber>(Metadata.BufferSize.X), MakeShared<FJsonValueNumber>(Metadata.BufferSize.Y) });
 			Temporal->SetNumberField(TEXT("resolutionFraction"), Metadata.ResolutionFraction);
 			Temporal->SetNumberField(TEXT("inverseResolutionFraction"), Metadata.InvResolutionFraction);
+			const double GlobalMipMapLODBias = FCString::Atod(*CaptureCVarProfile.FindRef(TEXT("r.MipMapLODBias")));
+			Temporal->SetNumberField(TEXT("automaticViewMipBias"), Metadata.MaterialTextureMipBias);
+			Temporal->SetStringField(TEXT("automaticViewMipBiasPolicy"), TEXT("engine_main_view_spatial_upscale"));
+			Temporal->SetNumberField(TEXT("globalMipMapLODBias"), GlobalMipMapLODBias);
+			Temporal->SetNumberField(
+				TEXT("effectiveMaterialTextureMipBias"),
+				Metadata.MaterialTextureMipBias + GlobalMipMapLODBias);
+			Temporal->SetStringField(
+				TEXT("effectiveMipBiasScope"),
+				TEXT("automatic_view_mip_bias_material_samples_plus_global_mipmap_lod_bias"));
 			Temporal->SetNumberField(TEXT("screenPercentage"),
 				100.0 * static_cast<double>(ActiveJob.LRResolution.X) / ActiveJob.HRResolution.X);
 			Temporal->SetBoolField(TEXT("dynamicResolutionEnabled"), false);
@@ -1459,6 +1588,12 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				Native->SetBoolField(TEXT("preExposed"), true);
 				Native->SetNumberField(TEXT("preExposure"), NativeHR.PreExposure);
 				Native->SetNumberField(TEXT("exposure"), NativeHR.OneOverPreExposure);
+				Native->SetNumberField(TEXT("automaticViewMipBias"), NativeHR.MaterialTextureMipBias);
+				Native->SetStringField(TEXT("automaticViewMipBiasPolicy"), TEXT("isolated_full_resolution_scene_capture"));
+				Native->SetNumberField(TEXT("globalMipMapLODBias"), GlobalMipMapLODBias);
+				Native->SetNumberField(
+					TEXT("effectiveMaterialTextureMipBias"),
+					NativeHR.MaterialTextureMipBias + GlobalMipMapLODBias);
 				Native->SetArrayField(TEXT("renderSize"), {
 					MakeShared<FJsonValueNumber>(NativeHR.ViewSize.X), MakeShared<FJsonValueNumber>(NativeHR.ViewSize.Y) });
 				Native->SetArrayField(TEXT("displaySize"), {
@@ -1484,6 +1619,12 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				Reference->SetBoolField(TEXT("preExposed"), true);
 				Reference->SetNumberField(TEXT("preExposure"), ReferenceHR.PreExposure);
 				Reference->SetNumberField(TEXT("exposure"), ReferenceHR.OneOverPreExposure);
+				Reference->SetNumberField(TEXT("automaticViewMipBias"), ReferenceHR.MaterialTextureMipBias);
+				Reference->SetStringField(TEXT("automaticViewMipBiasPolicy"), TEXT("isolated_full_resolution_scene_capture"));
+				Reference->SetNumberField(TEXT("globalMipMapLODBias"), GlobalMipMapLODBias);
+				Reference->SetNumberField(
+					TEXT("effectiveMaterialTextureMipBias"),
+					ReferenceHR.MaterialTextureMipBias + GlobalMipMapLODBias);
 				Reference->SetArrayField(TEXT("sourceRenderSize"), {
 					MakeShared<FJsonValueNumber>(ReferenceHR.ViewSize.X),
 					MakeShared<FJsonValueNumber>(ReferenceHR.ViewSize.Y) });
@@ -1523,6 +1664,12 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 					MakeShared<FJsonValueNumber>(HUDlessSize.X),
 					MakeShared<FJsonValueNumber>(HUDlessSize.Y) });
 				HUDlessDiagnostics->SetNumberField(TEXT("preExposureBeforeTonemap"), HUDless.PreExposure);
+				HUDlessDiagnostics->SetNumberField(TEXT("automaticViewMipBias"), HUDless.MaterialTextureMipBias);
+				HUDlessDiagnostics->SetStringField(TEXT("automaticViewMipBiasPolicy"), TEXT("engine_main_view_spatial_upscale"));
+				HUDlessDiagnostics->SetNumberField(TEXT("globalMipMapLODBias"), GlobalMipMapLODBias);
+				HUDlessDiagnostics->SetNumberField(
+					TEXT("effectiveMaterialTextureMipBias"),
+					HUDless.MaterialTextureMipBias + GlobalMipMapLODBias);
 				HUDlessDiagnostics->SetNumberField(TEXT("outputDevice"),
 					CaptureCVarProfile.Contains(TEXT("r.HDR.Display.OutputDevice"))
 						? FCString::Atoi(*CaptureCVarProfile.FindChecked(TEXT("r.HDR.Display.OutputDevice")))
@@ -1545,7 +1692,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.2.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.2.1"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -1581,6 +1728,18 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Provenance->SetStringField(TEXT("contentMapSha1"), ContentMapSha1);
 	Provenance->SetStringField(TEXT("shaderSourceSha1"), ShaderSourceSha1);
 	Provenance->SetStringField(TEXT("shaderHashScope"), TEXT("SRDatasetExtract.usf_source_not_compiled_bytecode"));
+	Provenance->SetBoolField(TEXT("streamingBarrierEnabled"), ActiveJob.bBlockOnStreamingBeforeCapture);
+	Provenance->SetNumberField(TEXT("streamingBarrierWaitSeconds"), ActiveJob.StreamingWaitSeconds);
+	Provenance->SetBoolField(TEXT("streamingBarrierComplete"), bStreamingBarrierComplete);
+	Provenance->SetNumberField(TEXT("streamingRequestsAfterBarrier"), StreamingRequestsAfterBarrier);
+	Provenance->SetNumberField(TEXT("streamingTextureCountAfterBarrier"), StreamingTextureCountAfterBarrier);
+	Provenance->SetNumberField(
+		TEXT("pendingStreamingTextureCountAfterBarrier"),
+		PendingStreamingTextureCountAfterBarrier);
+	Provenance->SetStringField(TEXT("streamingStateAfterBarrierSha1"), StreamingStateAfterBarrierSha1);
+	Provenance->SetStringField(
+		TEXT("streamingStateHashScope"),
+		TEXT("sorted_loaded_UTexture2D_path_size_asset_mips_resident_mips_streamable_pending"));
 	TSharedRef<FJsonObject> CVarProfile = MakeShared<FJsonObject>();
 	TArray<FString> CVarNames;
 	CaptureCVarProfile.GetKeys(CVarNames);

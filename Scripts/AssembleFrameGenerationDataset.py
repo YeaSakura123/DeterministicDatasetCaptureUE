@@ -80,6 +80,8 @@ def compatible(endpoint: dict[str, Any], intermediate: dict[str, Any]) -> dict[s
         "bLockExposure",
         "bForceSynchronousRendering",
         "bEnableSemanticValidationFixture",
+        "bBlockOnStreamingBeforeCapture",
+        "streamingWaitSeconds",
     )
     mismatches = [name for name in fields if endpoint_job.get(name) != intermediate_job.get(name)]
     if mismatches:
@@ -97,6 +99,14 @@ def compatible(endpoint: dict[str, Any], intermediate: dict[str, Any]) -> dict[s
         "gpuDeviceId",
         "contentMapSha1",
         "shaderSourceSha1",
+        "streamingBarrierEnabled",
+        "streamingBarrierWaitSeconds",
+        "streamingBarrierComplete",
+        "streamingRequestsAfterBarrier",
+        "streamingTextureCountAfterBarrier",
+        "pendingStreamingTextureCountAfterBarrier",
+        "streamingStateAfterBarrierSha1",
+        "streamingStateHashScope",
     )
     mismatches = [
         name for name in provenance_fields
@@ -285,6 +295,11 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
                     "t0": frame0["temporalDiagnostics"]["preExposure"],
                     "tau": frame_tau["temporalDiagnostics"]["preExposure"],
                     "t1": frame1["temporalDiagnostics"]["preExposure"],
+                },
+                "streamingStateSha1": {
+                    "t0": frame0["streamingStateSha1"],
+                    "tau": frame_tau["streamingStateSha1"],
+                    "t1": frame1["streamingStateSha1"],
                 },
                 "reset": {
                     "t0": bool(frame0.get("reset", False)),

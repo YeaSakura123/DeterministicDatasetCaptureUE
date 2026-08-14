@@ -176,6 +176,14 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
 	bool bForceSynchronousRendering = true;
 
+	/** Block once after render warmup until currently requested engine streaming resources settle. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
+	bool bBlockOnStreamingBeforeCapture = true;
+
+	/** Maximum streaming-barrier duration; a timeout fails the job instead of silently capturing partial residency. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism", meta = (ClampMin = "0.1", EditCondition = "bBlockOnStreamingBeforeCapture"))
+	float StreamingWaitSeconds = 60.0f;
+
 	/**
 	 * Experimental endpoint capture: do not submit a player Main View on
 	 * simulated frames that are not selected by FrameStep/CaptureFrameOffset.

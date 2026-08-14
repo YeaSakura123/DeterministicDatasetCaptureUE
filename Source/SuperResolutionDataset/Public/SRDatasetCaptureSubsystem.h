@@ -69,6 +69,8 @@ private:
 	void ApplyDeterministicRuntimeState();
 	void RestoreDeterministicRuntimeState();
 	void SnapshotProvenance();
+	bool EnsureStreamingReady(FString& OutError);
+	FString ComputeStreamingStateSha1(int32& OutTextureCount, int32& OutPendingTextureCount) const;
 	void DiscoverAndControlNiagara(float TimeSeconds);
 	void RestoreNiagara();
 	void NotifyControllablesPrepare();
@@ -120,6 +122,11 @@ private:
 	FString CaptureCVarProfileCanonical;
 	FString ContentMapSha1;
 	FString ShaderSourceSha1;
+	bool bStreamingBarrierComplete = false;
+	int32 StreamingRequestsAfterBarrier = INDEX_NONE;
+	int32 StreamingTextureCountAfterBarrier = 0;
+	int32 PendingStreamingTextureCountAfterBarrier = 0;
+	FString StreamingStateAfterBarrierSha1;
 	FDelegateHandle PreActorTickHandle;
 	FDelegateHandle PostActorTickHandle;
 

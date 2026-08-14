@@ -49,6 +49,7 @@ struct FSRDatasetTemporalFrameMetadata
 	FIntPoint BufferSize = FIntPoint::ZeroValue;
 	float ResolutionFraction = 1.0f;
 	float InvResolutionFraction = 1.0f;
+	float MaterialTextureMipBias = 0.0f;
 	uint32 RenderFrameNumber = 0;
 	uint32 StateFrameIndex = 0;
 	uint32 StateFrameIndexMod8 = 0;

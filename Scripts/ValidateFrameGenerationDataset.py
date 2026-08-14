@@ -239,6 +239,14 @@ def validate_provenance(checks: list[dict[str, Any]], provenance: Any) -> None:
         "gpuDeviceId",
         "contentMapSha1",
         "shaderSourceSha1",
+        "streamingBarrierEnabled",
+        "streamingBarrierWaitSeconds",
+        "streamingBarrierComplete",
+        "streamingRequestsAfterBarrier",
+        "streamingTextureCountAfterBarrier",
+        "pendingStreamingTextureCountAfterBarrier",
+        "streamingStateAfterBarrierSha1",
+        "streamingStateHashScope",
     )
     mismatches = [name for name in invariant_fields if endpoint.get(name) != intermediate.get(name)]
     add_check(
@@ -380,6 +388,20 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                     value * pre_value, 1.0, rel_tol=1e-5, abs_tol=1e-5
                 )
             add_check(checks, f"{prefix}.exposure", exposure_ok, json.dumps(exposure_detail, sort_keys=True))
+
+            streaming_hashes = pair.get("streamingStateSha1", {})
+            streaming_values = [str(streaming_hashes.get(phase, "")) for phase in ("t0", "tau", "t1")]
+            streaming_hashes_valid = all(
+                len(value) == 40
+                and all(character in "0123456789ABCDEFabcdef" for character in value)
+                for value in streaming_values
+            )
+            add_check(
+                checks,
+                f"{prefix}.streaming_state_stable",
+                streaming_hashes_valid and len(set(streaming_values)) == 1,
+                json.dumps(streaming_hashes, sort_keys=True),
+            )
 
             files = pair.get("files", {})
             hashes = pair.get("sha1", {})
