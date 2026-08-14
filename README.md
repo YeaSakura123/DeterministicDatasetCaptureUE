@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.3.1-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.3.2-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,7 +11,7 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.3.1 deliberately separates implemented output from certified training contracts:
+Version 0.3.2 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
@@ -166,6 +166,25 @@ python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
 
 The v3 validator requires exact provenance and temporal/native-HR/reference-HR/HUD-less/semantic/streaming metadata. It also verifies the effective material texture Mip bias against the recorded render fraction and CVar profile. Geometry, depth, motion, masks and IDs must be numerically exact; color permits a narrow documented floating-point tolerance and writes heatmaps when hashes differ.
 
+### Capture-order invariance gate
+
+The paired validation jobs submit the same logical scene in two genuinely different orders:
+
+```text
+HighResolutionFirst: HR -> Reference -> LR -> Depth -> Main View
+LowResolutionFirst:  LR -> Depth -> HR -> Reference -> Main View
+```
+
+Run both clean processes and the strict comparison with one command:
+
+```powershell
+& '.\Plugins\DeterministicDatasetCaptureUE\Scripts\RunCaptureOrderValidation.ps1' `
+  -Project '.\YourProject.uproject' `
+  -Map '/Game/Maps/YourCaptureMap'
+```
+
+The comparator requires opposite recorded submission orders, jobs equal except name/output/order, exact engine/GPU/content/shader/CVar/streaming provenance after removing only the capture-config hash, byte-exact non-color modalities and tolerance-gated color. `LowResolutionFirst` is rejected for `DownsampleFromHR`, because a CPU-derived LR image has no independent render submission to reorder.
+
 ## Semantic validation fixture
 
 [`Config/job.semantic-validation.json`](Config/job.semantic-validation.json) replaces visible level geometry during the job with a camera-relative chart containing:
@@ -233,13 +252,15 @@ Actors spawned during capture are discovered and prepared before their first eva
 
 ## Verified release evidence
 
-Version 0.3.1 was compiled as a UE 5.7 Development Editor plugin and exercised on Windows/D3D12 with an AMD Radeon RX 7900 XTX. The checked fixture produced:
+Version 0.3.2 was compiled as a UE 5.7 Development Editor plugin and exercised on Windows/D3D12 with an AMD Radeon RX 7900 XTX. The checked fixture produced:
 
 - Unreal automation: 1/1 job-validation test passed with zero warnings/errors;
-- standard semantic deterministic replay with streaming/Mip/history/scene-state provenance: 569/569 required checks;
-- FG endpoint replay: 403/403 required checks;
-- isolated FG intermediate replay: 209/209 required checks;
-- assembled FG integrity: 102/102 checks, intentionally uncertified.
+- standard semantic deterministic replay with streaming/Mip/history/scene-state provenance: 569/569 required checks from v0.3.1;
+- capture-order standalone validation: 406/406 required checks;
+- paired capture-order invariance: 574/574 required checks;
+- FG endpoint replay regression: 410/410 required checks;
+- isolated FG intermediate replay regression: 213/213 required checks;
+- assembled FG integrity regression: 103/103 checks, intentionally uncertified.
 
 The validation Main View used a 50% render fraction. Its GPU View Uniform reported a material texture Mip bias of `-1.296875`, exactly matching the independent formula and recorded CVar profile; both full-resolution isolated HR views reported `0`. The streaming barrier ended with 0 requests and 0 pending textures, and its 81-texture residency hash was stable across both semantic replay processes.
 
@@ -248,6 +269,8 @@ The known reveal fixture rejected all 174/174 revealed pixels with valid evidenc
 The fixture process recorded 81 actors, 99 components, two skeletal components and 178 component-space bones. Scene-state hashes changed across logical frames and matched exactly across clean processes. Seven ticking actors lacked `SRDatasetControllable`; their paths/classes are listed for audit rather than automatically treated as failures. GPU particle payloads are outside this hash scope and remain a cache/validation requirement.
 
 Five color files were not byte-identical in the standard replay, but remained inside the numeric gate (HUD-less PSNR at least 61.6 dB in that run). Depth, motion, validity, masks and IDs were exact. Cross-GPU or cross-driver bit identity is not promised.
+
+In the capture-order pair, all 30 non-color modality/frame pairs were byte-exact. The order-sensitive Lumen/color outputs remained within the numeric gate; the worst HUD-less comparison was 59.1 dB PSNR. This closes the fixture-level capture-order gate, while non-fixture scene coverage and Main View/reference pixel-domain equivalence remain open.
 
 See [`Docs/ARCHITECTURE.md`](Docs/ARCHITECTURE.md) for the full state/control contract and [`Docs/ROADMAP.md`](Docs/ROADMAP.md) for the remaining certification work.
 

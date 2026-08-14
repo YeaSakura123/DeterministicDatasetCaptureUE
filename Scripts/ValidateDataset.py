@@ -64,6 +64,10 @@ REPLAY_ROLES = {
     "FrameGenerationEndpoints",
     "FrameGenerationIntermediate",
 }
+AUXILIARY_CAPTURE_ORDERS = {
+    "HighResolutionFirst",
+    "LowResolutionFirst",
+}
 REPLAY_METADATA_FIELDS = (
     "logicalFrameId",
     "simulationTick",
@@ -105,7 +109,40 @@ REPLAY_METADATA_FIELDS = (
     "motionTimeSpanS",
     "motionTrainingUsable",
     "endpointPreviousTransformOverride",
+    "auxiliaryCaptureOrder",
 )
+
+
+def expected_submission_modalities(job: dict[str, Any]) -> list[str]:
+    high_resolution = ["hr"]
+    if job.get("bCaptureReferenceHR", False):
+        high_resolution.append("hr_reference")
+    low_resolution: list[str] = []
+    if job.get("lRMode") == "NativeRender":
+        low_resolution.append("lr")
+    if job.get("bCaptureDepth", False):
+        low_resolution.append("depth")
+    auxiliary = (
+        low_resolution + high_resolution
+        if job.get("auxiliaryCaptureOrder") == "LowResolutionFirst"
+        else high_resolution + low_resolution
+    )
+    if job.get("bCaptureMainViewTemporalDiagnostics", False):
+        auxiliary.append("main_view_temporal")
+    return auxiliary
+
+
+def normalized_capture_order_job(job: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(job)
+    for field in ("jobName", "outputDirectory", "auxiliaryCaptureOrder"):
+        normalized.pop(field, None)
+    return normalized
+
+
+def normalized_capture_order_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(provenance)
+    normalized.pop("captureConfigSha1", None)
+    return normalized
 
 
 def sha1(path: Path) -> str:
@@ -767,7 +804,11 @@ def validate_semantic_fixture_frame(
     )
 
 
-def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]:
+def validate(
+    dataset: Path,
+    compare: Path | None,
+    compare_mode: str = "exact-replay",
+) -> tuple[dict[str, Any], bool]:
     dataset = dataset.resolve()
     manifest_path = dataset / "manifest.json"
     if not manifest_path.is_file():
@@ -784,6 +825,17 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
     lr_size = (int(job.get("lRResolution", {}).get("x", 0)), int(job.get("lRResolution", {}).get("y", 0)))
     temporal_enabled = bool(job.get("bCaptureTemporalDiagnostics", False))
     main_view = bool(job.get("bCaptureMainViewTemporalDiagnostics", False))
+    auxiliary_capture_order = str(job.get("auxiliaryCaptureOrder") or "HighResolutionFirst")
+    add_check(
+        checks,
+        "capture_order.job_contract",
+        auxiliary_capture_order in AUXILIARY_CAPTURE_ORDERS
+        and not (
+            auxiliary_capture_order == "LowResolutionFirst"
+            and job.get("lRMode") != "NativeRender"
+        ),
+        f"order={auxiliary_capture_order} lrMode={job.get('lRMode')}",
+    )
     replay_role = str(manifest.get("replayPass") or job.get("replayPass") or "Standard")
     job_replay_role = str(job.get("replayPass") or "Standard")
     add_check(
@@ -931,6 +983,7 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
     frame_paths: dict[tuple[int, str], Path] = {}
     temporal_records: list[tuple[int, dict[str, Any], bool]] = []
     semantic_records: list[tuple[int, dict[str, Any], dict[str, np.ndarray]]] = []
+    all_render_submission_ids: list[int] = []
     for frame in frames:
         frame_id = int(frame["logicalFrameId"])
         frame_role = str(frame.get("replayPass") or "Standard")
@@ -956,6 +1009,41 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
             endpoint_override is expected_endpoint_override,
             f"expected={expected_endpoint_override} actual={endpoint_override}",
         )
+        frame_capture_order = str(frame.get("auxiliaryCaptureOrder") or "")
+        submissions = frame.get("renderSubmissions", [])
+        expected_modalities = expected_submission_modalities(job)
+        actual_modalities = [str(item.get("modality")) for item in submissions]
+        submission_ids = [int(item.get("renderSubmissionId", -1)) for item in submissions]
+        expected_view_states = [
+            "player_main_view" if modality == "main_view_temporal" else f"{modality}_scene_capture"
+            for modality in actual_modalities
+        ]
+        actual_view_states = [str(item.get("viewState")) for item in submissions]
+        submission_contract = (
+            frame_capture_order == auxiliary_capture_order
+            and actual_modalities == ([] if frame.get("resumed") is True else expected_modalities)
+            and submission_ids == sorted(submission_ids)
+            and len(set(submission_ids)) == len(submission_ids)
+            and all(submission_id >= 0 for submission_id in submission_ids)
+            and actual_view_states == expected_view_states
+            and all(item.get("simulationAdvance") is False for item in submissions)
+        )
+        add_check(
+            checks,
+            f"frame_{frame_id:06d}.capture_order_submissions",
+            submission_contract,
+            json.dumps(
+                {
+                    "order": frame_capture_order,
+                    "expectedModalities": expected_modalities,
+                    "actualModalities": actual_modalities,
+                    "submissionIds": submission_ids,
+                    "viewStates": actual_view_states,
+                },
+                sort_keys=True,
+            ),
+        )
+        all_render_submission_ids.extend(submission_ids)
         frame_streaming_hash = str(frame.get("streamingStateSha1", ""))
         valid_frame_streaming_hash = len(frame_streaming_hash) == 40 and all(
             character in "0123456789ABCDEFabcdef" for character in frame_streaming_hash
@@ -1191,6 +1279,14 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
                             f"metadata_device={hudless.get('outputDevice')} cvar_device={expected_output_device} metadata_gamut={hudless.get('colorGamut')} cvar_gamut={expected_color_gamut}",
                         )
 
+    add_check(
+        checks,
+        "capture_order.submission_ids_global",
+        not all_render_submission_ids
+        or all_render_submission_ids == list(range(len(all_render_submission_ids))),
+        f"count={len(all_render_submission_ids)} first={all_render_submission_ids[:4]} last={all_render_submission_ids[-4:]}",
+    )
+
     temporal_records.sort(key=lambda item: item[0])
     for index in range(1, len(temporal_records)):
         frame_id, current, reset = temporal_records[index]
@@ -1351,6 +1447,7 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
         other_manifest_path = compare / "manifest.json" if compare.is_dir() else compare
         other_root = (compare if compare.is_dir() else compare.parent).resolve()
         other = json.loads(other_manifest_path.read_text(encoding="utf-8"))
+        other_job = other.get("job", {})
         other_role = str(other.get("replayPass") or other.get("job", {}).get("replayPass") or "Standard")
         add_check(
             checks,
@@ -1358,12 +1455,45 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
             other_role == replay_role,
             f"left={replay_role} right={other_role}",
         )
-        add_check(
-            checks,
-            "replay.provenance_exact",
-            provenance == other.get("provenance", {}),
-            "exact" if provenance == other.get("provenance", {}) else "provenance differs",
-        )
+        if compare_mode == "capture-order":
+            other_order = str(other_job.get("auxiliaryCaptureOrder") or "HighResolutionFirst")
+            order_pair_valid = {
+                auxiliary_capture_order,
+                other_order,
+            } == AUXILIARY_CAPTURE_ORDERS
+            normalized_jobs_match = (
+                normalized_capture_order_job(job)
+                == normalized_capture_order_job(other_job)
+            )
+            normalized_provenance_match = (
+                normalized_capture_order_provenance(provenance)
+                == normalized_capture_order_provenance(other.get("provenance", {}))
+            )
+            add_check(
+                checks,
+                "capture_order.opposite_orders",
+                order_pair_valid,
+                f"left={auxiliary_capture_order} right={other_order}",
+            )
+            add_check(
+                checks,
+                "capture_order.jobs_equal_except_identity_output_and_order",
+                normalized_jobs_match,
+                "exact after normalization" if normalized_jobs_match else "normalized jobs differ",
+            )
+            add_check(
+                checks,
+                "capture_order.provenance_equal_except_config_hash",
+                normalized_provenance_match,
+                "exact after normalization" if normalized_provenance_match else "normalized provenance differs",
+            )
+        else:
+            add_check(
+                checks,
+                "replay.provenance_exact",
+                provenance == other.get("provenance", {}),
+                "exact" if provenance == other.get("provenance", {}) else "provenance differs",
+            )
         other_hashes = {
             (int(frame["logicalFrameId"]), modality): str(value).upper()
             for frame in other.get("frames", [])
@@ -1378,6 +1508,20 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
             f"left={len(frame_hashes)} right={len(other_hashes)} mismatches={hash_mismatches}",
             required=False,
         )
+        if compare_mode == "capture-order":
+            non_color_keys = {
+                key for key in all_keys if key[1] not in COLOR_MODALITIES
+            }
+            non_color_hash_mismatches = sum(
+                frame_hashes.get(key) != other_hashes.get(key)
+                for key in non_color_keys
+            )
+            add_check(
+                checks,
+                "capture_order.non_color_modalities_byte_exact",
+                bool(non_color_keys) and non_color_hash_mismatches == 0,
+                f"modalities={len(non_color_keys)} mismatches={non_color_hash_mismatches}",
+            )
 
         other_frames = {int(frame["logicalFrameId"]): frame for frame in other.get("frames", [])}
         add_check(checks, "replay.frame_ids", set(other_frames) == {int(frame["logicalFrameId"]) for frame in frames}, f"left={len(frames)} right={len(other_frames)}")
@@ -1438,6 +1582,11 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
             if left_frame is None:
                 continue
             for field in REPLAY_METADATA_FIELDS:
+                if compare_mode == "capture-order" and field in {
+                    "renderSubmissions",
+                    "auxiliaryCaptureOrder",
+                }:
+                    continue
                 left_value = left_frame.get(field)
                 right_value = right_frame.get(field)
                 add_check(
@@ -1453,6 +1602,12 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
     passed = all(check["passed"] for check in required_checks)
     report = {
         "validatorVersion": 3,
+        "comparisonMode": compare_mode if compare is not None else "none",
+        "captureOrderInvarianceGate": (
+            "pass" if compare is not None and compare_mode == "capture-order" and passed
+            else "fail" if compare is not None and compare_mode == "capture-order"
+            else "not_run"
+        ),
         "dataset": str(dataset.resolve()),
         "contractVersion": manifest.get("contractVersion"),
         "certificationStatus": manifest.get("certificationStatus"),
@@ -1464,7 +1619,7 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
         "checks": checks,
         "statistics": stats,
         "replayMetrics": replay_metrics,
-        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. When the semantic fixture is enabled it also validates object-motion direction/magnitude, 1/10/100 m depth, nonzero After-DOF transparency, known occlusion/disocclusion geometry, and the experimental history-rejection signal. Cross-replay checks require exact temporal/native-HR/reference-HR/HUD-less/semantic metadata. Capture-order invariance, production certification of disocclusion for unlabeled/deforming geometry, and Main View/reference-HR pixel equivalence remain separate gates.",
+        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. When the semantic fixture is enabled it also validates object-motion direction/magnitude, 1/10/100 m depth, nonzero After-DOF transparency, known occlusion/disocclusion geometry, and the experimental history-rejection signal. Exact replay requires matching provenance and metadata. Capture-order comparison requires opposite auxiliary submission orders, identical normalized jobs/provenance, exact non-color buffers and tolerance-gated color. Production certification of disocclusion for unlabeled/deforming geometry and Main View/reference-HR pixel equivalence remain separate gates.",
     }
     return report, passed
 
@@ -1473,10 +1628,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path, help="Dataset output directory containing manifest.json")
     parser.add_argument("--compare", type=Path, help="Second dataset directory or manifest for deterministic hash comparison")
+    parser.add_argument(
+        "--compare-mode",
+        choices=("exact-replay", "capture-order"),
+        default="exact-replay",
+        help="Comparison contract. capture-order allows only job identity/output/order and captureConfigSha1 to differ.",
+    )
     parser.add_argument("--report", type=Path, help="Output report path (default: <dataset>/validation_report.json)")
     args = parser.parse_args()
 
-    report, passed = validate(args.dataset, args.compare)
+    if args.compare_mode == "capture-order" and args.compare is None:
+        parser.error("--compare-mode capture-order requires --compare")
+
+    report, passed = validate(args.dataset, args.compare, args.compare_mode)
     report_path = args.report or (args.dataset / "validation_report.json")
     temporary = report_path.with_suffix(report_path.suffix + ".part")
     temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

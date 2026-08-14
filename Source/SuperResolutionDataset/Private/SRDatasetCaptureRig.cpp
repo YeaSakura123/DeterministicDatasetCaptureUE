@@ -112,18 +112,34 @@ void ASRDatasetCaptureRig::WarmupRenderState(const FSRDatasetCaptureJob& Job)
 {
 	// Initialize each modality's persistent SceneCapture view state without
 	// writing a training sample or advancing world simulation.
-	HRCapture->CaptureScene();
-	if (Job.LRMode == ESRDatasetLRMode::NativeRender)
+	const auto WarmHighResolution = [this, &Job]()
 	{
-		LRCapture->CaptureScene();
+		HRCapture->CaptureScene();
+		if (Job.bCaptureReferenceHR)
+		{
+			ReferenceCapture->CaptureScene();
+		}
+	};
+	const auto WarmLowResolution = [this, &Job]()
+	{
+		if (Job.LRMode == ESRDatasetLRMode::NativeRender)
+		{
+			LRCapture->CaptureScene();
+		}
+		if (Job.bCaptureDepth)
+		{
+			DepthCapture->CaptureScene();
+		}
+	};
+	if (Job.AuxiliaryCaptureOrder == ESRDatasetAuxiliaryCaptureOrder::LowResolutionFirst)
+	{
+		WarmLowResolution();
+		WarmHighResolution();
 	}
-	if (Job.bCaptureReferenceHR)
+	else
 	{
-		ReferenceCapture->CaptureScene();
-	}
-	if (Job.bCaptureDepth)
-	{
-		DepthCapture->CaptureScene();
+		WarmHighResolution();
+		WarmLowResolution();
 	}
 }
 
@@ -179,33 +195,43 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 		ViewExtension = GetSRDatasetViewExtension();
 		if (!ViewExtension)
 		{
-			OutError = TEXT("The SRDataset RDG view extension is not available for native HR capture.");
-			return false;
-		}
-		if (!ViewExtension->RequestCapture(Job.HRResolution, Job.HRResolution, false, OutError))
-		{
+			OutError = TEXT("The SRDataset RDG view extension is not available for isolated capture.");
 			return false;
 		}
 	}
 
 	FImage HRImage;
-	HRCapture->CaptureScene();
-	if (!FImageUtils::GetRenderTargetImage(HRTarget, HRImage))
+	FImage LRImage;
+	const auto CaptureHighResolution = [&]() -> bool
 	{
-		OutError = TEXT("Failed to read the HR render target.");
-		return false;
-	}
-	if (Job.bCaptureTemporalDiagnostics)
-	{
-		FSRDatasetTemporalCaptureResult NativeHRResult;
-		if (!ViewExtension->WaitAndTakeCapture(NativeHRResult, OutError) ||
-			!SaveNativeHDRColorResult(NativeHRResult, HRPath, OutHashes, OutError))
+		if (Job.bCaptureTemporalDiagnostics &&
+			!ViewExtension->RequestCapture(Job.HRResolution, Job.HRResolution, false, OutError))
 		{
 			return false;
 		}
-	}
-	if (Job.bCaptureReferenceHR)
+		HRCapture->CaptureScene();
+		if (!FImageUtils::GetRenderTargetImage(HRTarget, HRImage))
+		{
+			OutError = TEXT("Failed to read the HR render target.");
+			return false;
+		}
+		if (Job.bCaptureTemporalDiagnostics)
+		{
+			FSRDatasetTemporalCaptureResult NativeHRResult;
+			if (!ViewExtension->WaitAndTakeCapture(NativeHRResult, OutError) ||
+				!SaveNativeHDRColorResult(NativeHRResult, HRPath, OutHashes, OutError))
+			{
+				return false;
+			}
+		}
+		return true;
+	};
+	const auto CaptureReference = [&]() -> bool
 	{
+		if (!Job.bCaptureReferenceHR)
+		{
+			return true;
+		}
 		const FIntPoint ReferenceSize(
 			Job.HRResolution.X * Job.ReferenceHRScale,
 			Job.HRResolution.Y * Job.ReferenceHRScale);
@@ -220,31 +246,16 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 		{
 			return false;
 		}
-	}
-
-	FString Hash;
-	if (!SaveImageAtomic(HRPath, TEXT("png"), HRImage, Hash, OutError))
+		return true;
+	};
+	const auto CaptureLowResolution = [&]() -> bool
 	{
-		return false;
-	}
-	OutHashes.Add(TEXT("hr"), Hash);
-
-	FImage LRImage;
-	if (Job.LRMode == ESRDatasetLRMode::DownsampleFromHR)
-	{
-		LRImage.Init(Job.LRResolution.X, Job.LRResolution.Y, 1, HRImage.Format, HRImage.GammaSpace);
-		FImageCore::ResizeImage(HRImage, LRImage, ToImageFilter(Job.ResizeFilter));
-	}
-	else
-	{
+		if (Job.LRMode != ESRDatasetLRMode::NativeRender)
+		{
+			return true;
+		}
 		if (Job.bCaptureTemporalDiagnostics && !Job.bCaptureMainViewTemporalDiagnostics)
 		{
-			ViewExtension = GetSRDatasetViewExtension();
-			if (!ViewExtension)
-			{
-				OutError = TEXT("The SRDataset RDG view extension is not available.");
-				return false;
-			}
 			if (!ViewExtension->RequestCapture(Job.LRResolution, Job.HRResolution, false, OutError))
 			{
 				return false;
@@ -273,18 +284,15 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 			{
 				return false;
 			}
-			LastTemporalMetadata = TemporalResult.Metadata;
 		}
-	}
-
-	if (!SaveImageAtomic(LRPath, TEXT("png"), LRImage, Hash, OutError))
+		return true;
+	};
+	const auto CaptureDepth = [&]() -> bool
 	{
-		return false;
-	}
-	OutHashes.Add(TEXT("lr"), Hash);
-
-	if (Job.bCaptureDepth)
-	{
+		if (!Job.bCaptureDepth)
+		{
+			return true;
+		}
 		FImage DepthImage;
 		DepthCapture->CaptureScene();
 		if (!FImageUtils::GetRenderTargetImage(DepthTarget, DepthImage))
@@ -292,12 +300,46 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 			OutError = TEXT("Failed to read the depth render target.");
 			return false;
 		}
-		if (!SaveImageAtomic(DepthPath, TEXT("exr"), DepthImage, Hash, OutError))
+		FString DepthHash;
+		if (!SaveImageAtomic(DepthPath, TEXT("exr"), DepthImage, DepthHash, OutError))
 		{
 			return false;
 		}
-		OutHashes.Add(TEXT("depth"), Hash);
+		OutHashes.Add(TEXT("depth"), DepthHash);
+		return true;
+	};
+
+	if (Job.AuxiliaryCaptureOrder == ESRDatasetAuxiliaryCaptureOrder::LowResolutionFirst)
+	{
+		if (!CaptureLowResolution() || !CaptureDepth() ||
+			!CaptureHighResolution() || !CaptureReference())
+		{
+			return false;
+		}
 	}
+	else if (!CaptureHighResolution() || !CaptureReference() ||
+		!CaptureLowResolution() || !CaptureDepth())
+	{
+		return false;
+	}
+
+	if (Job.LRMode == ESRDatasetLRMode::DownsampleFromHR)
+	{
+		LRImage.Init(Job.LRResolution.X, Job.LRResolution.Y, 1, HRImage.Format, HRImage.GammaSpace);
+		FImageCore::ResizeImage(HRImage, LRImage, ToImageFilter(Job.ResizeFilter));
+	}
+
+	FString Hash;
+	if (!SaveImageAtomic(HRPath, TEXT("png"), HRImage, Hash, OutError))
+	{
+		return false;
+	}
+	OutHashes.Add(TEXT("hr"), Hash);
+	if (!SaveImageAtomic(LRPath, TEXT("png"), LRImage, Hash, OutError))
+	{
+		return false;
+	}
+	OutHashes.Add(TEXT("lr"), Hash);
 
 	return true;
 }

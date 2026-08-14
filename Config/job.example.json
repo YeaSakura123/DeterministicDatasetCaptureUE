@@ -18,6 +18,7 @@
   },
   "lRMode": "DownsampleFromHR",
   "resizeFilter": "CubicMitchell",
+  "auxiliaryCaptureOrder": "HighResolutionFirst",
   "bCaptureDepth": true,
   "outputDirectory": "Saved/SRDataset/first_person_example",
   "bResume": true,
