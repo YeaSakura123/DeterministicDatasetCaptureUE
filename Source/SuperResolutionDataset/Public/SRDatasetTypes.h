@@ -31,6 +31,14 @@ enum class ESRDatasetCaptureState : uint8
 	Cancelled
 };
 
+UENUM(BlueprintType)
+enum class ESRDatasetReplayPass : uint8
+{
+	Standard,
+	FrameGenerationEndpoints,
+	FrameGenerationIntermediate
+};
+
 /**
  * A serializable capture job. The same struct is accepted by Blueprint and by
  * the -SRDatasetJob=<json-file> command-line entry point.
@@ -40,12 +48,20 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 {
 	GENERATED_BODY()
 
+	/** Versioned semantic contract. v0.1.x only certifies spatial-sr-data-v1. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Identity")
+	FString ContractVersion = TEXT("spatial-sr-data-v1");
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Identity")
 	FString JobName = TEXT("default");
 
 	/** Optional Level Sequence. Autonomous gameplay is still advanced at the fixed frame rate. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay")
 	FSoftObjectPath Sequence;
+
+	/** Explicit replay role; FG endpoint and intermediate passes are assembled separately. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay")
+	ESRDatasetReplayPass ReplayPass = ESRDatasetReplayPass::Standard;
 
 	/** Optional package name guard, for example /Game/Maps/MyMap. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay")
@@ -65,6 +81,10 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	/** Simulates every frame but only writes every Nth frame. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Frames", meta = (ClampMin = "1"))
 	int32 FrameStep = 1;
+
+	/** Captured phase in [0, FrameStep); 0 preserves the original behavior. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Frames", meta = (ClampMin = "0"))
+	int32 CaptureFrameOffset = 0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Frames", meta = (ClampMin = "1"))
 	int32 CaptureFrameRateNumerator = 30;
@@ -90,6 +110,36 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
 	bool bCaptureDepth = true;
+
+	/**
+	 * Experimental UE RDG extraction from the native LR view. Writes HDR Color,
+	 * raw/full motion, device/linear depth and validity diagnostics. These files
+	 * are not temporal-training certified until the validation suite passes.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
+	bool bCaptureTemporalDiagnostics = false;
+
+	/** Capture diagnostics from the real player Main View instead of the LR SceneCapture. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureTemporalDiagnostics"))
+	bool bCaptureMainViewTemporalDiagnostics = false;
+
+	/**
+	 * Render an isolated, non-jittered spatial supersample and downsample it to
+	 * the HR output grid as a distinct linear-HDR reference target.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureTemporalDiagnostics"))
+	bool bCaptureReferenceHR = false;
+
+	/** Per-axis reference render scale. 2 means 4x as many source pixels. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (ClampMin = "2", ClampMax = "4", EditCondition = "bCaptureReferenceHR"))
+	int32 ReferenceHRScale = 2;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureReferenceHR"))
+	ESRDatasetResizeFilter ReferenceResizeFilter = ESRDatasetResizeFilter::Lanczos4;
+
+	/** Capture display-resolution Main View color after tonemap but before Slate/UI composition. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureMainViewTemporalDiagnostics"))
+	bool bCaptureMainViewHUDlessColor = false;
 
 	/** Relative paths resolve beneath the project directory. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
@@ -117,6 +167,37 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	/** Removes view-dependent motion blur from all generated modalities. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
 	bool bDisableMotionBlur = true;
+
+	/** Disables eye adaptation so HR/LR/Main View use a stable exposure state. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
+	bool bLockExposure = true;
+
+	/** Disables parallel/async render paths whose completion order can perturb offline captures. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
+	bool bForceSynchronousRendering = true;
+
+	/**
+	 * Experimental endpoint capture: do not submit a player Main View on
+	 * simulated frames that are not selected by FrameStep/CaptureFrameOffset.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation")
+	bool bSuppressMainViewOnUncapturedFrames = false;
+
+	/**
+	 * Override component previous transforms with the last captured endpoint.
+	 * This covers rigid/component motion; skeletal bone/WPO endpoint motion is
+	 * still uncertified and must not be inferred from this option alone.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bSuppressMainViewOnUncapturedFrames"))
+	bool bUseLastCapturedEndpointTransforms = false;
+
+	/**
+	 * Replaces visible level geometry with a deterministic, camera-relative test
+	 * chart containing moving, known-depth and translucent primitives. This is a
+	 * validation fixture, not a production dataset option.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation")
+	bool bEnableSemanticValidationFixture = false;
 
 	/** Exit Unreal automatically after a command-line job completes or fails. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Automation")

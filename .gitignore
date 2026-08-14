@@ -13,5 +13,8 @@ Saved/
 *.pdb
 *.obj
 *.log
+__pycache__/
+*.py[cod]
+.venv/
 Thumbs.db
 .DS_Store

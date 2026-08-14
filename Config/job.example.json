@@ -1,4 +1,5 @@
 {
+  "contractVersion": "spatial-sr-data-v1",
   "jobName": "first_person_example",
   "expectedMap": "/Game/FirstPerson/Lvl_FirstPerson",
   "startFrame": 0,
@@ -26,5 +27,7 @@
   "bForceNiagaraDeterminism": true,
   "bEnableChaosDeterminism": true,
   "bDisableMotionBlur": true,
+  "bLockExposure": true,
+  "bForceSynchronousRendering": true,
   "bAutoQuit": true
 }

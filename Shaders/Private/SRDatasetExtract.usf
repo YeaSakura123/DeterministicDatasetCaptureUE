@@ -1,0 +1,144 @@
+#include "/Engine/Private/Common.ush"
+
+Texture2D<float4> InputSceneColor;
+Texture2D<float4> InputVelocity;
+Texture2D<float> InputDepth;
+Texture2D<float4> InputSeparateTranslucency;
+Texture2D<uint2> InputCustomStencil;
+SamplerState InputSeparateTranslucencySampler;
+
+RWTexture2D<float4> OutSceneColor;
+RWTexture2D<float4> OutVelocityRaw;
+RWTexture2D<float4> OutMotionFull;
+RWTexture2D<float4> OutDepth;
+RWTexture2D<float4> OutTranslucency;
+RWTexture2D<float4> OutObjectId;
+RWTexture2D<float4> OutMetadata;
+
+int2 InputViewRectMin;
+int2 OutputSize;
+float2 DisplaySize;
+int2 SeparateTranslucencyViewRectMin;
+int2 SeparateTranslucencyViewRectSize;
+
+float2 ComputeCameraScreenVelocity(uint2 OutputPixel, float DeviceZ)
+{
+	float2 ViewportUV = (float2(OutputPixel) + 0.5f) / float2(OutputSize);
+	float2 ScreenPos = 2.0f * float2(ViewportUV.x, 1.0f - ViewportUV.y) - 1.0f;
+	float4 ThisClip = float4(ScreenPos, DeviceZ, 1.0f);
+	float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
+	float2 PrevScreen = PrevClip.xy / PrevClip.w;
+	return AdjustClipToPrevClipForProjectionType(ScreenPos - PrevScreen, DeviceZ);
+}
+
+float4 GetMetadataValue(uint Row, uint Column)
+{
+	float4x4 PrevViewToClipNoAA = View.PrevViewToClip;
+	PrevViewToClipNoAA[2][0] -= View.TemporalAAJitter.z;
+	PrevViewToClipNoAA[2][1] -= View.TemporalAAJitter.w;
+	float4x4 TranslatedWorldToClipNoAA = mul(View.TranslatedWorldToView, View.ViewToClipNoAA);
+	float4x4 PrevTranslatedWorldToClipNoAA = mul(View.PrevTranslatedWorldToView, PrevViewToClipNoAA);
+
+	if (Row == 0) return View.ViewToClip[Column];
+	if (Row == 1) return View.ViewToClipNoAA[Column];
+	if (Row == 2) return View.PrevViewToClip[Column];
+	if (Row == 3) return View.ClipToPrevClip[Column];
+	if (Row == 4) return View.ClipToPrevClipWithAA[Column];
+	if (Row == 5 && Column == 0) return float4(View.PreExposure, View.OneOverPreExposure, View.TemporalAAJitter.xy);
+	if (Row == 5 && Column == 1) return float4(View.TemporalAAJitter.zw, View.DeltaTime, View.GameTime);
+	if (Row == 5 && Column == 2) return float4(View.NearPlane, View.OrthoFarPlane, View.ViewSizeAndInvSize.xy);
+	if (Row == 5 && Column == 3) return float4(View.ViewSizeAndInvSize.zw, 0.0f, 0.0f);
+	if (Row == 6) return View.TranslatedWorldToView[Column];
+	if (Row == 7) return View.ViewToTranslatedWorld[Column];
+	if (Row == 8) return View.TranslatedWorldToClip[Column];
+	if (Row == 9) return View.ClipToTranslatedWorld[Column];
+	if (Row == 10) return View.PrevTranslatedWorldToView[Column];
+	if (Row == 11) return View.PrevViewToTranslatedWorld[Column];
+	if (Row == 12) return View.PrevTranslatedWorldToClip[Column];
+	if (Row == 13) return PrevViewToClipNoAA[Column];
+	if (Row == 14) return TranslatedWorldToClipNoAA[Column];
+	if (Row == 15) return PrevTranslatedWorldToClipNoAA[Column];
+	if (Row == 16 && Column == 0) return float4(View.WorldViewOriginHigh, 0.0f);
+	if (Row == 16 && Column == 1) return float4(View.WorldViewOriginLow, 0.0f);
+	if (Row == 16 && Column == 2) return float4(View.PreViewTranslationHigh, 0.0f);
+	if (Row == 16 && Column == 3) return float4(View.PreViewTranslationLow, 0.0f);
+	if (Row == 17 && Column == 0) return float4(View.PrevWorldViewOriginHigh, 0.0f);
+	if (Row == 17 && Column == 1) return float4(View.PrevWorldViewOriginLow, 0.0f);
+	if (Row == 17 && Column == 2) return float4(View.PrevPreViewTranslationHigh, 0.0f);
+	if (Row == 17 && Column == 3) return float4(View.PrevPreViewTranslationLow, 0.0f);
+	if (Row == 18 && Column == 0) return float4(View.ViewRectMin.xy, View.ViewSizeAndInvSize.xy);
+	if (Row == 18 && Column == 1) return View.BufferSizeAndInvSize;
+	if (Row == 18 && Column == 2) return float4(View.ResolutionFractionAndInv, 0.0f, 0.0f);
+	if (Row == 19 && Column == 0) return float4(View.FrameNumber, View.StateFrameIndex, View.StateFrameIndexMod8, 0.0f);
+	return 0.0f;
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 Pixel = DispatchThreadId.xy;
+	if (all(Pixel < uint2(OutputSize)))
+	{
+		int2 InputPixel = InputViewRectMin + int2(Pixel);
+		float4 EncodedVelocity = InputVelocity.Load(int3(InputPixel, 0));
+		float DeviceZ = InputDepth.Load(int3(InputPixel, 0));
+		bool HasRenderedVelocity = EncodedVelocity.x > 0.0f;
+		bool ValidDepth = DeviceZ > 0.0f && isfinite(DeviceZ);
+
+		float2 RawScreenVelocity = HasRenderedVelocity ? DecodeVelocityFromTexture(EncodedVelocity).xy : 0.0f;
+		float2 FullScreenVelocity = HasRenderedVelocity
+			? RawScreenVelocity
+			: ComputeCameraScreenVelocity(Pixel, DeviceZ);
+
+		// UE velocity is current_screen - previous_screen in NDC-like screen space
+		// (+Y up). The dataset contract is previous_pixel = current_pixel + motion
+		// in display pixels with a top-left origin (+Y down).
+		float2 MotionCurrentToPrevious = float2(
+			-0.5f * DisplaySize.x * FullScreenVelocity.x,
+			 0.5f * DisplaySize.y * FullScreenVelocity.y);
+
+		float LinearDepthMeters = ValidDepth ? ConvertFromDeviceZ(DeviceZ) * 0.01f : 0.0f;
+		bool ValidMotion = ValidDepth && all(isfinite(MotionCurrentToPrevious));
+
+		OutSceneColor[Pixel] = InputSceneColor.Load(int3(InputPixel, 0));
+		OutVelocityRaw[Pixel] = float4(RawScreenVelocity, HasRenderedVelocity ? 1.0f : 0.0f, ValidMotion ? 1.0f : 0.0f);
+		OutMotionFull[Pixel] = float4(MotionCurrentToPrevious, HasRenderedVelocity ? 1.0f : 0.0f, ValidMotion ? 1.0f : 0.0f);
+		OutDepth[Pixel] = float4(LinearDepthMeters, DeviceZ, ValidDepth ? 1.0f : 0.0f, 1.0f);
+
+		uint SeparateWidth;
+		uint SeparateHeight;
+		InputSeparateTranslucency.GetDimensions(SeparateWidth, SeparateHeight);
+		float2 ViewportUV = (float2(Pixel) + 0.5f) / float2(OutputSize);
+		float2 SeparatePixel = float2(SeparateTranslucencyViewRectMin) +
+			ViewportUV * float2(SeparateTranslucencyViewRectSize);
+		float2 SeparateUV = SeparatePixel / float2(SeparateWidth, SeparateHeight);
+		OutTranslucency[Pixel] = InputSeparateTranslucency.SampleLevel(
+			InputSeparateTranslucencySampler, SeparateUV, 0.0f);
+
+		// Custom Stencil is the dataset's explicit, integer-valued object ID
+		// source. Zero is reserved for unlabeled/background pixels.
+		uint CustomStencil = InputCustomStencil.Load(int3(InputPixel, 0)) STENCIL_COMPONENT_SWIZZLE;
+		OutObjectId[Pixel] = float4(float(CustomStencil), 0.0f, 0.0f, 1.0f);
+	}
+
+	if (Pixel.x < 4 && Pixel.y < 20)
+	{
+		OutMetadata[Pixel] = GetMetadataValue(Pixel.y, Pixel.x);
+	}
+}
+
+[numthreads(8, 8, 1)]
+void CopyColorCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 Pixel = DispatchThreadId.xy;
+	if (all(Pixel < uint2(OutputSize)))
+	{
+		int2 InputPixel = InputViewRectMin + int2(Pixel);
+		OutSceneColor[Pixel] = InputSceneColor.Load(int3(InputPixel, 0));
+	}
+
+	if (Pixel.x < 4 && Pixel.y < 20)
+	{
+		OutMetadata[Pixel] = GetMetadataValue(Pixel.y, Pixel.x);
+	}
+}

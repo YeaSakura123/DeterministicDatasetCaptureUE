@@ -21,7 +21,9 @@ public class SuperResolutionDataset : ModuleRules
 		{
 			"Json",
 			"JsonUtilities",
+			"Projects",
 			"RenderCore",
+			"Renderer",
 			"RHI"
 		});
 	}

@@ -1,8 +1,15 @@
 #include "Modules/ModuleManager.h"
 
 #include "Engine/World.h"
+#include "Engine/Engine.h"
+#include "Misc/CoreDelegates.h"
 #include "HAL/IConsoleManager.h"
+#include "Interfaces/IPluginManager.h"
+#include "Misc/Paths.h"
+#include "RenderCore.h"
 #include "SRDatasetCaptureSubsystem.h"
+#include "SRDatasetViewExtension.h"
+#include "SceneViewExtension.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSRDatasetModule, Log, All);
 
@@ -11,6 +18,22 @@ class FSuperResolutionDatasetModule final : public IModuleInterface
 public:
 	virtual void StartupModule() override
 	{
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("SuperResolutionDataset"));
+		if (Plugin)
+		{
+			AddShaderSourceDirectoryMapping(
+				TEXT("/Plugin/SuperResolutionDataset"),
+				FPaths::Combine(Plugin->GetBaseDir(), TEXT("Shaders")));
+		}
+		if (GEngine)
+		{
+			InitializeViewExtension();
+		}
+		else
+		{
+			PostEngineInitHandle = FCoreDelegates::OnPostEngineInit.AddRaw(this, &FSuperResolutionDatasetModule::InitializeViewExtension);
+		}
+
 		StartCommand = IConsoleManager::Get().RegisterConsoleCommand(
 			TEXT("SRDataset.Start"),
 			TEXT("Start a dataset job. Usage: SRDataset.Start <job-json-path>"),
@@ -30,6 +53,13 @@ public:
 
 	virtual void ShutdownModule() override
 	{
+		if (PostEngineInitHandle.IsValid())
+		{
+			FCoreDelegates::OnPostEngineInit.Remove(PostEngineInitHandle);
+			PostEngineInitHandle.Reset();
+		}
+		SetSRDatasetViewExtension(nullptr);
+		SetSRDatasetTonemapViewExtension(nullptr);
 		for (IConsoleObject* Command : { StartCommand, CancelCommand, StatusCommand })
 		{
 			if (Command)
@@ -40,6 +70,20 @@ public:
 	}
 
 private:
+	void InitializeViewExtension()
+	{
+		if (!GetSRDatasetViewExtension())
+		{
+			SetSRDatasetViewExtension(FSceneViewExtensions::NewExtension<FSRDatasetViewExtension>(
+				ESRDatasetViewCaptureStage::AfterDOFTemporal));
+		}
+		if (!GetSRDatasetTonemapViewExtension())
+		{
+			SetSRDatasetTonemapViewExtension(FSceneViewExtensions::NewExtension<FSRDatasetViewExtension>(
+				ESRDatasetViewCaptureStage::AfterTonemapColor));
+		}
+	}
+
 	static USRDatasetCaptureSubsystem* FindSubsystem(UWorld* World)
 	{
 		if (!World)
@@ -96,6 +140,7 @@ private:
 	IConsoleObject* StartCommand = nullptr;
 	IConsoleObject* CancelCommand = nullptr;
 	IConsoleObject* StatusCommand = nullptr;
+	FDelegateHandle PostEngineInitHandle;
 };
 
 IMPLEMENT_MODULE(FSuperResolutionDatasetModule, SuperResolutionDataset)

@@ -1,25 +1,31 @@
 {
   "contractVersion": "spatial-sr-data-v1",
-  "jobName": "first_person_smoke",
+  "jobName": "first_person_semantic_validation",
   "expectedMap": "/Game/FirstPerson/Lvl_FirstPerson",
   "startFrame": 0,
-  "endFrame": 0,
+  "endFrame": 1,
   "frameStep": 1,
   "captureFrameRateNumerator": 30,
   "captureFrameRateDenominator": 1,
-  "warmupFrames": 2,
+  "warmupFrames": 32,
   "hRResolution": {
+    "x": 256,
+    "y": 144
+  },
+  "lRResolution": {
     "x": 128,
     "y": 72
   },
-  "lRResolution": {
-    "x": 64,
-    "y": 36
-  },
-  "lRMode": "DownsampleFromHR",
+  "lRMode": "NativeRender",
   "resizeFilter": "CubicMitchell",
   "bCaptureDepth": true,
-  "outputDirectory": "Saved/SRDataset/smoke",
+  "bCaptureTemporalDiagnostics": true,
+  "bCaptureMainViewTemporalDiagnostics": true,
+  "bCaptureReferenceHR": true,
+  "referenceHRScale": 2,
+  "referenceResizeFilter": "Lanczos4",
+  "bCaptureMainViewHUDlessColor": true,
+  "outputDirectory": "Saved/SRDataset/semantic_validation",
   "bResume": false,
   "bWriteManifestEveryFrame": true,
   "randomSeed": 1337,
@@ -29,5 +35,6 @@
   "bDisableMotionBlur": true,
   "bLockExposure": true,
   "bForceSynchronousRendering": true,
+  "bEnableSemanticValidationFixture": true,
   "bAutoQuit": true
 }
