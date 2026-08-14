@@ -42,8 +42,10 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Atomic FG assembler plus an independent self-contained integrity validator.
 - [x] Per-frame sorted scene-state hash covering Actor/components, skeletal bones, Niagara controls and controllable/ticking-actor audit lists.
 - [x] Capture `motion_0_to_1` in an independent reverse-endpoint process; never infer it by negation.
+- [x] Validate controlled pure-skinning endpoint motion by injecting double-buffered component-space bones in both directions.
+- [x] Validate explicit `PreviousFrameSwitch` WPO endpoint motion in forward/reverse/midpoint processes and the assembled pair.
 - [ ] Capture UI Color/Alpha independently and validate zero UI residue in HUD-less color.
-- [ ] Validate endpoint motion for skeletal bones, WPO, animated materials, Niagara and translucency.
+- [ ] Validate non-fixture AnimBP, project WPO/animated materials, Niagara and translucency endpoint motion.
 - [ ] Certify disocclusion/visibility for unlabeled moving, skeletal, WPO and animated-material geometry and capture both endpoint directions.
 - [ ] Add static/camera-only/mixed-motion and four-direction jitter-sign fixtures.
 - [ ] Add a preflight scanner for every tickable actor, Niagara data interface and nondeterministic material input.
@@ -111,3 +113,13 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - The assembler copies independently captured `motion_1_to_0`, `motion_0_to_1` and direction-specific history-rejection/validity buffers; the self-contained pair passed 127/127 integrity checks.
 - Full scene-state hashes did not match between forward and reverse fixture traversal because hidden ticking actors remain uncontrolled. The exception is fixture-only; production assembly still rejects it.
 - UI RGBA, skeletal/WPO/animated-material endpoint validation and production-certified bidirectional visibility remain open, so FG certification remains false.
+
+## Version 0.4.1 skeletal and WPO endpoint snapshot
+
+- UE 5.7 Development Editor build passed.
+- Forward endpoint, reverse endpoint and isolated midpoint processes passed 428/428, 428/428 and 224/224 required checks.
+- The subsystem caches every eligible double-buffered skinned component's component-space bones and supplies them as previous endpoint state; the controlled pure-skinning fixture matched analytic motion within 0.02 display pixels in both directions.
+- The plugin now ships a generated validation material using explicit current/previous world offsets through UE's `PreviousFrameSwitch`, and temporal capture forces/records `r.Velocity.EnableVertexDeformation=1`.
+- WPO native Velocity coverage was 100% in both directions. Expected `-17.23077/+17.23077` display pixels measured `-17.23032/+17.23033`.
+- The self-contained FG pair re-measured both WPO fields and passed 131/131 integrity checks. Opposite auxiliary capture-order comparison passed 599/599 checks.
+- UI RGBA, non-fixture AnimBP/project WPO/animated-material coverage and production-certified bidirectional visibility remain open, so FG certification remains false.

@@ -432,6 +432,22 @@ void USRDatasetCaptureSubsystem::ApplyDeterministicRuntimeState()
 	FApp::SetUseFixedTimeStep(true);
 	FMath::RandInit(ActiveJob.RandomSeed);
 	FMath::SRandInit(ActiveJob.RandomSeed);
+	PreviousRenderDeterminismCVars.Reset();
+	const auto ApplyTrackedCVarOverride = [this](const TCHAR* Name, const TCHAR* Value)
+	{
+		if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(Name))
+		{
+			PreviousRenderDeterminismCVars.Add(Name, Variable->GetString());
+			Variable->Set(Value, ECVF_SetByCode);
+		}
+	};
+
+	if (ActiveJob.bCaptureMainViewTemporalDiagnostics)
+	{
+		// WPO on an otherwise stationary component only participates in the
+		// velocity pass when vertex-deformation velocity output is enabled.
+		ApplyTrackedCVarOverride(TEXT("r.Velocity.EnableVertexDeformation"), TEXT("1"));
+	}
 
 	if (ActiveJob.bCaptureMainViewTemporalDiagnostics)
 	{
@@ -524,14 +540,9 @@ void USRDatasetCaptureSubsystem::ApplyDeterministicRuntimeState()
 			{ TEXT("r.Nanite.AsyncRasterization.CustomPass"), TEXT("0") },
 			{ TEXT("r.Nanite.AsyncRasterization.LumenMeshCards"), TEXT("0") }
 		};
-		PreviousRenderDeterminismCVars.Reset();
 		for (const TPair<const TCHAR*, const TCHAR*>& Override : Overrides)
 		{
-			if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(Override.Key))
-			{
-				PreviousRenderDeterminismCVars.Add(Override.Key, Variable->GetString());
-				Variable->Set(Override.Value, ECVF_SetByCode);
-			}
+			ApplyTrackedCVarOverride(Override.Key, Override.Value);
 		}
 	}
 }
@@ -591,6 +602,10 @@ void USRDatasetCaptureSubsystem::RestoreDeterministicRuntimeState()
 	}
 	bOverrodeWorldRendering = false;
 	LastCapturedEndpointTransforms.Reset();
+	LastCapturedEndpointBoneStates.Reset();
+	AppliedEndpointBoneComponentCount = 0;
+	AppliedEndpointBoneCount = 0;
+	SkippedEndpointBoneComponents.Reset();
 	for (const TPair<FString, FString>& Pair : PreviousRenderDeterminismCVars)
 	{
 		if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(*Pair.Key))
@@ -685,6 +700,7 @@ void USRDatasetCaptureSubsystem::SnapshotProvenance()
 		TEXT("r.Streaming.UseFixedPoolSize"),
 		TEXT("r.TemporalAA.Upsampling"),
 		TEXT("r.TemporalAA.Debug.OverrideTemporalIndex"),
+		TEXT("r.Velocity.EnableVertexDeformation"),
 		TEXT("r.ViewTextureMipBias.Min"),
 		TEXT("r.ViewTextureMipBias.Offset"),
 		TEXT("r.ViewTextureMipBias.Quantization"),
@@ -1418,7 +1434,10 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 
 void USRDatasetCaptureSubsystem::ApplyLastCapturedEndpointTransforms()
 {
-	if (!ActiveJob.bUseLastCapturedEndpointTransforms || LastCapturedEndpointTransforms.IsEmpty())
+	AppliedEndpointBoneComponentCount = 0;
+	AppliedEndpointBoneCount = 0;
+	SkippedEndpointBoneComponents.Reset();
+	if (!ActiveJob.bUseLastCapturedEndpointTransforms)
 	{
 		return;
 	}
@@ -1429,6 +1448,61 @@ void USRDatasetCaptureSubsystem::ApplyLastCapturedEndpointTransforms()
 			FMotionVectorSimulation::Get().SetPreviousTransform(Component, Pair.Value);
 		}
 	}
+
+	for (const TPair<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState>& Pair :
+		LastCapturedEndpointBoneStates)
+	{
+		const FSkeletalEndpointState& State = Pair.Value;
+		USkinnedMeshComponent* Component = Pair.Key.Get();
+		if (!IsValid(Component) || !Component->IsRegistered())
+		{
+			SkippedEndpointBoneComponents.Add(State.ComponentPath + TEXT("|unavailable"));
+			continue;
+		}
+		const FString CurrentAssetPath = Component->GetSkinnedAsset()
+			? Component->GetSkinnedAsset()->GetPathName()
+			: TEXT("none");
+		if (CurrentAssetPath != State.SkinnedAssetPath)
+		{
+			SkippedEndpointBoneComponents.Add(State.ComponentPath + TEXT("|skinned_asset_changed"));
+			continue;
+		}
+		TArray<FTransform>& EditablePreviousTransforms = Component->GetEditableComponentSpaceTransforms();
+		const bool bUsesDoubleBufferedTransforms =
+			&Component->GetPreviousComponentTransformsArray() == &EditablePreviousTransforms;
+		if (!bUsesDoubleBufferedTransforms)
+		{
+			SkippedEndpointBoneComponents.Add(State.ComponentPath + TEXT("|not_double_buffered"));
+			continue;
+		}
+		if (State.ComponentSpaceTransforms.IsEmpty() ||
+			EditablePreviousTransforms.Num() != State.ComponentSpaceTransforms.Num())
+		{
+			SkippedEndpointBoneComponents.Add(State.ComponentPath + TEXT("|bone_count_changed"));
+			continue;
+		}
+
+		EditablePreviousTransforms = State.ComponentSpaceTransforms;
+		TArray<uint8>& EditablePreviousVisibility = Component->GetEditableBoneVisibilityStates();
+		if (EditablePreviousVisibility.Num() == State.BoneVisibilityStates.Num())
+		{
+			EditablePreviousVisibility = State.BoneVisibilityStates;
+		}
+		else if (!State.BoneVisibilityStates.IsEmpty())
+		{
+			SkippedEndpointBoneComponents.Add(State.ComponentPath + TEXT("|visibility_count_changed"));
+			continue;
+		}
+
+		// Two queued force entries make UE select UpdatePrevious rather than
+		// reusing the last GPU skin buffer. SceneCapture flushes the world's
+		// deferred component updates before it enqueues the capture render.
+		Component->ForceMotionVector();
+		Component->ForceMotionVector();
+		++AppliedEndpointBoneComponentCount;
+		AppliedEndpointBoneCount += State.ComponentSpaceTransforms.Num();
+	}
+	SkippedEndpointBoneComponents.Sort();
 }
 
 void USRDatasetCaptureSubsystem::SnapshotCapturedEndpointTransforms()
@@ -1438,6 +1512,7 @@ void USRDatasetCaptureSubsystem::SnapshotCapturedEndpointTransforms()
 		return;
 	}
 	LastCapturedEndpointTransforms.Reset();
+	LastCapturedEndpointBoneStates.Reset();
 	for (TActorIterator<AActor> It(GetWorld()); It; ++It)
 	{
 		TInlineComponentArray<USceneComponent*> Components;
@@ -1447,6 +1522,19 @@ void USRDatasetCaptureSubsystem::SnapshotCapturedEndpointTransforms()
 			if (IsValid(Component) && Component->IsRegistered())
 			{
 				LastCapturedEndpointTransforms.Add(Component, Component->GetComponentTransform());
+				if (USkinnedMeshComponent* Skinned = Cast<USkinnedMeshComponent>(Component))
+				{
+					const TArray<FTransform>& CurrentBones = Skinned->GetComponentSpaceTransforms();
+					if (Skinned->GetSkinnedAsset() && !CurrentBones.IsEmpty())
+					{
+						FSkeletalEndpointState State;
+						State.ComponentPath = Skinned->GetPathName();
+						State.SkinnedAssetPath = Skinned->GetSkinnedAsset()->GetPathName();
+						State.ComponentSpaceTransforms = CurrentBones;
+						State.BoneVisibilityStates = Skinned->GetBoneVisibilityStates();
+						LastCapturedEndpointBoneStates.Add(Skinned, MoveTemp(State));
+					}
+				}
 			}
 		}
 	}
@@ -1599,6 +1687,22 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		MotionTimeSpanFrames * ActiveJob.GetFixedDeltaSeconds());
 	Frame->SetBoolField(TEXT("motionTrainingUsable"), !bIntermediateReplay);
 	Frame->SetBoolField(TEXT("endpointPreviousTransformOverride"), ActiveJob.bUseLastCapturedEndpointTransforms);
+	Frame->SetBoolField(
+		TEXT("endpointPreviousSkeletalBoneOverride"),
+		AppliedEndpointBoneComponentCount > 0);
+	Frame->SetNumberField(
+		TEXT("endpointPreviousSkeletalBoneComponentCount"),
+		AppliedEndpointBoneComponentCount);
+	Frame->SetNumberField(TEXT("endpointPreviousSkeletalBoneCount"), AppliedEndpointBoneCount);
+	TArray<TSharedPtr<FJsonValue>> SkippedBoneComponentsJson;
+	SkippedBoneComponentsJson.Reserve(SkippedEndpointBoneComponents.Num());
+	for (const FString& Value : SkippedEndpointBoneComponents)
+	{
+		SkippedBoneComponentsJson.Add(MakeShared<FJsonValueString>(Value));
+	}
+	Frame->SetArrayField(
+		TEXT("endpointPreviousSkeletalBoneSkippedComponents"),
+		SkippedBoneComponentsJson);
 	Frame->SetStringField(
 		TEXT("auxiliaryCaptureOrder"),
 		StaticEnum<ESRDatasetAuxiliaryCaptureOrder>()->GetNameStringByValue(
@@ -1735,11 +1839,23 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		Fixture->SetNumberField(TEXT("movingObjectId"), ASRDatasetValidationFixture::MovingObjectId);
 		Fixture->SetNumberField(TEXT("backgroundObjectId"), ASRDatasetValidationFixture::BackgroundObjectId);
 		Fixture->SetNumberField(TEXT("translucentObjectId"), ASRDatasetValidationFixture::TranslucentObjectId);
+		Fixture->SetNumberField(TEXT("skeletalObjectId"), ASRDatasetValidationFixture::SkeletalObjectId);
+		Fixture->SetNumberField(TEXT("wpoObjectId"), ASRDatasetValidationFixture::WPOObjectId);
 		Fixture->SetNumberField(TEXT("movingCurrentRightCm"), FixtureFrame.MovingCurrentRightCm);
 		Fixture->SetNumberField(TEXT("movingPreviousRightCm"), FixtureFrame.MovingPreviousRightCm);
 		Fixture->SetArrayField(TEXT("expectedMovingMotionDisplayPixels"), {
 			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedMovingMotionDisplayPixels.X),
 			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedMovingMotionDisplayPixels.Y) });
+		Fixture->SetNumberField(TEXT("skeletalCurrentRightCm"), FixtureFrame.SkeletalCurrentRightCm);
+		Fixture->SetNumberField(TEXT("skeletalPreviousRightCm"), FixtureFrame.SkeletalPreviousRightCm);
+		Fixture->SetArrayField(TEXT("expectedSkeletalMotionDisplayPixels"), {
+			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedSkeletalMotionDisplayPixels.X),
+			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedSkeletalMotionDisplayPixels.Y) });
+		Fixture->SetNumberField(TEXT("wpoCurrentRightCm"), FixtureFrame.WPOCurrentRightCm);
+		Fixture->SetNumberField(TEXT("wpoPreviousRightCm"), FixtureFrame.WPOPreviousRightCm);
+		Fixture->SetArrayField(TEXT("expectedWPOMotionDisplayPixels"), {
+			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedWPOMotionDisplayPixels.X),
+			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedWPOMotionDisplayPixels.Y) });
 		TSharedRef<FJsonObject> ExpectedDepth = MakeShared<FJsonObject>();
 		for (const TPair<int32, float>& Pair : FixtureFrame.ExpectedFrontDepthMeters)
 		{
@@ -2035,7 +2151,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.4.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.4.1"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -2141,7 +2257,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Contract->SetStringField(
 		TEXT("endpointPreviousTransformScope"),
 		ActiveJob.bUseLastCapturedEndpointTransforms
-			? TEXT("scene_component_rigid_transform_only_skeletal_bones_and_wpo_uncertified")
+			? TEXT("scene_component_transforms_plus_double_buffered_skinned_component_space_bones_plus_explicit_previous_frame_switch_wpo_fixture_non_fixture_wpo_uncertified")
 			: TEXT("engine_previous_render_state"));
 	if (ActiveJob.bCaptureTemporalDiagnostics)
 	{

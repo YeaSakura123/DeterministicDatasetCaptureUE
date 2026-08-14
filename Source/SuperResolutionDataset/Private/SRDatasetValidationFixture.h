@@ -6,6 +6,9 @@
 #include "SRDatasetValidationFixture.generated.h"
 
 class UMaterialInterface;
+class UMaterialInstanceDynamic;
+class UPoseableMeshComponent;
+class UPrimitiveComponent;
 class UStaticMeshComponent;
 
 struct FSRDatasetValidationFixtureFrame
@@ -15,6 +18,12 @@ struct FSRDatasetValidationFixtureFrame
 	float MovingCurrentRightCm = 0.0f;
 	float MovingPreviousRightCm = 0.0f;
 	FVector2f ExpectedMovingMotionDisplayPixels = FVector2f::ZeroVector;
+	float SkeletalCurrentRightCm = 0.0f;
+	float SkeletalPreviousRightCm = 0.0f;
+	FVector2f ExpectedSkeletalMotionDisplayPixels = FVector2f::ZeroVector;
+	float WPOCurrentRightCm = 0.0f;
+	float WPOPreviousRightCm = 0.0f;
+	FVector2f ExpectedWPOMotionDisplayPixels = FVector2f::ZeroVector;
 	TMap<int32, float> ExpectedFrontDepthMeters;
 };
 
@@ -27,7 +36,7 @@ class ASRDatasetValidationFixture final : public AActor
 public:
 	ASRDatasetValidationFixture();
 
-	bool Configure(FString& OutError) const;
+	bool Configure(FString& OutError);
 	void Evaluate(
 		const FMinimalViewInfo& CameraView,
 		int32 LogicalFrame,
@@ -43,9 +52,11 @@ public:
 	static constexpr int32 DepthTenMetersObjectId = 12;
 	static constexpr int32 DepthHundredMetersObjectId = 13;
 	static constexpr int32 TranslucentObjectId = 21;
+	static constexpr int32 SkeletalObjectId = 31;
+	static constexpr int32 WPOObjectId = 41;
 
 private:
-	static void ConfigurePrimitive(UStaticMeshComponent* Component, int32 StencilValue);
+	static void ConfigurePrimitive(UPrimitiveComponent* Component, int32 StencilValue);
 	static void PlaceBox(
 		UStaticMeshComponent* Component,
 		const FMinimalViewInfo& CameraView,
@@ -75,15 +86,33 @@ private:
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<UStaticMeshComponent> TranslucentPanel;
 
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UPoseableMeshComponent> SkeletalCube;
+
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UStaticMeshComponent> WPOCube;
+
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> OpaqueMaterial;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> TranslucentMaterial;
 
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> WPOBaseMaterial;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> WPOMaterial;
+
 	FSRDatasetValidationFixtureFrame FrameMetadata;
 	int32 LastEvaluatedFrame = INDEX_NONE;
 	float LastMovingRightCm = 0.0f;
 	bool bHasCapturedMovingRight = false;
 	float LastCapturedMovingRightCm = 0.0f;
+	float LastSkeletalRightCm = 0.0f;
+	bool bHasCapturedSkeletalRight = false;
+	float LastCapturedSkeletalRightCm = 0.0f;
+	float LastWPORightCm = 0.0f;
+	bool bHasCapturedWPORight = false;
+	float LastCapturedWPORightCm = 0.0f;
 };

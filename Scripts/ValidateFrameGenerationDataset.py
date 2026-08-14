@@ -81,11 +81,16 @@ OBJECT_ID_MODALITIES = {"object_id_t0", "object_id_tau", "object_id_t1"}
 
 REQUIRED_UNCERTIFIED_GAPS = {
     "ui_color_alpha_t0_tau_t1",
-    "skeletal_bone_endpoint_motion_validation",
-    "wpo_and_animated_material_endpoint_motion_validation",
+    "non_fixture_skeletal_animation_endpoint_motion_validation",
+    "non_fixture_wpo_and_animated_material_endpoint_motion_validation",
     "production_disocclusion_masks",
     "hudless_in_world_ui_residue_validation",
 }
+
+EXPECTED_ENDPOINT_SCOPE = (
+    "scene_components_plus_double_buffered_skinned_component_space_bones_"
+    "plus_explicit_previous_frame_switch_wpo_fixture"
+)
 
 INTENTIONAL_CVAR_VALUES = {
     "r.MotionVectorSimulation": {
@@ -358,9 +363,24 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         add_check(
             checks,
             f"sources.{role}",
-            total > 0 and passed == total,
+            total > 0
+            and passed == total
+            and int(validation.get("validatorVersion", 0)) >= 5,
             f"passed={passed} total={total} validator={validation.get('validatorVersion')}",
         )
+
+    validation_coverage = manifest.get("validationCoverage", {})
+    add_check(
+        checks,
+        "sources.semantic_motion_fixture_coverage",
+        isinstance(validation_coverage, dict)
+        and validation_coverage.get("semanticFixtureRigidComponentMotion") is True
+        and validation_coverage.get("semanticFixtureDoubleBufferedSkeletalBoneMotion")
+        is True
+        and validation_coverage.get("semanticFixturePreviousFrameSwitchWPOMotion")
+        is True,
+        json.dumps(validation_coverage, sort_keys=True),
+    )
 
     validate_provenance(checks, manifest.get("provenance"))
 
@@ -379,7 +399,9 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         motion_semantics.get("definition") == "previous_pixel = current_pixel + motion_1_to_0"
         and motion_semantics.get("unit") == "display_pixel"
         and motion_semantics.get("origin") == "top_left"
-        and motion_semantics.get("jitterRemoved") is True,
+        and motion_semantics.get("jitterRemoved") is True
+        and motion_semantics.get("endpointTransformScope")
+        == EXPECTED_ENDPOINT_SCOPE,
         json.dumps(motion_semantics, sort_keys=True),
     )
     add_check(
@@ -390,7 +412,9 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         and reverse_motion_semantics.get("unit") == "display_pixel"
         and reverse_motion_semantics.get("origin") == "top_left"
         and reverse_motion_semantics.get("jitterRemoved") is True
-        and reverse_motion_semantics.get("independentlyCaptured") is True,
+        and reverse_motion_semantics.get("independentlyCaptured") is True
+        and reverse_motion_semantics.get("endpointTransformScope")
+        == EXPECTED_ENDPOINT_SCOPE,
         json.dumps(reverse_motion_semantics, sort_keys=True),
     )
     add_check(
@@ -468,6 +492,11 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                 and pair.get("bidirectionalMotionIndependentProcesses") is True
                 and int(endpoint_state.get("t1PreviousLogicalFrameId", -1)) == t0
                 and endpoint_state.get("componentTransformOverride") is True
+                and endpoint_state.get("skeletalBoneOverride") is True
+                and int(endpoint_state.get("skeletalBoneComponentCount", 0)) > 0
+                and int(endpoint_state.get("skeletalBoneCount", 0)) > 0
+                and endpoint_state.get("skeletalBoneSkippedComponents") == []
+                and endpoint_state.get("wpoPreviousFrameSwitchFixtureValidated") is True
                 and delta_time > 0.0
                 and math.isclose(time_span, delta_time, rel_tol=1e-6, abs_tol=1e-7),
                 f"previous={endpoint_state.get('t1PreviousLogicalFrameId')} delta={delta_time} span={time_span}",
@@ -478,6 +507,12 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                 pair.get("bidirectionalMotionIndependentProcesses") is True
                 and int(reverse_endpoint_state.get("t0PreviousLogicalFrameId", -1)) == t1
                 and reverse_endpoint_state.get("componentTransformOverride") is True
+                and reverse_endpoint_state.get("skeletalBoneOverride") is True
+                and int(reverse_endpoint_state.get("skeletalBoneComponentCount", 0)) > 0
+                and int(reverse_endpoint_state.get("skeletalBoneCount", 0)) > 0
+                and reverse_endpoint_state.get("skeletalBoneSkippedComponents") == []
+                and reverse_endpoint_state.get("wpoPreviousFrameSwitchFixtureValidated")
+                is True
                 and delta_time > 0.0
                 and math.isclose(
                     reverse_time_span, delta_time, rel_tol=1e-6, abs_tol=1e-7
@@ -549,6 +584,43 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                 json.dumps(scene_hashes, sort_keys=True),
             )
 
+            wpo_validation = pair.get("wpoValidation", {})
+            wpo_forward = (
+                wpo_validation.get("forward", {})
+                if isinstance(wpo_validation, dict)
+                else {}
+            )
+            wpo_reverse = (
+                wpo_validation.get("reverse", {})
+                if isinstance(wpo_validation, dict)
+                else {}
+            )
+            wpo_object_id = int(wpo_validation.get("objectId", -1))
+            wpo_forward_expected = np.asarray(
+                wpo_forward.get("expectedMotionDisplayPixels", (math.nan, math.nan)),
+                dtype=np.float64,
+            )
+            wpo_reverse_expected = np.asarray(
+                wpo_reverse.get("expectedMotionDisplayPixels", (math.nan, math.nan)),
+                dtype=np.float64,
+            )
+            add_check(
+                checks,
+                f"{prefix}.wpo_previous_frame_switch_metadata",
+                isinstance(wpo_validation, dict)
+                and wpo_validation.get("previousFrameSwitch") is True
+                and 0 < wpo_object_id <= 255
+                and wpo_forward_expected.shape == (2,)
+                and wpo_reverse_expected.shape == (2,)
+                and bool(np.isfinite(wpo_forward_expected).all())
+                and bool(np.isfinite(wpo_reverse_expected).all())
+                and float(wpo_forward.get("previousRightCm", math.nan))
+                != float(wpo_forward.get("currentRightCm", math.nan))
+                and float(wpo_reverse.get("previousRightCm", math.nan))
+                != float(wpo_reverse.get("currentRightCm", math.nan)),
+                json.dumps(wpo_validation, sort_keys=True),
+            )
+
             files = pair.get("files", {})
             hashes = pair.get("sha1", {})
             missing_modalities = sorted(REQUIRED_MODALITIES - set(files)) if isinstance(files, dict) else sorted(REQUIRED_MODALITIES)
@@ -615,6 +687,58 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                     "mean": float(np.mean(pixels)),
                 }
 
+            for direction, object_modality, motion_modality, valid_modality, expected in (
+                (
+                    "forward",
+                    "object_id_t1",
+                    "motion_1_to_0",
+                    "motion_valid_1_to_0",
+                    wpo_forward_expected,
+                ),
+                (
+                    "reverse",
+                    "object_id_t0",
+                    "motion_0_to_1",
+                    "motion_valid_0_to_1",
+                    wpo_reverse_expected,
+                ),
+            ):
+                required_wpo_modalities = (
+                    object_modality,
+                    motion_modality,
+                    valid_modality,
+                )
+                available = all(name in pair_pixels for name in required_wpo_modalities)
+                visible_count = 0
+                covered_count = 0
+                measured = np.asarray((math.nan, math.nan), dtype=np.float64)
+                error = np.asarray((math.inf, math.inf), dtype=np.float64)
+                if available:
+                    ids = np.rint(pair_pixels[object_modality][..., 0]).astype(np.int32)
+                    visible = ids == wpo_object_id
+                    covered = visible & (pair_pixels[valid_modality][..., 0] > 0.5)
+                    visible_count = int(np.count_nonzero(visible))
+                    covered_count = int(np.count_nonzero(covered))
+                    if covered_count:
+                        measured = np.median(
+                            pair_pixels[motion_modality][covered, :2].astype(np.float64),
+                            axis=0,
+                        )
+                        error = np.abs(measured - expected)
+                covered_fraction = covered_count / visible_count if visible_count else 0.0
+                add_check(
+                    checks,
+                    f"{prefix}.wpo_{direction}_motion",
+                    available
+                    and visible_count >= 32
+                    and covered_fraction >= 0.75
+                    and bool(np.all(error <= 1.5)),
+                    f"available={available} id={wpo_object_id} visible={visible_count} "
+                    f"covered={covered_count} fraction={covered_fraction:.9f} "
+                    f"expected={expected.tolist()} measured={measured.tolist()} "
+                    f"abs_error={error.tolist()}",
+                )
+
             if fixture_hidden_state_allowance:
                 required_motion_pixels = (
                     "motion_1_to_0",
@@ -648,7 +772,7 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
 
     passed = all(check["passed"] for check in checks)
     report = {
-        "validatorVersion": 2,
+        "validatorVersion": 4,
         "dataset": str(dataset),
         "contractVersion": manifest.get("contractVersion"),
         "certificationStatus": manifest.get("certificationStatus"),
