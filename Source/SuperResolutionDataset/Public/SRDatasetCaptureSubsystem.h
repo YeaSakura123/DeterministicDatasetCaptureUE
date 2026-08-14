@@ -14,6 +14,7 @@ class ULevelSequencePlayer;
 class UNiagaraComponent;
 class UNiagaraSystem;
 class USceneComponent;
+class USkinnedMeshComponent;
 
 UCLASS()
 class SUPERRESOLUTIONDATASET_API USRDatasetCaptureSubsystem : public UWorldSubsystem
@@ -71,6 +72,14 @@ private:
 		bool bFixedTickDelta = false;
 		int32 RandomSeed = 0;
 		float FixedTickDeltaTime = 0.0f;
+	};
+
+	struct FSkeletalEndpointState
+	{
+		FString ComponentPath;
+		FString SkinnedAssetPath;
+		TArray<FTransform> ComponentSpaceTransforms;
+		TArray<uint8> BoneVisibilityStates;
 	};
 
 	void HandleWorldPreActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
@@ -173,5 +182,9 @@ private:
 	TSet<TWeakObjectPtr<AActor>> PreparedControllables;
 	TMap<TWeakObjectPtr<AActor>, bool> ValidationHiddenActorStates;
 	TMap<TWeakObjectPtr<USceneComponent>, FTransform> LastCapturedEndpointTransforms;
+	TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState> LastCapturedEndpointBoneStates;
+	int32 AppliedEndpointBoneComponentCount = 0;
+	int32 AppliedEndpointBoneCount = 0;
+	TArray<FString> SkippedEndpointBoneComponents;
 	TArray<TSharedPtr<FJsonValue>> ManifestFrames;
 };

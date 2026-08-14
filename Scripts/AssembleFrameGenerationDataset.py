@@ -68,6 +68,41 @@ def require_capture(dataset: Path, role: str) -> tuple[dict[str, Any], dict[str,
     return manifest, report
 
 
+def require_wpo_fixture_gate(
+    manifest: dict[str, Any], report: dict[str, Any], role: str
+) -> bool:
+    if not manifest.get("job", {}).get("bEnableSemanticValidationFixture", False):
+        return False
+    if int(report.get("validatorVersion", 0)) < 5:
+        raise ValueError(f"{role} requires ValidateDataset.py validatorVersion >= 5")
+    checks = {
+        str(check.get("name")): bool(check.get("passed", False))
+        for check in report.get("checks", [])
+    }
+    wpo_checks = {
+        name: passed
+        for name, passed in checks.items()
+        if ".semantic_fixture.wpo_" in name
+    }
+    required_categories = (
+        "_object_visible",
+        "_velocity_coverage",
+        "_motion_direction_magnitude",
+    )
+    if role != INTERMEDIATE_ROLE:
+        required_categories += ("_reset_motion_zero",)
+    if (
+        not wpo_checks
+        or not all(wpo_checks.values())
+        or not all(any(name.endswith(suffix) for name in wpo_checks) for suffix in required_categories)
+        or checks.get("provenance.vertex_deformation_velocity_enabled") is not True
+    ):
+        raise ValueError(
+            f"{role} lacks a complete passing PreviousFrameSwitch WPO fixture gate"
+        )
+    return True
+
+
 def compatible(
     endpoint: dict[str, Any],
     reverse_endpoint: dict[str, Any],
@@ -323,6 +358,17 @@ def assemble(
         reverse_endpoint_dir, REVERSE_ENDPOINT_ROLE
     )
     intermediate, intermediate_report = require_capture(intermediate_dir, INTERMEDIATE_ROLE)
+    wpo_fixture_validated = all(
+        (
+            require_wpo_fixture_gate(endpoint, endpoint_report, ENDPOINT_ROLE),
+            require_wpo_fixture_gate(
+                reverse_endpoint, reverse_endpoint_report, REVERSE_ENDPOINT_ROLE
+            ),
+            require_wpo_fixture_gate(
+                intermediate, intermediate_report, INTERMEDIATE_ROLE
+            ),
+        )
+    )
     compatibility = compatible(endpoint, reverse_endpoint, intermediate)
     endpoint_job = endpoint["job"]
     if output_dir.exists():
@@ -363,6 +409,32 @@ def assemble(
                 raise ValueError(
                     f"reverse endpoint motion at frame {t0} does not point to frame {t1}"
                 )
+            for role_name, endpoint_frame in (
+                ("forward", frame1),
+                ("reverse", reverse_frame0),
+            ):
+                skipped_skeletal = endpoint_frame.get(
+                    "endpointPreviousSkeletalBoneSkippedComponents", []
+                )
+                if (
+                    endpoint_frame.get("endpointPreviousSkeletalBoneOverride") is not True
+                    or int(
+                        endpoint_frame.get(
+                            "endpointPreviousSkeletalBoneComponentCount", 0
+                        )
+                    )
+                    <= 0
+                    or int(endpoint_frame.get("endpointPreviousSkeletalBoneCount", 0)) <= 0
+                    or not isinstance(skipped_skeletal, list)
+                    or skipped_skeletal
+                ):
+                    raise ValueError(
+                        f"{role_name} endpoint lacks complete cached skeletal-bone history: "
+                        f"override={endpoint_frame.get('endpointPreviousSkeletalBoneOverride')} "
+                        f"components={endpoint_frame.get('endpointPreviousSkeletalBoneComponentCount')} "
+                        f"bones={endpoint_frame.get('endpointPreviousSkeletalBoneCount')} "
+                        f"skipped={skipped_skeletal}"
+                    )
             scene_state_exact_t0 = require_matching_endpoint_grid(frame0, reverse_frame0)
             scene_state_exact_t1 = require_matching_endpoint_grid(frame1, reverse_frame1)
             tau = (tau_frame_id - t0) / (t1 - t0)
@@ -419,11 +491,67 @@ def assemble(
                     "t1PreviousLogicalFrameId": int(frame1["motionPreviousLogicalFrameId"]),
                     "timeSpanS": float(frame1["motionTimeSpanS"]),
                     "componentTransformOverride": bool(frame1["endpointPreviousTransformOverride"]),
+                    "skeletalBoneOverride": bool(
+                        frame1["endpointPreviousSkeletalBoneOverride"]
+                    ),
+                    "skeletalBoneComponentCount": int(
+                        frame1["endpointPreviousSkeletalBoneComponentCount"]
+                    ),
+                    "skeletalBoneCount": int(frame1["endpointPreviousSkeletalBoneCount"]),
+                    "skeletalBoneSkippedComponents": frame1[
+                        "endpointPreviousSkeletalBoneSkippedComponents"
+                    ],
+                    "wpoPreviousFrameSwitchFixtureValidated": wpo_fixture_validated,
                 },
                 "reverseEndpointPreviousState": {
                     "t0PreviousLogicalFrameId": int(reverse_frame0["motionPreviousLogicalFrameId"]),
                     "timeSpanS": float(reverse_frame0["motionTimeSpanS"]),
                     "componentTransformOverride": bool(reverse_frame0["endpointPreviousTransformOverride"]),
+                    "skeletalBoneOverride": bool(
+                        reverse_frame0["endpointPreviousSkeletalBoneOverride"]
+                    ),
+                    "skeletalBoneComponentCount": int(
+                        reverse_frame0["endpointPreviousSkeletalBoneComponentCount"]
+                    ),
+                    "skeletalBoneCount": int(
+                        reverse_frame0["endpointPreviousSkeletalBoneCount"]
+                    ),
+                    "skeletalBoneSkippedComponents": reverse_frame0[
+                        "endpointPreviousSkeletalBoneSkippedComponents"
+                    ],
+                    "wpoPreviousFrameSwitchFixtureValidated": wpo_fixture_validated,
+                },
+                "wpoValidation": {
+                    "previousFrameSwitch": True,
+                    "objectId": int(
+                        frame1["semanticValidationFixture"]["wpoObjectId"]
+                    ),
+                    "forward": {
+                        "currentRightCm": float(
+                            frame1["semanticValidationFixture"]["wpoCurrentRightCm"]
+                        ),
+                        "previousRightCm": float(
+                            frame1["semanticValidationFixture"]["wpoPreviousRightCm"]
+                        ),
+                        "expectedMotionDisplayPixels": frame1[
+                            "semanticValidationFixture"
+                        ]["expectedWPOMotionDisplayPixels"],
+                    },
+                    "reverse": {
+                        "currentRightCm": float(
+                            reverse_frame0["semanticValidationFixture"][
+                                "wpoCurrentRightCm"
+                            ]
+                        ),
+                        "previousRightCm": float(
+                            reverse_frame0["semanticValidationFixture"][
+                                "wpoPreviousRightCm"
+                            ]
+                        ),
+                        "expectedMotionDisplayPixels": reverse_frame0[
+                            "semanticValidationFixture"
+                        ]["expectedWPOMotionDisplayPixels"],
+                    },
                 },
                 "reverseEndpointGridAlignment": {
                     "jitterCameraDepthObjectIdExact": True,
@@ -503,6 +631,7 @@ def assemble(
                     "origin": "top_left",
                     "jitterRemoved": True,
                     "resolution": "render",
+                    "endpointTransformScope": "scene_components_plus_double_buffered_skinned_component_space_bones_plus_explicit_previous_frame_switch_wpo_fixture",
                 },
                 "motion0To1": {
                     "definition": "future_pixel = current_pixel + motion_0_to_1",
@@ -511,6 +640,7 @@ def assemble(
                     "jitterRemoved": True,
                     "resolution": "render",
                     "independentlyCaptured": True,
+                    "endpointTransformScope": "scene_components_plus_double_buffered_skinned_component_space_bones_plus_explicit_previous_frame_switch_wpo_fixture",
                 },
                 "historyRejection1To0": {
                     "definition": "one_rejects_t0_history_at_t1_motion_reprojected_pixel",
@@ -551,6 +681,11 @@ def assemble(
                     "checksTotal": reverse_endpoint_report.get("checksTotal"),
                 },
             },
+            "validationCoverage": {
+                "semanticFixtureRigidComponentMotion": True,
+                "semanticFixtureDoubleBufferedSkeletalBoneMotion": True,
+                "semanticFixturePreviousFrameSwitchWPOMotion": wpo_fixture_validated,
+            },
             "provenance": {
                 **compatibility,
                 "endpointReplay": endpoint.get("provenance", {}),
@@ -559,8 +694,8 @@ def assemble(
             },
             "missingRequirements": [
                 "ui_color_alpha_t0_tau_t1",
-                "skeletal_bone_endpoint_motion_validation",
-                "wpo_and_animated_material_endpoint_motion_validation",
+                "non_fixture_skeletal_animation_endpoint_motion_validation",
+                "non_fixture_wpo_and_animated_material_endpoint_motion_validation",
                 "production_disocclusion_masks",
                 "hudless_in_world_ui_residue_validation",
             ],

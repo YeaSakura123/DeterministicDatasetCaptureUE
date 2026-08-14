@@ -110,6 +110,10 @@ REPLAY_METADATA_FIELDS = (
     "motionTimeSpanS",
     "motionTrainingUsable",
     "endpointPreviousTransformOverride",
+    "endpointPreviousSkeletalBoneOverride",
+    "endpointPreviousSkeletalBoneComponentCount",
+    "endpointPreviousSkeletalBoneCount",
+    "endpointPreviousSkeletalBoneSkippedComponents",
     "auxiliaryCaptureOrder",
     "logicalEvaluationDirection",
 )
@@ -729,48 +733,93 @@ def validate_semantic_fixture_frame(
         return
 
     object_id = np.rint(pixels["object_id"][..., 0]).astype(np.int32)
-    moving_id = int(fixture.get("movingObjectId", -1))
-    expected_motion = np.asarray(
-        fixture.get("expectedMovingMotionDisplayPixels", (math.nan, math.nan)), dtype=np.float64
-    )
-    moving_mask = object_id == moving_id
-    add_check(
-        checks,
-        f"{prefix}.moving_object_visible",
-        bool(np.count_nonzero(moving_mask) >= 8),
-        f"id={moving_id} pixels={int(np.count_nonzero(moving_mask))}",
-    )
-    if np.any(moving_mask):
-        velocity_coverage = pixels["velocity_coverage"][..., 0]
-        covered = moving_mask & (velocity_coverage == 1.0)
-        covered_fraction = float(np.count_nonzero(covered) / np.count_nonzero(moving_mask))
-        intermediate_replay = frame.get("replayPass") == "FrameGenerationIntermediate"
-        if frame.get("reset", False) and not intermediate_replay:
-            reset_motion = pixels["motion_full_current_to_previous"][moving_mask, :2]
+    velocity_coverage = pixels["velocity_coverage"][..., 0]
+    intermediate_replay = frame.get("replayPass") == "FrameGenerationIntermediate"
+
+    def validate_motion_object(
+        label: str,
+        stencil_id: int,
+        expected_motion: np.ndarray,
+        minimum_pixels: int,
+        reset_tolerance: float,
+        motion_tolerance: float,
+    ) -> None:
+        mask = object_id == stencil_id
+        visible_pixels = int(np.count_nonzero(mask))
+        add_check(
+            checks,
+            f"{prefix}.{label}_object_visible",
+            visible_pixels >= minimum_pixels,
+            f"id={stencil_id} pixels={visible_pixels}",
+        )
+        if not visible_pixels:
+            return
+
+        covered = mask & (velocity_coverage == 1.0)
+        covered_count = int(np.count_nonzero(covered))
+        covered_fraction = covered_count / visible_pixels
+        if not frame.get("reset", False) or intermediate_replay:
             add_check(
                 checks,
-                f"{prefix}.moving_reset_motion_zero",
-                bool(np.max(np.abs(reset_motion)) <= 1e-4),
-                f"max_abs={float(np.max(np.abs(reset_motion))):.9g} covered_fraction={covered_fraction:.9f}",
-            )
-        else:
-            add_check(
-                checks,
-                f"{prefix}.moving_velocity_coverage",
+                f"{prefix}.{label}_velocity_coverage",
                 covered_fraction >= 0.75,
-                f"covered_fraction={covered_fraction:.9f}",
+                f"covered={covered_count} fraction={covered_fraction:.9f}",
             )
-        if np.any(covered) and (not frame.get("reset", False) or intermediate_replay):
+        if frame.get("reset", False) and not intermediate_replay:
+            reset_motion = pixels["motion_full_current_to_previous"][mask, :2]
+            add_check(
+                checks,
+                f"{prefix}.{label}_reset_motion_zero",
+                bool(np.max(np.abs(reset_motion)) <= reset_tolerance),
+                f"max_abs={float(np.max(np.abs(reset_motion))):.9g}",
+            )
+        elif covered_count:
             measured_motion = np.median(
-                pixels["motion_full_current_to_previous"][covered, :2].astype(np.float64), axis=0
+                pixels["motion_full_current_to_previous"][covered, :2].astype(np.float64),
+                axis=0,
             )
             error = np.abs(measured_motion - expected_motion)
             add_check(
                 checks,
-                f"{prefix}.moving_motion_direction_magnitude",
-                bool(np.all(error <= 1.5)),
-                f"expected={expected_motion.tolist()} measured={measured_motion.tolist()} abs_error={error.tolist()}",
+                f"{prefix}.{label}_motion_direction_magnitude",
+                bool(np.all(error <= motion_tolerance)),
+                f"expected={expected_motion.tolist()} measured={measured_motion.tolist()} "
+                f"abs_error={error.tolist()}",
             )
+
+    validate_motion_object(
+        "moving",
+        int(fixture.get("movingObjectId", -1)),
+        np.asarray(
+            fixture.get("expectedMovingMotionDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        ),
+        8,
+        1e-4,
+        1.5,
+    )
+    validate_motion_object(
+        "skeletal",
+        int(fixture.get("skeletalObjectId", -1)),
+        np.asarray(
+            fixture.get("expectedSkeletalMotionDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        ),
+        32,
+        0.01,
+        2.0,
+    )
+    validate_motion_object(
+        "wpo",
+        int(fixture.get("wpoObjectId", -1)),
+        np.asarray(
+            fixture.get("expectedWPOMotionDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        ),
+        32,
+        0.01,
+        1.5,
+    )
 
     linear_depth = pixels["depth_view_linear_meters"][..., 0]
     depth_valid = pixels["depth_valid"][..., 0]
@@ -966,6 +1015,13 @@ def validate(
             cvars.get("r.TemporalAA.Debug.OverrideTemporalIndex") == "0",
             str(cvars.get("r.TemporalAA.Debug.OverrideTemporalIndex")),
         )
+    if job.get("bCaptureMainViewTemporalDiagnostics", False):
+        add_check(
+            checks,
+            "provenance.vertex_deformation_velocity_enabled",
+            cvars.get("r.Velocity.EnableVertexDeformation") == "1",
+            str(cvars.get("r.Velocity.EnableVertexDeformation")),
+        )
     if job.get("bForceSynchronousRendering", False):
         synchronous_names = (
             "r.RDG.ParallelExecute",
@@ -1027,6 +1083,37 @@ def validate(
             f"frame_{frame_id:06d}.endpoint_transform_role",
             endpoint_override is expected_endpoint_override,
             f"expected={expected_endpoint_override} actual={endpoint_override}",
+        )
+        expected_skeletal_override = (
+            expected_endpoint_override and int(frame.get("motionTimeSpanFrames", 0)) > 0
+        )
+        skeletal_override = frame.get("endpointPreviousSkeletalBoneOverride")
+        skeletal_component_count = int(
+            frame.get("endpointPreviousSkeletalBoneComponentCount", -1)
+        )
+        skeletal_bone_count = int(frame.get("endpointPreviousSkeletalBoneCount", -1))
+        skeletal_skipped = frame.get("endpointPreviousSkeletalBoneSkippedComponents")
+        add_check(
+            checks,
+            f"frame_{frame_id:06d}.endpoint_skeletal_bone_override",
+            skeletal_override is expected_skeletal_override
+            and isinstance(skeletal_skipped, list)
+            and not skeletal_skipped
+            and (
+                (skeletal_component_count > 0 and skeletal_bone_count > 0)
+                if expected_skeletal_override
+                else (skeletal_component_count == 0 and skeletal_bone_count == 0)
+            ),
+            json.dumps(
+                {
+                    "expected": expected_skeletal_override,
+                    "actual": skeletal_override,
+                    "components": skeletal_component_count,
+                    "bones": skeletal_bone_count,
+                    "skipped": skeletal_skipped,
+                },
+                sort_keys=True,
+            ),
         )
         expected_evaluation_direction = (
             "decreasing_frame_id"
@@ -1673,7 +1760,7 @@ def validate(
     required_checks = [check for check in checks if check["required"]]
     passed = all(check["passed"] for check in required_checks)
     report = {
-        "validatorVersion": 3,
+        "validatorVersion": 5,
         "comparisonMode": compare_mode if compare is not None else "none",
         "captureOrderInvarianceGate": (
             "pass" if compare is not None and compare_mode == "capture-order" and passed
@@ -1691,7 +1778,7 @@ def validate(
         "checks": checks,
         "statistics": stats,
         "replayMetrics": replay_metrics,
-        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. When the semantic fixture is enabled it also validates object-motion direction/magnitude, 1/10/100 m depth, nonzero After-DOF transparency, known occlusion/disocclusion geometry, and the experimental history-rejection signal. Exact replay requires matching provenance and metadata. Capture-order comparison requires opposite auxiliary submission orders, identical normalized jobs/provenance, exact non-color buffers and tolerance-gated color. Production certification of disocclusion for unlabeled/deforming geometry and Main View/reference-HR pixel equivalence remain separate gates.",
+        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. When the semantic fixture is enabled it also validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion direction/magnitude, 1/10/100 m depth, nonzero After-DOF transparency, known occlusion/disocclusion geometry, and the experimental history-rejection signal. Exact replay requires matching provenance and metadata. Capture-order comparison requires opposite auxiliary submission orders, identical normalized jobs/provenance, exact non-color buffers and tolerance-gated color. Non-fixture animated-material/WPO motion, production disocclusion for unlabeled/deforming geometry and Main View/reference-HR pixel equivalence remain separate gates.",
     }
     return report, passed
 

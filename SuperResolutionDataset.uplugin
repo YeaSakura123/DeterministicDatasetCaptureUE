@@ -1,12 +1,12 @@
 {
 	"FileVersion": 3,
-	"Version": 8,
-	"VersionName": "0.4.0",
+	"Version": 9,
+	"VersionName": "0.4.1",
 	"FriendlyName": "Super Resolution Dataset",
 	"Description": "Deterministic scene replay with synchronized spatial, temporal, semantic and experimental frame-generation dataset capture.",
 	"Category": "Rendering",
 	"CreatedBy": "UnrealCodeDemo",
-	"CanContainContent": false,
+	"CanContainContent": true,
 	"IsBetaVersion": true,
 	"Installed": false,
 	"Modules": [

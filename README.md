@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.4.0-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.4.1-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,13 +11,13 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.4.0 deliberately separates implemented output from certified training contracts:
+Version 0.4.1 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
 | `spatial-sr-data-v1` | Certified | Same-state HR/LR PNG and SceneCapture depth baseline. |
 | Main View temporal buffers | Experimental, validated fixture | Real AfterDOF HDR, motion, depth, jitter, matrices, masks and validity-gated history rejection are captured, but `nr-sr-data-v2` remains disabled until every production gate passes. |
-| FG forward/reverse endpoint plus intermediate replay | Experimental, uncertified | `motion_1_to_0` and `motion_0_to_1` come from independent processes and assemble with a real `tau=0.5` frame. UI RGBA, skeletal/WPO endpoint validation and production-certified bidirectional disocclusion are still missing. |
+| FG forward/reverse endpoint plus intermediate replay | Experimental, uncertified | `motion_1_to_0` and `motion_0_to_1` come from independent processes and assemble with a real `tau=0.5` frame. Controlled pure-skinning and explicit `PreviousFrameSwitch` WPO fixtures pass analytic bidirectional gates. UI RGBA, non-fixture skeletal/WPO/animated-material coverage and production-certified bidirectional disocclusion are still missing. |
 
 The plugin rejects `nr-sr-data-v2` and direct `nr-fg-data-v1` capture jobs. Missing fields are never filled with guesses. The experimental FG assembler emits `nr-fg-data-v1` only with `frameGenerationCertified=false` and an explicit `missingRequirements` list.
 
@@ -74,13 +74,15 @@ The experimental history-rejection mask uses motion-reprojected Custom Stencil i
 - Chaos enhanced determinism through `p.Chaos.Solver.Deterministic`.
 - `SRDatasetControllable` Blueprint/C++ interface for gameplay and third-party systems.
 - Separate logical-frame and render-submission IDs; reference renders do not advance simulation.
+- Endpoint-history injection for SceneComponent transforms and double-buffered skinned component-space bones.
+- A shipped validation-only WPO material with explicit current/previous world offsets through UE's `PreviousFrameSwitch`; vertex-deformation velocity output is forced and recorded for temporal jobs.
 - Persistent, isolated SceneCapture view state for native/reference HR and the real player Main View history for temporal inputs.
 - Atomic file/manifest writes, hashes, map guard, CVar provenance and unattended auto-exit.
 - A pre-capture streaming barrier that fails on timeout, plus per-frame resident-texture counts and a sorted streaming-state SHA-1.
 - Actual GPU View Uniform Mip bias for Main View, native HR, reference HR and HUD-less color; the validator independently reproduces UE's quantized automatic-bias formula.
 - A per-frame scene-state SHA-1 over sorted Actor/component transforms, visibility/tick state, skeletal component-space bones, Niagara component time/seed controls and Cascade component state. The manifest also lists actors that tick without implementing `SRDatasetControllable`.
 
-“Absolute control” is an explicit protocol, not a claim that arbitrary live input becomes deterministic automatically. Network traffic, audio-driven state, nondeterministic third-party data interfaces, custom async work, skeletal endpoint bone motion and WPO endpoint motion require an adapter, cache or additional validation before certification.
+“Absolute control” is an explicit protocol, not a claim that arbitrary live input becomes deterministic automatically. Network traffic, audio-driven state, nondeterministic third-party data interfaces, custom async work, arbitrary AnimBP state, Material Parameter Collections and project-authored WPO/animated materials require an adapter, cache or additional validation before certification. The included bone and WPO fixtures prove the engine paths, not every project asset.
 
 ## Requirements
 
@@ -259,22 +261,22 @@ Actors spawned during capture are discovered and prepared before their first eva
 
 ## Verified release evidence
 
-Version 0.4.0 was compiled as a UE 5.7 Development Editor plugin and exercised on Windows/D3D12 with an AMD Radeon RX 7900 XTX. The checked fixture produced:
+Version 0.4.1 was compiled as a UE 5.7 Development Editor plugin and exercised on Windows/D3D12 with an AMD Radeon RX 7900 XTX. The checked fixture produced:
 
 - Unreal automation: 1/1 job-validation test passed with zero warnings/errors;
 - standard semantic deterministic replay with streaming/Mip/history/scene-state provenance: 569/569 required checks from v0.3.1;
-- capture-order standalone validation: 408/408 required checks;
-- paired capture-order invariance: 578/578 required checks;
-- FG forward endpoint replay: 415/415 required checks;
-- independent reverse endpoint replay: 415/415 required checks;
-- isolated FG intermediate replay: 216/216 required checks;
-- assembled bidirectional FG integrity: 127/127 checks, intentionally uncertified.
+- capture-order standalone validation: 421/421 required checks;
+- paired capture-order invariance: 599/599 required checks;
+- FG forward endpoint replay: 428/428 required checks;
+- independent reverse endpoint replay: 428/428 required checks;
+- isolated FG intermediate replay: 224/224 required checks;
+- assembled bidirectional FG integrity: 131/131 checks, intentionally uncertified.
 
 The validation Main View used a 50% render fraction. Its GPU View Uniform reported a material texture Mip bias of `-1.296875`, exactly matching the independent formula and recorded CVar profile; both full-resolution isolated HR views reported `0`. The streaming barrier ended with 0 requests and 0 pending textures, and its 81-texture residency hash was stable across both semantic replay processes.
 
 The known reveal fixture rejected all 174/174 revealed pixels with valid evidence and retained 734 stable background pixels. Both history-rejection EXRs were byte-exact across the two replay processes. This validates the declared scope; it does not extend production certification to unlabeled moving, skeletal or WPO geometry.
 
-The fixture process recorded 81 actors, 99 components, two skeletal components and 178 component-space bones. Scene-state hashes changed across logical frames and matched exactly across clean processes. Seven ticking actors lacked `SRDatasetControllable`; their paths/classes are listed for audit rather than automatically treated as failures. GPU particle payloads are outside this hash scope and remain a cache/validation requirement.
+The fixture process recorded 81 actors, 101 components, three skeletal components and 180 component-space bones. Its pure-skinning gate measured the analytic endpoint displacement within 0.02 display pixels. Its WPO object had 100% native velocity coverage in both endpoint directions: expected `-17.23077/+17.23077` pixels and measured `-17.23032/+17.23033` pixels. Seven ticking actors lacked `SRDatasetControllable`; their paths/classes are listed for audit rather than automatically treated as failures. GPU particle payloads and non-fixture material state remain outside this certification scope.
 
 Five color files were not byte-identical in the standard replay, but remained inside the numeric gate (HUD-less PSNR at least 61.6 dB in that run). Depth, motion, validity, masks and IDs were exact. Cross-GPU or cross-driver bit identity is not promised.
 
