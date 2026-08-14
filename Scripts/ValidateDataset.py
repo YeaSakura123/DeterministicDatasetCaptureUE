@@ -62,6 +62,7 @@ HR_TEMPORAL_MODALITIES = {
 REPLAY_ROLES = {
     "Standard",
     "FrameGenerationEndpoints",
+    "FrameGenerationReverseEndpoints",
     "FrameGenerationIntermediate",
 }
 AUXILIARY_CAPTURE_ORDERS = {
@@ -110,6 +111,7 @@ REPLAY_METADATA_FIELDS = (
     "motionTrainingUsable",
     "endpointPreviousTransformOverride",
     "auxiliaryCaptureOrder",
+    "logicalEvaluationDirection",
 )
 
 
@@ -853,12 +855,16 @@ def validate(
         valid_frame_rate,
         f"numerator={frame_rate_numerator} denominator={frame_rate_denominator}",
     )
-    if replay_role == "FrameGenerationEndpoints":
+    if replay_role in (
+        "FrameGenerationEndpoints",
+        "FrameGenerationReverseEndpoints",
+    ):
         add_check(
             checks,
             "replay.endpoint_job_contract",
             job.get("bSuppressMainViewOnUncapturedFrames") is True
             and job.get("bUseLastCapturedEndpointTransforms") is True
+            and job.get("bLockTemporalJitterToLogicalFrame") is True
             and int(job.get("frameStep", 1)) > 1,
             json.dumps(
                 {
@@ -866,6 +872,7 @@ def validate(
                     for key in (
                         "bSuppressMainViewOnUncapturedFrames",
                         "bUseLastCapturedEndpointTransforms",
+                        "bLockTemporalJitterToLogicalFrame",
                         "frameStep",
                     )
                 },
@@ -878,6 +885,7 @@ def validate(
             "replay.intermediate_job_contract",
             job.get("bSuppressMainViewOnUncapturedFrames") is True
             and job.get("bUseLastCapturedEndpointTransforms") is not True
+            and job.get("bLockTemporalJitterToLogicalFrame") is True
             and int(job.get("frameStep", 1)) > 1
             and 0 < int(job.get("captureFrameOffset", 0)) < int(job.get("frameStep", 1)),
             json.dumps(
@@ -886,6 +894,7 @@ def validate(
                     for key in (
                         "bSuppressMainViewOnUncapturedFrames",
                         "bUseLastCapturedEndpointTransforms",
+                        "bLockTemporalJitterToLogicalFrame",
                         "frameStep",
                         "captureFrameOffset",
                     )
@@ -950,6 +959,13 @@ def validate(
     )
     if job.get("bLockExposure", False):
         add_check(checks, "provenance.exposure_locked", cvars.get("r.EyeAdaptationQuality") == "0", str(cvars.get("r.EyeAdaptationQuality")))
+    if job.get("bLockTemporalJitterToLogicalFrame", False):
+        add_check(
+            checks,
+            "provenance.logical_frame_jitter_override",
+            cvars.get("r.TemporalAA.Debug.OverrideTemporalIndex") == "0",
+            str(cvars.get("r.TemporalAA.Debug.OverrideTemporalIndex")),
+        )
     if job.get("bForceSynchronousRendering", False):
         synchronous_names = (
             "r.RDG.ParallelExecute",
@@ -1002,12 +1018,26 @@ def validate(
             f"expected={expected_motion_training_usable} actual={motion_training_usable}",
         )
         endpoint_override = frame.get("endpointPreviousTransformOverride")
-        expected_endpoint_override = replay_role == "FrameGenerationEndpoints"
+        expected_endpoint_override = replay_role in (
+            "FrameGenerationEndpoints",
+            "FrameGenerationReverseEndpoints",
+        )
         add_check(
             checks,
             f"frame_{frame_id:06d}.endpoint_transform_role",
             endpoint_override is expected_endpoint_override,
             f"expected={expected_endpoint_override} actual={endpoint_override}",
+        )
+        expected_evaluation_direction = (
+            "decreasing_frame_id"
+            if replay_role == "FrameGenerationReverseEndpoints"
+            else "increasing_frame_id"
+        )
+        add_check(
+            checks,
+            f"frame_{frame_id:06d}.logical_evaluation_direction",
+            frame.get("logicalEvaluationDirection") == expected_evaluation_direction,
+            f"expected={expected_evaluation_direction} actual={frame.get('logicalEvaluationDirection')}",
         )
         frame_capture_order = str(frame.get("auxiliaryCaptureOrder") or "")
         submissions = frame.get("renderSubmissions", [])
@@ -1237,6 +1267,35 @@ def validate(
                     valid = isinstance(value, (int, float)) and math.isfinite(value) and value > 0
                     add_check(checks, f"frame_{frame_id:06d}.{name}.positive", valid, str(value))
 
+                if job.get("bLockTemporalJitterToLogicalFrame", False):
+                    sequence_length = int(job.get("temporalJitterSequenceLength", 0))
+                    phase_offset = int(job.get("temporalJitterPhaseOffset", 0))
+                    expected_jitter_index = (
+                        (frame_id + phase_offset) % sequence_length
+                        if sequence_length > 0
+                        else -1
+                    )
+                    add_check(
+                        checks,
+                        f"frame_{frame_id:06d}.logical_frame_jitter_phase",
+                        1 <= sequence_length <= 8
+                        and temporal.get("jitterLogicalFrameLocked") is True
+                        and temporal.get("jitterIndexSource") == "logical_frame_debug_override"
+                        and int(temporal.get("jitterIndex", -1)) == expected_jitter_index
+                        and int(temporal.get("jitterSequenceLength", -1)) == sequence_length
+                        and int(temporal.get("jitterPhaseOffset", 0)) == phase_offset,
+                        json.dumps(
+                            {
+                                "expectedIndex": expected_jitter_index,
+                                "actualIndex": temporal.get("jitterIndex"),
+                                "sequenceLength": temporal.get("jitterSequenceLength"),
+                                "phaseOffset": temporal.get("jitterPhaseOffset"),
+                                "source": temporal.get("jitterIndexSource"),
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+
                 validate_temporal_frame(
                     checks, frame, temporal, frame_pixels, lr_size, hr_size, main_view, cvars
                 )
@@ -1287,7 +1346,8 @@ def validate(
         f"count={len(all_render_submission_ids)} first={all_render_submission_ids[:4]} last={all_render_submission_ids[-4:]}",
     )
 
-    temporal_records.sort(key=lambda item: item[0])
+    # Preserve manifest/process order. Reverse endpoint replay intentionally
+    # captures t1 before t0 so the retained View State yields motion_0_to_1.
     for index in range(1, len(temporal_records)):
         frame_id, current, reset = temporal_records[index]
         _, previous, _ = temporal_records[index - 1]
@@ -1314,12 +1374,17 @@ def validate(
         step = int(job.get("frameStep", 1))
         offset = int(job.get("captureFrameOffset", 0))
         expected_frame_ids = list(range(start + offset, end + 1, step))
-        actual_frame_ids = sorted(int(frame["logicalFrameId"]) for frame in frames)
+        expected_process_order = (
+            list(reversed(expected_frame_ids))
+            if replay_role == "FrameGenerationReverseEndpoints"
+            else expected_frame_ids
+        )
+        actual_frame_ids = [int(frame["logicalFrameId"]) for frame in frames]
         add_check(
             checks,
             "replay.captured_frame_phase",
-            actual_frame_ids == expected_frame_ids,
-            f"expected={expected_frame_ids} actual={actual_frame_ids}",
+            actual_frame_ids == expected_process_order,
+            f"expectedProcessOrder={expected_process_order} actual={actual_frame_ids}",
         )
         if replay_role == "FrameGenerationIntermediate":
             add_check(
@@ -1331,18 +1396,25 @@ def validate(
                     "so a prior intermediate cannot become the retained Main View history"
                 ),
             )
-        for frame in frames:
+        for frame_index, frame in enumerate(frames):
             frame_id = int(frame["logicalFrameId"])
-            expected_previous = frame_id if frame_id == expected_frame_ids[0] else frame_id - step
+            expected_previous = (
+                frame_id
+                if frame_index == 0
+                else int(frames[frame_index - 1]["logicalFrameId"])
+            )
             add_check(
                 checks,
                 f"frame_{frame_id:06d}.endpoint_previous_frame",
                 int(frame.get("previousCapturedLogicalFrameId", -1)) == expected_previous,
                 f"expected={expected_previous} actual={frame.get('previousCapturedLogicalFrameId')}",
             )
-            if replay_role == "FrameGenerationEndpoints":
+            if replay_role in (
+                "FrameGenerationEndpoints",
+                "FrameGenerationReverseEndpoints",
+            ):
                 expected_motion_previous = expected_previous
-                expected_span_frames = 0 if frame_id == expected_frame_ids[0] else step
+                expected_span_frames = 0 if frame_index == 0 else step
             else:
                 expected_motion_previous = frame_id - 1
                 expected_span_frames = 1
@@ -1377,7 +1449,7 @@ def validate(
                 f"expected={expected_span_frames} actual={frame.get('motionTimeSpanFrames')}",
             )
 
-    semantic_records.sort(key=lambda item: item[0])
+    # Preserve process order for the same reason as temporal history above.
     if len(semantic_records) > 1:
         semantic_frame_ids = {frame_id for frame_id, _, _ in semantic_records}
         semantic_scene_hashes = {

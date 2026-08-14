@@ -14,10 +14,12 @@ from typing import Any
 
 
 ENDPOINT_ROLE = "FrameGenerationEndpoints"
+REVERSE_ENDPOINT_ROLE = "FrameGenerationReverseEndpoints"
 INTERMEDIATE_ROLE = "FrameGenerationIntermediate"
 INTENTIONAL_CVAR_DIFFERENCES = {
     "r.MotionVectorSimulation": {
         "endpoints": "1",
+        "reverseEndpoints": "1",
         "intermediate": "0",
         "reason": (
             "Endpoint replay preserves the last captured component transforms so t1 motion spans "
@@ -66,8 +68,13 @@ def require_capture(dataset: Path, role: str) -> tuple[dict[str, Any], dict[str,
     return manifest, report
 
 
-def compatible(endpoint: dict[str, Any], intermediate: dict[str, Any]) -> dict[str, Any]:
+def compatible(
+    endpoint: dict[str, Any],
+    reverse_endpoint: dict[str, Any],
+    intermediate: dict[str, Any],
+) -> dict[str, Any]:
     endpoint_job = endpoint["job"]
+    reverse_job = reverse_endpoint["job"]
     intermediate_job = intermediate["job"]
     fields = (
         "expectedMap",
@@ -82,11 +89,20 @@ def compatible(endpoint: dict[str, Any], intermediate: dict[str, Any]) -> dict[s
         "bEnableSemanticValidationFixture",
         "bBlockOnStreamingBeforeCapture",
         "streamingWaitSeconds",
+        "bLockTemporalJitterToLogicalFrame",
+        "temporalJitterSequenceLength",
+        "temporalJitterPhaseOffset",
     )
-    mismatches = [name for name in fields if endpoint_job.get(name) != intermediate_job.get(name)]
+    mismatches = [
+        name
+        for name in fields
+        if endpoint_job.get(name) != intermediate_job.get(name)
+        or endpoint_job.get(name) != reverse_job.get(name)
+    ]
     if mismatches:
-        raise ValueError(f"endpoint/intermediate job mismatch: {mismatches}")
+        raise ValueError(f"forward/reverse/intermediate job mismatch: {mismatches}")
     endpoint_provenance = endpoint.get("provenance", {})
+    reverse_provenance = reverse_endpoint.get("provenance", {})
     intermediate_provenance = intermediate.get("provenance", {})
     provenance_fields = (
         "engineVersion",
@@ -111,21 +127,30 @@ def compatible(endpoint: dict[str, Any], intermediate: dict[str, Any]) -> dict[s
     mismatches = [
         name for name in provenance_fields
         if endpoint_provenance.get(name) != intermediate_provenance.get(name)
+        or endpoint_provenance.get(name) != reverse_provenance.get(name)
     ]
     if mismatches:
-        raise ValueError(f"endpoint/intermediate provenance mismatch: {mismatches}")
+        raise ValueError(f"forward/reverse/intermediate provenance mismatch: {mismatches}")
 
     endpoint_cvars = endpoint_provenance.get("cvars")
+    reverse_cvars = reverse_provenance.get("cvars")
     intermediate_cvars = intermediate_provenance.get("cvars")
-    if not isinstance(endpoint_cvars, dict) or not isinstance(intermediate_cvars, dict):
-        raise ValueError("both source replays must contain a provenance.cvars object")
+    if (
+        not isinstance(endpoint_cvars, dict)
+        or not isinstance(reverse_cvars, dict)
+        or not isinstance(intermediate_cvars, dict)
+    ):
+        raise ValueError("all three source replays must contain a provenance.cvars object")
 
-    all_cvar_names = sorted(set(endpoint_cvars) | set(intermediate_cvars))
+    all_cvar_names = sorted(set(endpoint_cvars) | set(reverse_cvars) | set(intermediate_cvars))
     unexpected_cvar_differences = [
         name
         for name in all_cvar_names
         if name not in INTENTIONAL_CVAR_DIFFERENCES
-        and endpoint_cvars.get(name) != intermediate_cvars.get(name)
+        and (
+            endpoint_cvars.get(name) != intermediate_cvars.get(name)
+            or endpoint_cvars.get(name) != reverse_cvars.get(name)
+        )
     ]
     if unexpected_cvar_differences:
         raise ValueError(
@@ -135,11 +160,17 @@ def compatible(endpoint: dict[str, Any], intermediate: dict[str, Any]) -> dict[s
 
     for name, expected in INTENTIONAL_CVAR_DIFFERENCES.items():
         endpoint_value = str(endpoint_cvars.get(name))
+        reverse_value = str(reverse_cvars.get(name))
         intermediate_value = str(intermediate_cvars.get(name))
-        if endpoint_value != expected["endpoints"] or intermediate_value != expected["intermediate"]:
+        if (
+            endpoint_value != expected["endpoints"]
+            or reverse_value != expected["reverseEndpoints"]
+            or intermediate_value != expected["intermediate"]
+        ):
             raise ValueError(
                 f"intentional CVar difference {name} has unexpected values: "
-                f"endpoints={endpoint_value}, intermediate={intermediate_value}"
+                f"endpoints={endpoint_value}, reverseEndpoints={reverse_value}, "
+                f"intermediate={intermediate_value}"
             )
 
     normalized_cvars = {
@@ -206,15 +237,102 @@ def unjittered_camera(frame: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> None:
+def current_grid_signature(frame: dict[str, Any]) -> dict[str, Any]:
+    temporal = frame["temporalDiagnostics"]
+    fields = (
+        "renderSize",
+        "displaySize",
+        "viewRect",
+        "sceneBufferSize",
+        "resolutionFraction",
+        "jitterCurrentNDC",
+        "jitterCurrentRenderPixel",
+        "jitterCurrentDisplayPixel",
+        "jitterIndex",
+        "jitterIndexSource",
+        "jitterLogicalFrameLocked",
+        "jitterSequenceLength",
+        "jitterPhaseOffset",
+        "viewToClipCurrentJittered",
+        "viewToClipCurrentUnjittered",
+        "translatedWorldToViewCurrent",
+        "viewToTranslatedWorldCurrent",
+        "translatedWorldToClipCurrentJittered",
+        "translatedWorldToClipCurrentUnjittered",
+        "worldViewOriginHighCurrent",
+        "worldViewOriginLowCurrent",
+        "preViewTranslationHighCurrent",
+        "preViewTranslationLowCurrent",
+        "preExposure",
+        "exposure",
+        "nearPlane",
+        "reversedZ",
+        "infiniteFar",
+    )
+    return {
+        "logicalFrameId": int(frame["logicalFrameId"]),
+        "simulationTimeS": frame["simulationTimeS"],
+        "camera": frame["camera"],
+        "temporal": {name: temporal.get(name) for name in fields},
+    }
+
+
+def require_matching_endpoint_grid(
+    forward: dict[str, Any], reverse: dict[str, Any]
+) -> bool:
+    frame_id = int(forward["logicalFrameId"])
+    if int(reverse.get("logicalFrameId", -1)) != frame_id:
+        raise ValueError(f"reverse replay lacks matching logical frame {frame_id}")
+    if current_grid_signature(forward) != current_grid_signature(reverse):
+        raise ValueError(
+            f"forward/reverse current raster grid, jitter, camera, or exposure differs at frame {frame_id}"
+        )
+    for modality in (
+        "depth_device_raw",
+        "depth_view_linear_meters",
+        "depth_valid",
+        "object_id",
+        "motion_valid",
+    ):
+        forward_hash = str(forward.get("sha1", {}).get(modality, "")).upper()
+        reverse_hash = str(reverse.get("sha1", {}).get(modality, "")).upper()
+        if not forward_hash or forward_hash != reverse_hash:
+            raise ValueError(
+                f"forward/reverse {modality} grid differs at frame {frame_id}"
+            )
+    scene_state_exact = forward.get("sceneStateSha1") == reverse.get("sceneStateSha1")
+    fixture_enabled = bool(
+        forward.get("semanticValidationFixture", {}).get("enabled")
+        and reverse.get("semanticValidationFixture", {}).get("enabled")
+    )
+    if not scene_state_exact and not fixture_enabled:
+        raise ValueError(
+            f"forward/reverse full scene state differs at production frame {frame_id}"
+        )
+    return scene_state_exact
+
+
+def assemble(
+    endpoint_dir: Path,
+    reverse_endpoint_dir: Path,
+    intermediate_dir: Path,
+    output_dir: Path,
+) -> None:
     endpoint, endpoint_report = require_capture(endpoint_dir, ENDPOINT_ROLE)
+    reverse_endpoint, reverse_endpoint_report = require_capture(
+        reverse_endpoint_dir, REVERSE_ENDPOINT_ROLE
+    )
     intermediate, intermediate_report = require_capture(intermediate_dir, INTERMEDIATE_ROLE)
-    compatibility = compatible(endpoint, intermediate)
+    compatibility = compatible(endpoint, reverse_endpoint, intermediate)
     endpoint_job = endpoint["job"]
     if output_dir.exists():
         raise ValueError(f"output already exists; choose a new directory: {output_dir}")
 
     endpoint_frames = sorted(endpoint.get("frames", []), key=lambda frame: int(frame["logicalFrameId"]))
+    reverse_by_id = {
+        int(frame["logicalFrameId"]): frame
+        for frame in reverse_endpoint.get("frames", [])
+    }
     intermediate_by_id = {
         int(frame["logicalFrameId"]): frame for frame in intermediate.get("frames", [])
     }
@@ -237,6 +355,16 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
                 raise ValueError(f"pair {t0}->{t1} requires exactly one intermediate, found {tau_candidates}")
             tau_frame_id = tau_candidates[0]
             frame_tau = intermediate_by_id[tau_frame_id]
+            reverse_frame0 = reverse_by_id.get(t0)
+            reverse_frame1 = reverse_by_id.get(t1)
+            if reverse_frame0 is None or reverse_frame1 is None:
+                raise ValueError(f"reverse endpoints are missing pair {t0}->{t1}")
+            if int(reverse_frame0.get("motionPreviousLogicalFrameId", -1)) != t1:
+                raise ValueError(
+                    f"reverse endpoint motion at frame {t0} does not point to frame {t1}"
+                )
+            scene_state_exact_t0 = require_matching_endpoint_grid(frame0, reverse_frame0)
+            scene_state_exact_t1 = require_matching_endpoint_grid(frame1, reverse_frame1)
             tau = (tau_frame_id - t0) / (t1 - t0)
             if abs(tau - 0.5) > 1e-9:
                 raise ValueError(f"v1 requires tau=0.5, found {tau}")
@@ -253,8 +381,12 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
                 ("depth_t1", endpoint_dir, frame1, "depth_view_linear_meters"),
                 ("motion_1_to_0", endpoint_dir, frame1, "motion_full_current_to_previous"),
                 ("motion_valid_1_to_0", endpoint_dir, frame1, "motion_valid"),
+                ("motion_0_to_1", reverse_endpoint_dir, reverse_frame0, "motion_full_current_to_previous"),
+                ("motion_valid_0_to_1", reverse_endpoint_dir, reverse_frame0, "motion_valid"),
                 ("history_rejection_1_to_0", endpoint_dir, frame1, "history_rejection_mask"),
                 ("history_rejection_valid_1_to_0", endpoint_dir, frame1, "history_rejection_valid"),
+                ("history_rejection_0_to_1", reverse_endpoint_dir, reverse_frame0, "history_rejection_mask"),
+                ("history_rejection_valid_0_to_1", reverse_endpoint_dir, reverse_frame0, "history_rejection_valid"),
                 ("object_id_t0", endpoint_dir, frame0, "object_id"),
                 ("object_id_tau", intermediate_dir, frame_tau, "object_id"),
                 ("object_id_t1", endpoint_dir, frame1, "object_id"),
@@ -280,11 +412,26 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
                 "deltaTimeS": float(frame1["simulationTimeS"]) - float(frame0["simulationTimeS"]),
                 "endpointMotionDefinition": "previous_pixel = current_pixel + motion_1_to_0",
                 "endpointMotionUnit": "display_pixel",
+                "reverseEndpointMotionDefinition": "future_pixel = current_pixel + motion_0_to_1",
+                "bidirectionalMotionIndependentProcesses": True,
                 "intermediateHistoryIsolated": True,
                 "endpointPreviousState": {
                     "t1PreviousLogicalFrameId": int(frame1["motionPreviousLogicalFrameId"]),
                     "timeSpanS": float(frame1["motionTimeSpanS"]),
                     "componentTransformOverride": bool(frame1["endpointPreviousTransformOverride"]),
+                },
+                "reverseEndpointPreviousState": {
+                    "t0PreviousLogicalFrameId": int(reverse_frame0["motionPreviousLogicalFrameId"]),
+                    "timeSpanS": float(reverse_frame0["motionTimeSpanS"]),
+                    "componentTransformOverride": bool(reverse_frame0["endpointPreviousTransformOverride"]),
+                },
+                "reverseEndpointGridAlignment": {
+                    "jitterCameraDepthObjectIdExact": True,
+                    "sceneStateExactT0": scene_state_exact_t0,
+                    "sceneStateExactT1": scene_state_exact_t1,
+                    "semanticFixtureAllowsHiddenUncontrolledStateMismatch": bool(
+                        frame0.get("semanticValidationFixture", {}).get("enabled")
+                    ),
                 },
                 "cameraT0Unjittered": unjittered_camera(frame0),
                 "cameraT1Unjittered": unjittered_camera(frame1),
@@ -357,10 +504,25 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
                     "jitterRemoved": True,
                     "resolution": "render",
                 },
+                "motion0To1": {
+                    "definition": "future_pixel = current_pixel + motion_0_to_1",
+                    "unit": "display_pixel",
+                    "origin": "top_left",
+                    "jitterRemoved": True,
+                    "resolution": "render",
+                    "independentlyCaptured": True,
+                },
                 "historyRejection1To0": {
                     "definition": "one_rejects_t0_history_at_t1_motion_reprojected_pixel",
                     "source": "custom_stencil_identity_else_static_camera_depth_reprojection_v1",
                     "validity": "history_rejection_valid_1_to_0",
+                    "resolution": "render",
+                    "productionCertified": False,
+                },
+                "historyRejection0To1": {
+                    "definition": "one_rejects_t1_history_at_t0_motion_reprojected_pixel",
+                    "source": "custom_stencil_identity_else_static_camera_depth_reprojection_v1",
+                    "validity": "history_rejection_valid_0_to_1",
                     "resolution": "render",
                     "productionCertified": False,
                 },
@@ -371,6 +533,7 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
             },
             "sourceReplays": {
                 "endpoints": str(endpoint_dir.resolve()),
+                "reverseEndpoints": str(reverse_endpoint_dir.resolve()),
                 "intermediate": str(intermediate_dir.resolve()),
                 "endpointValidation": {
                     "validatorVersion": endpoint_report.get("validatorVersion"),
@@ -382,14 +545,19 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
                     "checksPassed": intermediate_report.get("checksPassed"),
                     "checksTotal": intermediate_report.get("checksTotal"),
                 },
+                "reverseEndpointValidation": {
+                    "validatorVersion": reverse_endpoint_report.get("validatorVersion"),
+                    "checksPassed": reverse_endpoint_report.get("checksPassed"),
+                    "checksTotal": reverse_endpoint_report.get("checksTotal"),
+                },
             },
             "provenance": {
                 **compatibility,
                 "endpointReplay": endpoint.get("provenance", {}),
+                "reverseEndpointReplay": reverse_endpoint.get("provenance", {}),
                 "intermediateReplay": intermediate.get("provenance", {}),
             },
             "missingRequirements": [
-                "motion_0_to_1_independently_captured",
                 "ui_color_alpha_t0_tau_t1",
                 "skeletal_bone_endpoint_motion_validation",
                 "wpo_and_animated_material_endpoint_motion_validation",
@@ -409,11 +577,17 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoints", type=Path, required=True)
+    parser.add_argument("--reverse-endpoints", type=Path, required=True)
     parser.add_argument("--intermediate", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
-        assemble(args.endpoints.resolve(), args.intermediate.resolve(), args.output.resolve())
+        assemble(
+            args.endpoints.resolve(),
+            args.reverse_endpoints.resolve(),
+            args.intermediate.resolve(),
+            args.output.resolve(),
+        )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

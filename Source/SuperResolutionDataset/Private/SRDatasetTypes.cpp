@@ -39,6 +39,12 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("WarmupFrames cannot be negative.");
 		return false;
 	}
+	if (bLockTemporalJitterToLogicalFrame &&
+		(TemporalJitterSequenceLength < 1 || TemporalJitterSequenceLength > 8))
+	{
+		OutError = TEXT("TemporalJitterSequenceLength must be in [1, 8] when logical-frame jitter locking is enabled.");
+		return false;
+	}
 	if (bBlockOnStreamingBeforeCapture &&
 		(!FMath::IsFinite(StreamingWaitSeconds) || StreamingWaitSeconds <= 0.0f || StreamingWaitSeconds > 3600.0f))
 	{
@@ -98,9 +104,11 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("Endpoint previous-transform overrides require suppressed uncaptured Main Views.");
 		return false;
 	}
-	if (bUseLastCapturedEndpointTransforms && ReplayPass != ESRDatasetReplayPass::FrameGenerationEndpoints)
+	if (bUseLastCapturedEndpointTransforms &&
+		ReplayPass != ESRDatasetReplayPass::FrameGenerationEndpoints &&
+		ReplayPass != ESRDatasetReplayPass::FrameGenerationReverseEndpoints)
 	{
-		OutError = TEXT("Endpoint previous-transform overrides require ReplayPass=FrameGenerationEndpoints.");
+		OutError = TEXT("Endpoint previous-transform overrides require a forward or reverse endpoint replay pass.");
 		return false;
 	}
 	if (bCaptureReferenceHR && (ReferenceHRScale < 2 || ReferenceHRScale > 4))
@@ -145,16 +153,24 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 	}
 	if (ReplayPass == ESRDatasetReplayPass::FrameGenerationEndpoints &&
 		(!bCaptureMainViewHUDlessColor || !bSuppressMainViewOnUncapturedFrames ||
-		 !bUseLastCapturedEndpointTransforms || CapturedFrameCount < 2))
+		 !bUseLastCapturedEndpointTransforms || !bLockTemporalJitterToLogicalFrame || CapturedFrameCount < 2))
 	{
-		OutError = TEXT("FrameGenerationEndpoints requires HUD-less Main View color, suppressed intermediate renders, endpoint transform overrides, and at least two endpoints.");
+		OutError = TEXT("FrameGenerationEndpoints requires HUD-less Main View color, logical-frame jitter locking, suppressed intermediate renders, endpoint transform overrides, and at least two endpoints.");
+		return false;
+	}
+	if (ReplayPass == ESRDatasetReplayPass::FrameGenerationReverseEndpoints &&
+		(!bCaptureMainViewHUDlessColor || !bSuppressMainViewOnUncapturedFrames ||
+		 !bUseLastCapturedEndpointTransforms || !bLockTemporalJitterToLogicalFrame || CapturedFrameCount < 2))
+	{
+		OutError = TEXT("FrameGenerationReverseEndpoints requires HUD-less Main View color, logical-frame jitter locking, suppressed intermediate renders, endpoint transform overrides, and at least two endpoints.");
 		return false;
 	}
 	if (ReplayPass == ESRDatasetReplayPass::FrameGenerationIntermediate &&
 		(!bCaptureMainViewHUDlessColor || !bSuppressMainViewOnUncapturedFrames ||
-		 bUseLastCapturedEndpointTransforms || CaptureFrameOffset == 0 || CapturedFrameCount != 1))
+		 bUseLastCapturedEndpointTransforms || !bLockTemporalJitterToLogicalFrame ||
+		 CaptureFrameOffset == 0 || CapturedFrameCount != 1))
 	{
-		OutError = TEXT("FrameGenerationIntermediate requires exactly one offset HUD-less Main View capture per process, suppressed uncaptured renders, and no endpoint override.");
+		OutError = TEXT("FrameGenerationIntermediate requires exactly one offset HUD-less Main View capture per process, logical-frame jitter locking, suppressed uncaptured renders, and no endpoint override.");
 		return false;
 	}
 	if (OutputDirectory.TrimStartAndEnd().IsEmpty())

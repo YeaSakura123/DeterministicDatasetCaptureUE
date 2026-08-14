@@ -30,8 +30,12 @@ REQUIRED_MODALITIES = {
     "depth_t1",
     "motion_1_to_0",
     "motion_valid_1_to_0",
+    "motion_0_to_1",
+    "motion_valid_0_to_1",
     "history_rejection_1_to_0",
     "history_rejection_valid_1_to_0",
+    "history_rejection_0_to_1",
+    "history_rejection_valid_0_to_1",
     "object_id_t0",
     "object_id_tau",
     "object_id_t1",
@@ -51,8 +55,11 @@ DISPLAY_MODALITIES = {
 
 MASK_MODALITIES = {
     "motion_valid_1_to_0",
+    "motion_valid_0_to_1",
     "history_rejection_1_to_0",
     "history_rejection_valid_1_to_0",
+    "history_rejection_0_to_1",
+    "history_rejection_valid_0_to_1",
     "reactive_mask_t0",
     "reactive_mask_tau",
     "reactive_mask_t1",
@@ -63,14 +70,16 @@ MASK_MODALITIES = {
 
 BINARY_MASK_MODALITIES = {
     "motion_valid_1_to_0",
+    "motion_valid_0_to_1",
     "history_rejection_1_to_0",
     "history_rejection_valid_1_to_0",
+    "history_rejection_0_to_1",
+    "history_rejection_valid_0_to_1",
 }
 
 OBJECT_ID_MODALITIES = {"object_id_t0", "object_id_tau", "object_id_t1"}
 
 REQUIRED_UNCERTIFIED_GAPS = {
-    "motion_0_to_1_independently_captured",
     "ui_color_alpha_t0_tau_t1",
     "skeletal_bone_endpoint_motion_validation",
     "wpo_and_animated_material_endpoint_motion_validation",
@@ -79,7 +88,11 @@ REQUIRED_UNCERTIFIED_GAPS = {
 }
 
 INTENTIONAL_CVAR_VALUES = {
-    "r.MotionVectorSimulation": {"endpoints": "1", "intermediate": "0"}
+    "r.MotionVectorSimulation": {
+        "endpoints": "1",
+        "reverseEndpoints": "1",
+        "intermediate": "0",
+    }
 }
 
 
@@ -174,24 +187,44 @@ def validate_provenance(checks: list[dict[str, Any]], provenance: Any) -> None:
         add_check(checks, "provenance.object", False, "missing provenance object")
         return
     endpoint = provenance.get("endpointReplay", {})
+    reverse_endpoint = provenance.get("reverseEndpointReplay", {})
     intermediate = provenance.get("intermediateReplay", {})
     endpoint_cvars = endpoint.get("cvars", {}) if isinstance(endpoint, dict) else {}
+    reverse_endpoint_cvars = (
+        reverse_endpoint.get("cvars", {}) if isinstance(reverse_endpoint, dict) else {}
+    )
     intermediate_cvars = intermediate.get("cvars", {}) if isinstance(intermediate, dict) else {}
     add_check(
         checks,
         "provenance.source_objects",
         isinstance(endpoint_cvars, dict) and bool(endpoint_cvars)
+        and isinstance(reverse_endpoint_cvars, dict) and bool(reverse_endpoint_cvars)
         and isinstance(intermediate_cvars, dict) and bool(intermediate_cvars),
-        f"endpointCVars={len(endpoint_cvars)} intermediateCVars={len(intermediate_cvars)}",
+        f"endpointCVars={len(endpoint_cvars)} "
+        f"reverseEndpointCVars={len(reverse_endpoint_cvars)} "
+        f"intermediateCVars={len(intermediate_cvars)}",
     )
-    if not isinstance(endpoint_cvars, dict) or not isinstance(intermediate_cvars, dict):
+    if (
+        not isinstance(endpoint_cvars, dict)
+        or not isinstance(reverse_endpoint_cvars, dict)
+        or not isinstance(intermediate_cvars, dict)
+    ):
         return
 
     unexpected = [
         name
-        for name in sorted(set(endpoint_cvars) | set(intermediate_cvars))
+        for name in sorted(
+            set(endpoint_cvars) | set(reverse_endpoint_cvars) | set(intermediate_cvars)
+        )
         if name not in INTENTIONAL_CVAR_VALUES
-        and endpoint_cvars.get(name) != intermediate_cvars.get(name)
+        and len(
+            {
+                str(endpoint_cvars.get(name)),
+                str(reverse_endpoint_cvars.get(name)),
+                str(intermediate_cvars.get(name)),
+            }
+        )
+        != 1
     ]
     add_check(
         checks,
@@ -201,6 +234,7 @@ def validate_provenance(checks: list[dict[str, Any]], provenance: Any) -> None:
     )
     expected_values_ok = all(
         str(endpoint_cvars.get(name)) == values["endpoints"]
+        and str(reverse_endpoint_cvars.get(name)) == values["reverseEndpoints"]
         and str(intermediate_cvars.get(name)) == values["intermediate"]
         for name, values in INTENTIONAL_CVAR_VALUES.items()
     )
@@ -212,6 +246,7 @@ def validate_provenance(checks: list[dict[str, Any]], provenance: Any) -> None:
             {
                 name: {
                     "endpoints": endpoint_cvars.get(name),
+                    "reverseEndpoints": reverse_endpoint_cvars.get(name),
                     "intermediate": intermediate_cvars.get(name),
                 }
                 for name in INTENTIONAL_CVAR_VALUES
@@ -224,6 +259,11 @@ def validate_provenance(checks: list[dict[str, Any]], provenance: Any) -> None:
         for name in sorted(endpoint_cvars)
         if name not in INTENTIONAL_CVAR_VALUES
     }
+    reverse_endpoint_normalized = {
+        name: reverse_endpoint_cvars[name]
+        for name in sorted(reverse_endpoint_cvars)
+        if name not in INTENTIONAL_CVAR_VALUES
+    }
     intermediate_normalized = {
         name: intermediate_cvars[name]
         for name in sorted(intermediate_cvars)
@@ -233,7 +273,7 @@ def validate_provenance(checks: list[dict[str, Any]], provenance: Any) -> None:
     add_check(
         checks,
         "provenance.normalized_cvar_profiles",
-        endpoint_normalized == intermediate_normalized
+        endpoint_normalized == reverse_endpoint_normalized == intermediate_normalized
         and provenance.get("normalizedCVarProfileSha1") == normalized_hash,
         f"computed={normalized_hash} declared={provenance.get('normalizedCVarProfileSha1')}",
     )
@@ -258,7 +298,12 @@ def validate_provenance(checks: list[dict[str, Any]], provenance: Any) -> None:
         "streamingStateAfterBarrierSha1",
         "streamingStateHashScope",
     )
-    mismatches = [name for name in invariant_fields if endpoint.get(name) != intermediate.get(name)]
+    mismatches = [
+        name
+        for name in invariant_fields
+        if endpoint.get(name) != reverse_endpoint.get(name)
+        or endpoint.get(name) != intermediate.get(name)
+    ]
     add_check(
         checks,
         "provenance.render_environment_exact",
@@ -302,7 +347,11 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
     add_check(checks, "contract.resolutions", valid_sizes, f"render={render_size} display={display_size}")
 
     source_replays = manifest.get("sourceReplays", {})
-    for role in ("endpointValidation", "intermediateValidation"):
+    for role in (
+        "endpointValidation",
+        "reverseEndpointValidation",
+        "intermediateValidation",
+    ):
         validation = source_replays.get(role, {}) if isinstance(source_replays, dict) else {}
         passed = int(validation.get("checksPassed", -1))
         total = int(validation.get("checksTotal", -2))
@@ -317,9 +366,13 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
 
     semantics = manifest.get("bufferSemantics", {})
     motion_semantics = semantics.get("motion1To0", {}) if isinstance(semantics, dict) else {}
+    reverse_motion_semantics = semantics.get("motion0To1", {}) if isinstance(semantics, dict) else {}
     color_semantics = semantics.get("sceneColorHudless", {}) if isinstance(semantics, dict) else {}
     depth_semantics = semantics.get("depth", {}) if isinstance(semantics, dict) else {}
     rejection_semantics = semantics.get("historyRejection1To0", {}) if isinstance(semantics, dict) else {}
+    reverse_rejection_semantics = (
+        semantics.get("historyRejection0To1", {}) if isinstance(semantics, dict) else {}
+    )
     add_check(
         checks,
         "semantics.motion",
@@ -328,6 +381,17 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         and motion_semantics.get("origin") == "top_left"
         and motion_semantics.get("jitterRemoved") is True,
         json.dumps(motion_semantics, sort_keys=True),
+    )
+    add_check(
+        checks,
+        "semantics.reverse_motion",
+        reverse_motion_semantics.get("definition")
+        == "future_pixel = current_pixel + motion_0_to_1"
+        and reverse_motion_semantics.get("unit") == "display_pixel"
+        and reverse_motion_semantics.get("origin") == "top_left"
+        and reverse_motion_semantics.get("jitterRemoved") is True
+        and reverse_motion_semantics.get("independentlyCaptured") is True,
+        json.dumps(reverse_motion_semantics, sort_keys=True),
     )
     add_check(
         checks,
@@ -356,6 +420,18 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         and rejection_semantics.get("productionCertified") is False,
         json.dumps(rejection_semantics, sort_keys=True),
     )
+    add_check(
+        checks,
+        "semantics.reverse_history_rejection",
+        reverse_rejection_semantics.get("definition")
+        == "one_rejects_t1_history_at_t0_motion_reprojected_pixel"
+        and reverse_rejection_semantics.get("source")
+        == "custom_stencil_identity_else_static_camera_depth_reprojection_v1"
+        and reverse_rejection_semantics.get("validity")
+        == "history_rejection_valid_0_to_1"
+        and reverse_rejection_semantics.get("productionCertified") is False,
+        json.dumps(reverse_rejection_semantics, sort_keys=True),
+    )
 
     pairs = manifest.get("pairs", [])
     add_check(checks, "pairs.nonempty", isinstance(pairs, list) and bool(pairs), f"count={len(pairs) if isinstance(pairs, list) else -1}")
@@ -382,16 +458,48 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
             )
             delta_time = float(pair.get("deltaTimeS", math.nan))
             endpoint_state = pair.get("endpointPreviousState", {})
+            reverse_endpoint_state = pair.get("reverseEndpointPreviousState", {})
             time_span = float(endpoint_state.get("timeSpanS", math.nan))
+            reverse_time_span = float(reverse_endpoint_state.get("timeSpanS", math.nan))
             add_check(
                 checks,
                 f"{prefix}.endpoint_history_isolation",
                 pair.get("intermediateHistoryIsolated") is True
+                and pair.get("bidirectionalMotionIndependentProcesses") is True
                 and int(endpoint_state.get("t1PreviousLogicalFrameId", -1)) == t0
                 and endpoint_state.get("componentTransformOverride") is True
                 and delta_time > 0.0
                 and math.isclose(time_span, delta_time, rel_tol=1e-6, abs_tol=1e-7),
                 f"previous={endpoint_state.get('t1PreviousLogicalFrameId')} delta={delta_time} span={time_span}",
+            )
+            add_check(
+                checks,
+                f"{prefix}.reverse_endpoint_history_isolation",
+                pair.get("bidirectionalMotionIndependentProcesses") is True
+                and int(reverse_endpoint_state.get("t0PreviousLogicalFrameId", -1)) == t1
+                and reverse_endpoint_state.get("componentTransformOverride") is True
+                and delta_time > 0.0
+                and math.isclose(
+                    reverse_time_span, delta_time, rel_tol=1e-6, abs_tol=1e-7
+                ),
+                f"previous={reverse_endpoint_state.get('t0PreviousLogicalFrameId')} "
+                f"delta={delta_time} span={reverse_time_span}",
+            )
+
+            grid_alignment = pair.get("reverseEndpointGridAlignment", {})
+            scene_state_exact = bool(grid_alignment.get("sceneStateExactT0")) and bool(
+                grid_alignment.get("sceneStateExactT1")
+            )
+            fixture_hidden_state_allowance = (
+                grid_alignment.get("semanticFixtureAllowsHiddenUncontrolledStateMismatch")
+                is True
+            )
+            add_check(
+                checks,
+                f"{prefix}.reverse_endpoint_grid_alignment",
+                grid_alignment.get("jitterCameraDepthObjectIdExact") is True
+                and (scene_state_exact or fixture_hidden_state_allowance),
+                json.dumps(grid_alignment, sort_keys=True),
             )
 
             for camera_name in ("cameraT0Unjittered", "cameraT1Unjittered"):
@@ -448,6 +556,7 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
             add_check(checks, f"{prefix}.modality_set", not missing_modalities and not extra_modalities, f"missing={missing_modalities} extra={extra_modalities}")
             if not isinstance(files, dict):
                 continue
+            pair_pixels: dict[str, np.ndarray] = {}
             for modality in sorted(REQUIRED_MODALITIES & set(files)):
                 try:
                     path = safe_dataset_file(dataset, files[modality])
@@ -477,6 +586,7 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                 add_check(checks, f"{prefix}.{modality}.pixels", not read_error and finite and actual_size == expected_size, f"size={actual_size} expected={expected_size} finite={finite} error={read_error}")
                 if not finite:
                     continue
+                pair_pixels[modality] = pixels
                 channel = pixels[..., 0]
                 if modality in MASK_MODALITIES:
                     valid_values = bool(np.min(channel) >= -1e-6 and np.max(channel) <= 1.0 + 1e-6)
@@ -505,9 +615,40 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                     "mean": float(np.mean(pixels)),
                 }
 
+            if fixture_hidden_state_allowance:
+                required_motion_pixels = (
+                    "motion_1_to_0",
+                    "motion_valid_1_to_0",
+                    "motion_0_to_1",
+                    "motion_valid_0_to_1",
+                )
+                available = all(name in pair_pixels for name in required_motion_pixels)
+                joint_valid_count = 0
+                max_same_pixel_negation_error = 0.0
+                if available:
+                    joint_valid = (
+                        pair_pixels["motion_valid_1_to_0"][..., 0] > 0.5
+                    ) & (pair_pixels["motion_valid_0_to_1"][..., 0] > 0.5)
+                    joint_valid_count = int(np.count_nonzero(joint_valid))
+                    if joint_valid_count:
+                        residual = (
+                            pair_pixels["motion_1_to_0"][..., :2]
+                            + pair_pixels["motion_0_to_1"][..., :2]
+                        )[joint_valid]
+                        max_same_pixel_negation_error = float(np.max(np.abs(residual)))
+                add_check(
+                    checks,
+                    f"{prefix}.bidirectional_motion_not_fabricated_by_pixelwise_negation",
+                    available
+                    and joint_valid_count > 0
+                    and max_same_pixel_negation_error > 1e-3,
+                    f"available={available} jointValid={joint_valid_count} "
+                    f"maxAbs(motion0To1+motion1To0)={max_same_pixel_negation_error}",
+                )
+
     passed = all(check["passed"] for check in checks)
     report = {
-        "validatorVersion": 1,
+        "validatorVersion": 2,
         "dataset": str(dataset),
         "contractVersion": manifest.get("contractVersion"),
         "certificationStatus": manifest.get("certificationStatus"),
@@ -520,7 +661,8 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         "statistics": statistics,
         "missingRequirements": sorted(declared_gaps),
         "note": (
-            "A passing integrity gate proves that the isolated endpoint/intermediate replay was "
+            "A passing integrity gate proves that the isolated forward-endpoint, reverse-endpoint, "
+            "and intermediate replays were "
             "assembled without path, hash, shape, numeric, timing, matrix, or declared-provenance "
             "violations. It does not certify nr-fg-data-v1 while the manifest lists missing requirements."
         ),
