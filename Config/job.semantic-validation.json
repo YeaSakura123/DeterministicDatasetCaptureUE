@@ -35,6 +35,8 @@
   "bDisableMotionBlur": true,
   "bLockExposure": true,
   "bForceSynchronousRendering": true,
+  "bBlockOnStreamingBeforeCapture": true,
+  "streamingWaitSeconds": 60.0,
   "bEnableSemanticValidationFixture": true,
   "bAutoQuit": true
 }

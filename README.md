@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.2.0-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.2.1-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,7 +11,7 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.2.0 deliberately separates implemented output from certified training contracts:
+Version 0.2.1 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
@@ -71,6 +71,8 @@ Pixels without object Velocity are completed from depth and the unjittered curre
 - Separate logical-frame and render-submission IDs; reference renders do not advance simulation.
 - Persistent, isolated SceneCapture view state for native/reference HR and the real player Main View history for temporal inputs.
 - Atomic file/manifest writes, hashes, map guard, CVar provenance and unattended auto-exit.
+- A pre-capture streaming barrier that fails on timeout, plus per-frame resident-texture counts and a sorted streaming-state SHA-1.
+- Actual GPU View Uniform Mip bias for Main View, native HR, reference HR and HUD-less color; the validator independently reproduces UE's quantized automatic-bias formula.
 
 “Absolute control” is an explicit protocol, not a claim that arbitrary live input becomes deterministic automatically. Network traffic, audio-driven state, nondeterministic third-party data interfaces, custom async work, skeletal endpoint bone motion and WPO endpoint motion require an adapter, cache or additional validation before certification.
 
@@ -102,6 +104,7 @@ The descriptor and C++ module remain named `SuperResolutionDataset`, so upgrades
 - 60 Hz fixed simulation, 64 warmup frames;
 - locked exposure, disabled motion blur/dynamic resolution and synchronous rendering profile;
 - all current temporal, semantic and HUD-less outputs enabled.
+- a 120-second streaming barrier so a production frame cannot silently use incomplete texture residency.
 
 Change at least `expectedMap`, `jobName`, `outputDirectory`, frame range and optionally `sequence` before running it. It is a production-resolution template, not proof that the still-disabled temporal contract is certified.
 
@@ -155,7 +158,7 @@ python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
   --compare '.\Saved\SRDataset\run_a'
 ```
 
-The v3 validator requires exact provenance and temporal/native-HR/reference-HR/HUD-less/semantic metadata. Geometry, depth, motion, masks and IDs must be numerically exact; color permits a narrow documented floating-point tolerance and writes heatmaps when hashes differ.
+The v3 validator requires exact provenance and temporal/native-HR/reference-HR/HUD-less/semantic/streaming metadata. It also verifies the effective material texture Mip bias against the recorded render fraction and CVar profile. Geometry, depth, motion, masks and IDs must be numerically exact; color permits a narrow documented floating-point tolerance and writes heatmaps when hashes differ.
 
 ## Semantic validation fixture
 
@@ -224,13 +227,15 @@ Actors spawned during capture are discovered and prepared before their first eva
 
 ## Verified release evidence
 
-Version 0.2.0 was compiled as a UE 5.7 Development Editor plugin and exercised on Windows/D3D12 with an AMD Radeon RX 7900 XTX. The checked fixture produced:
+Version 0.2.1 was compiled as a UE 5.7 Development Editor plugin and exercised on Windows/D3D12 with an AMD Radeon RX 7900 XTX. The checked fixture produced:
 
 - Unreal automation: 1/1 job-validation test passed with zero warnings/errors;
-- standard semantic deterministic replay: 458/458 required checks;
-- FG endpoint deterministic replay: 462/462 required checks;
-- isolated FG intermediate replay: 240/240 required checks;
-- assembled FG integrity: 89/89 checks, intentionally uncertified.
+- standard semantic deterministic replay with streaming/Mip provenance: 494/494 required checks;
+- FG endpoint replay: 367/367 required checks;
+- isolated FG intermediate replay: 192/192 required checks;
+- assembled FG integrity: 90/90 checks, intentionally uncertified.
+
+The validation Main View used a 50% render fraction. Its GPU View Uniform reported a material texture Mip bias of `-1.296875`, exactly matching the independent formula and recorded CVar profile; both full-resolution isolated HR views reported `0`. The streaming barrier ended with 0 requests and 0 pending textures, and its 81-texture residency hash was stable across both semantic replay processes.
 
 Five color files were not byte-identical in the standard replay, but remained inside the numeric gate (HUD-less PSNR at least 61.6 dB in that run). Depth, motion, validity, masks and IDs were exact. Cross-GPU or cross-driver bit identity is not promised.
 

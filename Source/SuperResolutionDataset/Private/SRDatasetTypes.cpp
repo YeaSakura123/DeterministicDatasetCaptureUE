@@ -39,6 +39,12 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("WarmupFrames cannot be negative.");
 		return false;
 	}
+	if (bBlockOnStreamingBeforeCapture &&
+		(!FMath::IsFinite(StreamingWaitSeconds) || StreamingWaitSeconds <= 0.0f || StreamingWaitSeconds > 3600.0f))
+	{
+		OutError = TEXT("StreamingWaitSeconds must be finite and in (0, 3600] when the streaming barrier is enabled.");
+		return false;
+	}
 	if (HRResolution.X <= 0 || HRResolution.Y <= 0 || LRResolution.X <= 0 || LRResolution.Y <= 0)
 	{
 		OutError = TEXT("HR and LR resolutions must be positive.");

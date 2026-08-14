@@ -24,6 +24,12 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("LR larger than HR is rejected"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
+	Job.StreamingWaitSeconds = 0.0f;
+	TestFalse(TEXT("Enabled streaming barrier rejects a zero timeout"), Job.Validate(Error));
+	Job.bBlockOnStreamingBeforeCapture = false;
+	TestTrue(TEXT("Disabled streaming barrier ignores its timeout"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
 	Job.ContractVersion = TEXT("nr-sr-data-v2");
 	TestFalse(TEXT("Unimplemented temporal contract is rejected instead of emitting incomplete data"), Job.Validate(Error));
 	TestTrue(TEXT("Temporal rejection explains the certification boundary"), Error.Contains(TEXT("not certified")));

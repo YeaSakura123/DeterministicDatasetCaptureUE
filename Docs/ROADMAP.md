@@ -25,7 +25,7 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] After-tonemap, pre-Slate/UI display-resolution Main View color.
 - [x] Logical-frame/render-submission IDs and per-frame engine/GPU/CVar/content/shader provenance.
 - [ ] Complete pixel-domain Main View/native/reference comparison and capture-order invariance.
-- [ ] Record effective Mip bias, fixed LOD/scalability state and a streaming-state hash.
+- [x] Record the GPU View Uniform Mip bias, fixed LOD/scalability CVar profile, streaming barrier and resident-texture state hash.
 - [ ] Export production disocclusion, instance ID, normals, albedo and material/semantic IDs.
 - [ ] Add Movie Render Graph for temporal/spatial samples, path tracing and tiled ultra-high-resolution output.
 - [ ] Add configurable camera calibration export and pluggable degradation chains.
@@ -63,3 +63,12 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - FG endpoint replay: 462/462 required checks.
 - Isolated midpoint replay: 240/240 required checks.
 - Assembled FG pair: 89/89 integrity checks, intentionally not certified.
+
+## Version 0.2.1 streaming/Mip validation snapshot
+
+- UE 5.7 Development Editor build and job-validation automation: passed.
+- Two-process semantic replay: 494/494 required checks.
+- Streaming barrier: 0 requests after wait; 81 loaded textures; 0 pending textures in the validation scene.
+- Main View at 50% render fraction: GPU View Uniform bias `-1.296875`, matching the independent formula using offset `-0.3` and quantization `1024`.
+- Native/reference full-resolution SceneCapture views: GPU View Uniform bias `0`.
+- FG endpoint/intermediate replays: 367/367 and 192/192 required checks; assembled pair: 90/90 integrity checks, still intentionally uncertified.
