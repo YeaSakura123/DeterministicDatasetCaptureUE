@@ -303,6 +303,12 @@ def assemble(endpoint_dir: Path, intermediate_dir: Path, output_dir: Path) -> No
                     "tau": frame_tau["streamingStateSha1"],
                     "t1": frame1["streamingStateSha1"],
                 },
+                "sceneStateSha1": {
+                    "t0": frame0["sceneStateSha1"],
+                    "tau": frame_tau["sceneStateSha1"],
+                    "t1": frame1["sceneStateSha1"],
+                },
+                "sceneStateHashScope": frame1["sceneStateHashScope"],
                 "reset": {
                     "t0": bool(frame0.get("reset", False)),
                     "tau": bool(frame_tau.get("reset", False)),

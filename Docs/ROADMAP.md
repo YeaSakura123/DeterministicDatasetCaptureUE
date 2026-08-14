@@ -39,6 +39,7 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Separate FG endpoint and real midpoint processes so `Sτ` cannot replace endpoint history.
 - [x] Full-interval `motion_1_to_0` for rigid scene components with explicit scope metadata.
 - [x] Atomic FG assembler plus an independent self-contained integrity validator.
+- [x] Per-frame sorted scene-state hash covering Actor/components, skeletal bones, Niagara controls and controllable/ticking-actor audit lists.
 - [ ] Capture `motion_0_to_1` independently; never infer it by negation.
 - [ ] Capture UI Color/Alpha independently and validate zero UI residue in HUD-less color.
 - [ ] Validate endpoint motion for skeletal bones, WPO, animated materials, Niagara and translucency.
@@ -81,3 +82,10 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - Known reveal geometry: 174/174 revealed pixels rejected with valid evidence; 734 stable background pixels retained.
 - FG endpoint/intermediate replays: 403/403 and 209/209 required checks.
 - Assembled FG pair: 102/102 integrity checks, still intentionally uncertified.
+
+## Version 0.3.1 scene-state provenance snapshot
+
+- Two-process semantic replay: 569/569 required checks.
+- Captured scope: 81 actors, 99 components, two skeletal components and 178 component-space bones.
+- Scene hashes changed between logical frames and matched exactly across processes.
+- Seven ticking actors without `SRDatasetControllable` are listed by path/class for preflight audit.

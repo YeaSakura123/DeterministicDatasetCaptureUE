@@ -79,6 +79,18 @@ REPLAY_METADATA_FIELDS = (
     "streamingTextureCount",
     "pendingStreamingTextureCount",
     "streamingRequestsWanting",
+    "sceneStateSha1",
+    "sceneActorCount",
+    "sceneComponentCount",
+    "sceneSkeletalComponentCount",
+    "sceneBoneCount",
+    "sceneFXComponentCount",
+    "sceneNiagaraComponentCount",
+    "sceneControllableActorCount",
+    "sceneUncontrolledTickingActorCount",
+    "sceneControllableActors",
+    "sceneUncontrolledTickingActors",
+    "sceneStateHashScope",
     "renderSubmissions",
     "semanticValidationFixture",
     "camera",
@@ -968,6 +980,56 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
                 sort_keys=True,
             ),
         )
+        scene_state_hash = str(frame.get("sceneStateSha1", ""))
+        valid_scene_state_hash = len(scene_state_hash) == 40 and all(
+            character in "0123456789ABCDEFabcdef" for character in scene_state_hash
+        )
+        actor_count = int(frame.get("sceneActorCount", -1))
+        component_count = int(frame.get("sceneComponentCount", -1))
+        skeletal_count = int(frame.get("sceneSkeletalComponentCount", -1))
+        bone_count = int(frame.get("sceneBoneCount", -1))
+        fx_count = int(frame.get("sceneFXComponentCount", -1))
+        niagara_count = int(frame.get("sceneNiagaraComponentCount", -1))
+        controllable_count = int(frame.get("sceneControllableActorCount", -1))
+        uncontrolled_ticking_count = int(frame.get("sceneUncontrolledTickingActorCount", -1))
+        controllable_actors = frame.get("sceneControllableActors", [])
+        uncontrolled_ticking_actors = frame.get("sceneUncontrolledTickingActors", [])
+        add_check(
+            checks,
+            f"frame_{frame_id:06d}.scene_state_provenance",
+            valid_scene_state_hash
+            and actor_count > 0
+            and component_count > 0
+            and 0 <= skeletal_count <= component_count
+            and bone_count >= 0
+            and (skeletal_count > 0 or bone_count == 0)
+            and 0 <= niagara_count <= fx_count <= component_count
+            and 0 <= controllable_count <= actor_count
+            and 0 <= uncontrolled_ticking_count <= actor_count
+            and isinstance(controllable_actors, list)
+            and len(controllable_actors) == controllable_count
+            and len(set(controllable_actors)) == controllable_count
+            and isinstance(uncontrolled_ticking_actors, list)
+            and len(uncontrolled_ticking_actors) == uncontrolled_ticking_count
+            and len(set(uncontrolled_ticking_actors)) == uncontrolled_ticking_count
+            and frame.get("sceneStateHashScope")
+            == "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_state_cascade_component_state_not_particle_payload",
+            json.dumps(
+                {
+                    "sha1": scene_state_hash,
+                    "actors": actor_count,
+                    "components": component_count,
+                    "skeletalComponents": skeletal_count,
+                    "bones": bone_count,
+                    "fxComponents": fx_count,
+                    "niagaraComponents": niagara_count,
+                    "controllableActors": controllable_count,
+                    "uncontrolledTickingActors": uncontrolled_ticking_count,
+                    "uncontrolledTickingActorPaths": uncontrolled_ticking_actors,
+                },
+                sort_keys=True,
+            ),
+        )
         motion_span_frames = int(frame.get("motionTimeSpanFrames", -1))
         motion_span_seconds = float(frame.get("motionTimeSpanS", math.nan))
         expected_motion_seconds = (
@@ -1220,6 +1282,19 @@ def validate(dataset: Path, compare: Path | None) -> tuple[dict[str, Any], bool]
             )
 
     semantic_records.sort(key=lambda item: item[0])
+    if len(semantic_records) > 1:
+        semantic_frame_ids = {frame_id for frame_id, _, _ in semantic_records}
+        semantic_scene_hashes = {
+            str(frame.get("sceneStateSha1", ""))
+            for frame in frames
+            if int(frame.get("logicalFrameId", -1)) in semantic_frame_ids
+        }
+        add_check(
+            checks,
+            "semantic_fixture.scene_state_changes_across_frames",
+            len(semantic_scene_hashes) == len(semantic_records),
+            f"frames={len(semantic_records)} uniqueSceneStateHashes={len(semantic_scene_hashes)}",
+        )
     for index in range(1, len(semantic_records)):
         frame_id, fixture, current_pixels = semantic_records[index]
         _, previous_fixture, previous_pixels = semantic_records[index - 1]
