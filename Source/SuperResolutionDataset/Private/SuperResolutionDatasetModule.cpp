@@ -42,7 +42,19 @@ public:
 private:
 	static USRDatasetCaptureSubsystem* FindSubsystem(UWorld* World)
 	{
-		return World ? World->GetSubsystem<USRDatasetCaptureSubsystem>() : nullptr;
+		if (!World)
+		{
+			UE_LOG(LogSRDatasetModule, Error, TEXT("SRDataset requires an active PIE or Game world. Start Play before using console commands."));
+			return nullptr;
+		}
+
+		USRDatasetCaptureSubsystem* Subsystem = World->GetSubsystem<USRDatasetCaptureSubsystem>();
+		if (!Subsystem)
+		{
+			UE_LOG(LogSRDatasetModule, Error, TEXT("SRDataset is not available for world '%s' (type %d). Use a PIE or Game world."),
+				*World->GetName(), static_cast<int32>(World->WorldType));
+		}
+		return Subsystem;
 	}
 
 	void StartFromConsole(const TArray<FString>& Args, UWorld* World)

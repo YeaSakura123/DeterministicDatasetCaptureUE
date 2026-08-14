@@ -745,7 +745,9 @@ void USRDatasetCaptureSubsystem::FinishCapture(const ESRDatasetCaptureState Fina
 			*StaticEnum<ESRDatasetCaptureState>()->GetNameStringByValue(static_cast<int64>(FinalState)), *Error);
 	}
 
-	if (ActiveJob.bAutoQuit || bCommandLineAutoQuit)
+	// Never terminate an interactive editor session. Auto-quit is intended for
+	// unattended workers launched by RunDatasetCapture.ps1/UnrealEditor-Cmd.
+	if ((ActiveJob.bAutoQuit || bCommandLineAutoQuit) && FApp::IsUnattended())
 	{
 		const uint8 ExitCode = FinalState == ESRDatasetCaptureState::Completed ? 0 : 1;
 		FPlatformMisc::RequestExitWithStatus(false, ExitCode, TEXT("SRDataset job finished"));

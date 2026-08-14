@@ -100,6 +100,8 @@ SRDataset.Status
 SRDataset.Cancel
 ```
 
+`bAutoQuit` is honored only by unattended workers. A capture started from an interactive PIE console completes without closing the Unreal Editor.
+
 ## Blueprint API
 
 - `Start Dataset Capture`
