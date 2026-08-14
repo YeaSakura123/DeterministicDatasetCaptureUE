@@ -104,12 +104,28 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	Job.ReplayPass = ESRDatasetReplayPass::FrameGenerationEndpoints;
 	TestFalse(TEXT("Endpoint replay requires HUD-less display color"), Job.Validate(Error));
 	Job.bCaptureMainViewHUDlessColor = true;
+	Job.bLockTemporalJitterToLogicalFrame = true;
 	TestTrue(TEXT("Endpoint replay accepts render suppression and prior captured transforms"), Job.Validate(Error));
 	Job.EndFrame = 1;
 	TestFalse(TEXT("Endpoint job must end on a captured frame"), Job.Validate(Error));
 	Job.EndFrame = 2;
 	Job.CaptureFrameOffset = 2;
 	TestFalse(TEXT("Capture phase must be smaller than FrameStep"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
+	Job.ReplayPass = ESRDatasetReplayPass::FrameGenerationReverseEndpoints;
+	Job.LRMode = ESRDatasetLRMode::NativeRender;
+	Job.bCaptureTemporalDiagnostics = true;
+	Job.bCaptureMainViewTemporalDiagnostics = true;
+	Job.bCaptureMainViewHUDlessColor = true;
+	Job.FrameStep = 2;
+	Job.EndFrame = 2;
+	Job.bSuppressMainViewOnUncapturedFrames = true;
+	Job.bUseLastCapturedEndpointTransforms = true;
+	Job.bLockTemporalJitterToLogicalFrame = true;
+	TestTrue(TEXT("Reverse endpoint replay accepts the same isolated endpoint contract"), Job.Validate(Error));
+	Job.bUseLastCapturedEndpointTransforms = false;
+	TestFalse(TEXT("Reverse endpoint replay requires saved future endpoint transforms"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
 	Job.ReplayPass = ESRDatasetReplayPass::FrameGenerationIntermediate;
@@ -122,6 +138,7 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	Job.EndFrame = 1;
 	Job.CaptureFrameOffset = 1;
 	Job.bSuppressMainViewOnUncapturedFrames = true;
+	Job.bLockTemporalJitterToLogicalFrame = true;
 	TestTrue(TEXT("Intermediate replay accepts one isolated offset capture"), Job.Validate(Error));
 	Job.EndFrame = 3;
 	TestFalse(TEXT("Intermediate replay rejects multiple captures in one retained View State"), Job.Validate(Error));
@@ -132,6 +149,11 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	Job.CaptureFrameOffset = 1;
 	Job.bUseLastCapturedEndpointTransforms = true;
 	TestFalse(TEXT("Intermediate replay rejects endpoint previous-transform overrides"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
+	Job.bLockTemporalJitterToLogicalFrame = true;
+	Job.TemporalJitterSequenceLength = 9;
+	TestFalse(TEXT("Logical-frame jitter locking rejects an unsafe sequence modulus"), Job.Validate(Error));
 	return true;
 }
 

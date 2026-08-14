@@ -41,7 +41,7 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Full-interval `motion_1_to_0` for rigid scene components with explicit scope metadata.
 - [x] Atomic FG assembler plus an independent self-contained integrity validator.
 - [x] Per-frame sorted scene-state hash covering Actor/components, skeletal bones, Niagara controls and controllable/ticking-actor audit lists.
-- [ ] Capture `motion_0_to_1` independently; never infer it by negation.
+- [x] Capture `motion_0_to_1` in an independent reverse-endpoint process; never infer it by negation.
 - [ ] Capture UI Color/Alpha independently and validate zero UI residue in HUD-less color.
 - [ ] Validate endpoint motion for skeletal bones, WPO, animated materials, Niagara and translucency.
 - [ ] Certify disocclusion/visibility for unlabeled moving, skeletal, WPO and animated-material geometry and capture both endpoint directions.
@@ -101,3 +101,13 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - All 30 non-color modality/frame pairs were byte-exact; worst HUD-less color was 59.1 dB PSNR.
 - FG endpoint/intermediate regressions passed 410/410 and 213/213 checks; the assembled pair passed 103/103 integrity checks and remains intentionally uncertified.
 - This closes the deterministic semantic-fixture gate, not yet the required non-fixture production-scene coverage gate.
+
+## Version 0.4.0 independent bidirectional-motion snapshot
+
+- Capture-order regression passed 408/408 standalone and 578/578 paired checks after the jitter-lock provenance fields were added.
+- Forward endpoint, reverse endpoint and isolated midpoint processes passed 415/415, 415/415 and 216/216 required checks.
+- FG jobs lock temporal jitter phase to logical frame IDs; matching endpoint depth, Object ID, motion-validity and actual jitter grids were exact across traversal directions.
+- Reverse frame 0 motion measured approximately `(+71.116, +0.001)` display pixels against the fixture's analytic `(+71.111, 0)` expectation.
+- The assembler copies independently captured `motion_1_to_0`, `motion_0_to_1` and direction-specific history-rejection/validity buffers; the self-contained pair passed 127/127 integrity checks.
+- Full scene-state hashes did not match between forward and reverse fixture traversal because hidden ticking actors remain uncontrolled. The exception is fixture-only; production assembly still rejects it.
+- UI RGBA, skeletal/WPO/animated-material endpoint validation and production-certified bidirectional visibility remain open, so FG certification remains false.

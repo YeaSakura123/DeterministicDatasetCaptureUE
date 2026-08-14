@@ -36,6 +36,7 @@ enum class ESRDatasetReplayPass : uint8
 {
 	Standard,
 	FrameGenerationEndpoints,
+	FrameGenerationReverseEndpoints,
 	FrameGenerationIntermediate
 };
 
@@ -194,6 +195,22 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
 	bool bForceSynchronousRendering = true;
 
+	/**
+	 * Bind the non-shipping Temporal AA/TSR jitter phase to logical frame ID.
+	 * Required by FG replay so forward, reverse and intermediate processes sample
+	 * the same logical frame on the same raster grid.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
+	bool bLockTemporalJitterToLogicalFrame = false;
+
+	/** Validation phase modulus. Eight is valid for UE TSR's base sequence. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism", meta = (ClampMin = "1", ClampMax = "8", EditCondition = "bLockTemporalJitterToLogicalFrame"))
+	int32 TemporalJitterSequenceLength = 8;
+
+	/** Per-clip phase offset, normalized modulo TemporalJitterSequenceLength. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism", meta = (EditCondition = "bLockTemporalJitterToLogicalFrame"))
+	int32 TemporalJitterPhaseOffset = 0;
+
 	/** Block once after render warmup until currently requested engine streaming resources settle. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
 	bool bBlockOnStreamingBeforeCapture = true;
@@ -211,8 +228,9 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 
 	/**
 	 * Override component previous transforms with the last captured endpoint.
-	 * This covers rigid/component motion; skeletal bone/WPO endpoint motion is
-	 * still uncertified and must not be inferred from this option alone.
+	 * Forward endpoints use t0 as the prior transform at t1; reverse endpoints
+	 * use t1 as the prior transform at t0. This covers rigid/component motion;
+	 * skeletal bone/WPO endpoint motion is still uncertified.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bSuppressMainViewOnUncapturedFrames"))
 	bool bUseLastCapturedEndpointTransforms = false;

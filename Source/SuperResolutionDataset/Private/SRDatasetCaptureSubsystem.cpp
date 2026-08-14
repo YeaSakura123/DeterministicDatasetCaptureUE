@@ -184,7 +184,7 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 
 	ActiveJob = Job;
 	Status = FSRDatasetCaptureStatus();
-	Status.CurrentFrame = Job.StartFrame;
+	Status.CurrentFrame = GetInitialEvaluationFrame();
 	ResolvedOutputDirectory = ResolveOutputDirectory(Job.OutputDirectory);
 	Status.OutputDirectory = ResolvedOutputDirectory;
 	ManifestFrames.Reset();
@@ -301,17 +301,66 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 	}
 
 	ApplyDeterministicRuntimeState();
+	if (ActiveJob.bLockTemporalJitterToLogicalFrame && !bOverrodeTemporalJitterIndex)
+	{
+		OutError = TEXT("Logical-frame jitter locking requires r.TemporalAA.Debug.OverrideTemporalIndex in a non-shipping capture build.");
+		return false;
+	}
 	SnapshotProvenance();
 	NotifyControllablesPrepare();
 	WarmupFramesRemaining = ActiveJob.WarmupFrames;
 	Status.State = WarmupFramesRemaining > 0 ? ESRDatasetCaptureState::WarmingUp : ESRDatasetCaptureState::Capturing;
-	Status.CurrentFrame = ActiveJob.StartFrame;
+	Status.CurrentFrame = GetInitialEvaluationFrame();
 
 	if (!WriteManifest(OutError))
 	{
 		return false;
 	}
 	return true;
+}
+
+bool USRDatasetCaptureSubsystem::IsReverseEndpointReplay() const
+{
+	return ActiveJob.ReplayPass == ESRDatasetReplayPass::FrameGenerationReverseEndpoints;
+}
+
+int32 USRDatasetCaptureSubsystem::GetEvaluationDirection() const
+{
+	return IsReverseEndpointReplay() ? -1 : 1;
+}
+
+int32 USRDatasetCaptureSubsystem::GetInitialEvaluationFrame() const
+{
+	return IsReverseEndpointReplay() ? ActiveJob.EndFrame : ActiveJob.StartFrame;
+}
+
+int32 USRDatasetCaptureSubsystem::GetFirstCapturedFrame() const
+{
+	if (!IsReverseEndpointReplay())
+	{
+		return ActiveJob.StartFrame + ActiveJob.CaptureFrameOffset;
+	}
+	const int32 FirstPhaseFrame = ActiveJob.StartFrame + ActiveJob.CaptureFrameOffset;
+	return ActiveJob.EndFrame - (ActiveJob.EndFrame - FirstPhaseFrame) % ActiveJob.FrameStep;
+}
+
+int32 USRDatasetCaptureSubsystem::GetPreviouslyCapturedFrame(const int32 FrameNumber) const
+{
+	return FrameNumber - GetEvaluationDirection() * ActiveJob.FrameStep;
+}
+
+int32 USRDatasetCaptureSubsystem::GetTemporalJitterOverrideIndex(const int32 FrameNumber) const
+{
+	const int32 SequenceLength = FMath::Max(1, ActiveJob.TemporalJitterSequenceLength);
+	const int32 Unnormalized = FrameNumber + ActiveJob.TemporalJitterPhaseOffset;
+	return ((Unnormalized % SequenceLength) + SequenceLength) % SequenceLength;
+}
+
+bool USRDatasetCaptureSubsystem::IsPastEvaluationRange(const int32 FrameNumber) const
+{
+	return IsReverseEndpointReplay()
+		? FrameNumber < ActiveJob.StartFrame
+		: FrameNumber > ActiveJob.EndFrame;
 }
 
 bool USRDatasetCaptureSubsystem::ShouldCaptureFrame(const int32 FrameNumber) const
@@ -437,6 +486,18 @@ void USRDatasetCaptureSubsystem::ApplyDeterministicRuntimeState()
 			bOverrodeMotionVectorSimulation = true;
 		}
 	}
+	if (ActiveJob.bLockTemporalJitterToLogicalFrame)
+	{
+		if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(
+			TEXT("r.TemporalAA.Debug.OverrideTemporalIndex")))
+		{
+			PreviousTemporalJitterOverrideIndex = Variable->GetInt();
+			// SnapshotProvenance sees the same neutral value in every replay;
+			// HandleWorldPreActorTick applies the logical-frame phase dynamically.
+			Variable->Set(0, ECVF_SetByCode);
+			bOverrodeTemporalJitterIndex = true;
+		}
+	}
 	if (ActiveJob.bSuppressMainViewOnUncapturedFrames)
 	{
 		bPreviousWorldRenderingEnabled = UGameplayStatics::GetEnableWorldRendering(this);
@@ -514,6 +575,16 @@ void USRDatasetCaptureSubsystem::RestoreDeterministicRuntimeState()
 	}
 	PreviousMotionVectorSimulation = -1;
 	bOverrodeMotionVectorSimulation = false;
+	if (bOverrodeTemporalJitterIndex)
+	{
+		if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(
+			TEXT("r.TemporalAA.Debug.OverrideTemporalIndex")))
+		{
+			Variable->Set(PreviousTemporalJitterOverrideIndex, ECVF_SetByCode);
+		}
+	}
+	PreviousTemporalJitterOverrideIndex = -1;
+	bOverrodeTemporalJitterIndex = false;
 	if (bOverrodeWorldRendering)
 	{
 		UGameplayStatics::SetEnableWorldRendering(this, bPreviousWorldRenderingEnabled);
@@ -544,6 +615,19 @@ void USRDatasetCaptureSubsystem::RestoreDeterministicRuntimeState()
 	}
 	bOverrodeScreenPercentage = false;
 	bOverrodeDynamicResolution = false;
+}
+
+void USRDatasetCaptureSubsystem::ApplyLogicalTemporalJitter(const int32 FrameNumber)
+{
+	if (!ActiveJob.bLockTemporalJitterToLogicalFrame)
+	{
+		return;
+	}
+	if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(
+		TEXT("r.TemporalAA.Debug.OverrideTemporalIndex")))
+	{
+		Variable->Set(GetTemporalJitterOverrideIndex(FrameNumber), ECVF_SetByCode);
+	}
 }
 
 void USRDatasetCaptureSubsystem::SnapshotProvenance()
@@ -600,6 +684,7 @@ void USRDatasetCaptureSubsystem::SnapshotProvenance()
 		TEXT("r.Streaming.UseAllMips"),
 		TEXT("r.Streaming.UseFixedPoolSize"),
 		TEXT("r.TemporalAA.Upsampling"),
+		TEXT("r.TemporalAA.Debug.OverrideTemporalIndex"),
 		TEXT("r.ViewTextureMipBias.Min"),
 		TEXT("r.ViewTextureMipBias.Offset"),
 		TEXT("r.ViewTextureMipBias.Quantization"),
@@ -883,7 +968,7 @@ void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTi
 			FinishCapture(ESRDatasetCaptureState::Failed, Error);
 			return;
 		}
-		if (Status.CurrentFrame > ActiveJob.EndFrame)
+		if (IsPastEvaluationRange(Status.CurrentFrame))
 		{
 			FinishCapture(ESRDatasetCaptureState::Completed);
 			return;
@@ -896,8 +981,9 @@ void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTi
 	}
 
 	const int32 EvaluationFrame = Status.State == ESRDatasetCaptureState::WarmingUp
-		? ActiveJob.StartFrame
+		? GetInitialEvaluationFrame()
 		: Status.CurrentFrame;
+	ApplyLogicalTemporalJitter(EvaluationFrame);
 	FString Error;
 	if (!EvaluateSequence(EvaluationFrame, Error))
 	{
@@ -930,7 +1016,7 @@ void USRDatasetCaptureSubsystem::HandleWorldPostActorTick(UWorld* World, ELevelT
 		if (WarmupFramesRemaining <= 0)
 		{
 			Status.State = ESRDatasetCaptureState::Capturing;
-			Status.CurrentFrame = ActiveJob.StartFrame;
+			Status.CurrentFrame = GetInitialEvaluationFrame();
 		}
 		return;
 	}
@@ -955,8 +1041,8 @@ void USRDatasetCaptureSubsystem::HandleWorldPostActorTick(UWorld* World, ELevelT
 		}
 	}
 
-	++Status.CurrentFrame;
-	if (Status.CurrentFrame > ActiveJob.EndFrame && !bMainViewCapturePending)
+	Status.CurrentFrame += GetEvaluationDirection();
+	if (IsPastEvaluationRange(Status.CurrentFrame) && !bMainViewCapturePending)
 	{
 		FinishCapture(ESRDatasetCaptureState::Completed);
 	}
@@ -970,8 +1056,10 @@ bool USRDatasetCaptureSubsystem::EvaluateSequence(const int32 FrameNumber, FStri
 	}
 
 	const float TimeSeconds = static_cast<float>(FrameNumber * ActiveJob.GetFixedDeltaSeconds());
-	FMovieSceneSequencePlaybackParams Params(TimeSeconds, EUpdatePositionMethod::Play);
-	Params.bHasJumped = false;
+	FMovieSceneSequencePlaybackParams Params(
+		TimeSeconds,
+		IsReverseEndpointReplay() ? EUpdatePositionMethod::Jump : EUpdatePositionMethod::Play);
+	Params.bHasJumped = IsReverseEndpointReplay();
 	SequencePlayer->SetPlaybackPosition(Params);
 	return true;
 }
@@ -1029,6 +1117,12 @@ void USRDatasetCaptureSubsystem::DiscoverAndControlNiagara(const float TimeSecon
 			Component->SetLockDesiredAgeDeltaTimeToSeekDelta(true);
 			Component->SetMaxSimTime(60.0f);
 			Component->ResetSystem();
+			Component->SeekToDesiredAge(TimeSeconds);
+		}
+		else if (IsReverseEndpointReplay())
+		{
+			// DesiredAge must explicitly seek when logical time decreases; merely
+			// assigning a smaller age can leave a GPU/system simulation at t1.
 			Component->SeekToDesiredAge(TimeSeconds);
 		}
 		else
@@ -1185,12 +1279,12 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 	}
 
 	const int32 FrameNumber = Status.CurrentFrame;
-	const int32 FirstCapturedFrame = ActiveJob.StartFrame + ActiveJob.CaptureFrameOffset;
+	const int32 FirstCapturedFrame = GetFirstCapturedFrame();
 	const bool bHistoryReset = FrameNumber == FirstCapturedFrame;
 	const int32 MotionPreviousLogicalFrameId =
 		ActiveJob.ReplayPass == ESRDatasetReplayPass::FrameGenerationIntermediate
 			? FrameNumber - 1
-			: (bHistoryReset ? FrameNumber : FrameNumber - ActiveJob.FrameStep);
+			: (bHistoryReset ? FrameNumber : GetPreviouslyCapturedFrame(FrameNumber));
 	ApplyLastCapturedEndpointTransforms();
 	const double TimeSeconds = FrameNumber * ActiveJob.GetFixedDeltaSeconds();
 	TMap<FString, FString> Hashes;
@@ -1373,14 +1467,14 @@ bool USRDatasetCaptureSubsystem::FinalizePendingMainViewCapture(FString& OutErro
 	}
 
 	FSRDatasetTemporalCaptureResult TemporalResult;
-	const int32 FirstCapturedFrame = ActiveJob.StartFrame + ActiveJob.CaptureFrameOffset;
+	const int32 FirstCapturedFrame = GetFirstCapturedFrame();
 	const bool bHistoryReset = PendingMainViewFrameNumber == FirstCapturedFrame;
 	const int32 MotionPreviousLogicalFrameId =
 		ActiveJob.ReplayPass == ESRDatasetReplayPass::FrameGenerationIntermediate
 			? PendingMainViewFrameNumber - 1
 			: (bHistoryReset
 				? PendingMainViewFrameNumber
-				: PendingMainViewFrameNumber - ActiveJob.FrameStep);
+				: GetPreviouslyCapturedFrame(PendingMainViewFrameNumber));
 	if (!ViewExtension->WaitAndTakeCapture(TemporalResult, OutError) ||
 		!CaptureRig->SaveTemporalCaptureResult(
 			TemporalResult,
@@ -1482,14 +1576,16 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	const bool bResumed)
 {
 	TSharedRef<FJsonObject> Frame = MakeShared<FJsonObject>();
-	const int32 FirstCapturedFrame = ActiveJob.StartFrame + ActiveJob.CaptureFrameOffset;
+	const int32 FirstCapturedFrame = GetFirstCapturedFrame();
 	const bool bFirstCapturedFrame = FrameNumber == FirstCapturedFrame;
-	const int32 PreviousCapturedFrame = bFirstCapturedFrame ? FrameNumber : FrameNumber - ActiveJob.FrameStep;
+	const int32 PreviousCapturedFrame = bFirstCapturedFrame
+		? FrameNumber
+		: GetPreviouslyCapturedFrame(FrameNumber);
 	const bool bIntermediateReplay = ActiveJob.ReplayPass == ESRDatasetReplayPass::FrameGenerationIntermediate;
 	const int32 MotionPreviousFrame = bIntermediateReplay ? FrameNumber - 1 : PreviousCapturedFrame;
 	const int32 MotionTimeSpanFrames = bFirstCapturedFrame && !bIntermediateReplay
 		? 0
-		: FrameNumber - MotionPreviousFrame;
+		: FMath::Abs(FrameNumber - MotionPreviousFrame);
 	Frame->SetNumberField(TEXT("frame"), FrameNumber);
 	Frame->SetStringField(
 		TEXT("replayPass"),
@@ -1512,6 +1608,9 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	Frame->SetNumberField(TEXT("deltaTimeS"), ActiveJob.GetFixedDeltaSeconds());
 	Frame->SetBoolField(TEXT("simulationAdvance"), true);
 	Frame->SetBoolField(TEXT("historyAdvance"), true);
+	Frame->SetStringField(
+		TEXT("logicalEvaluationDirection"),
+		IsReverseEndpointReplay() ? TEXT("decreasing_frame_id") : TEXT("increasing_frame_id"));
 	Frame->SetBoolField(TEXT("reset"), bFirstCapturedFrame);
 	Frame->SetStringField(TEXT("resetReason"), bFirstCapturedFrame ? TEXT("job_start") : TEXT("none"));
 	Frame->SetNumberField(TEXT("timeSeconds"), TimeSeconds);
@@ -1742,7 +1841,25 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				PreviousRenderPixels.X * ActiveJob.HRResolution.X / ActiveJob.LRResolution.X,
 				PreviousRenderPixels.Y * ActiveJob.HRResolution.Y / ActiveJob.LRResolution.Y)));
 			Temporal->SetStringField(TEXT("jitterSequence"), TEXT("engine_temporal_upscaler_owned"));
-			Temporal->SetNumberField(TEXT("jitterIndex"), Metadata.StateFrameIndex);
+			Temporal->SetNumberField(
+				TEXT("jitterIndex"),
+				ActiveJob.bLockTemporalJitterToLogicalFrame
+					? GetTemporalJitterOverrideIndex(FrameNumber)
+					: Metadata.StateFrameIndex);
+			Temporal->SetStringField(
+				TEXT("jitterIndexSource"),
+				ActiveJob.bLockTemporalJitterToLogicalFrame
+					? TEXT("logical_frame_debug_override")
+					: TEXT("engine_view_state_frame_index_proxy"));
+			Temporal->SetBoolField(
+				TEXT("jitterLogicalFrameLocked"),
+				ActiveJob.bLockTemporalJitterToLogicalFrame);
+			Temporal->SetNumberField(
+				TEXT("jitterSequenceLength"),
+				ActiveJob.TemporalJitterSequenceLength);
+			Temporal->SetNumberField(
+				TEXT("jitterPhaseOffset"),
+				ActiveJob.TemporalJitterPhaseOffset);
 			Temporal->SetStringField(TEXT("matrixLayout"), TEXT("row_major_flat_16"));
 			Temporal->SetStringField(TEXT("matrixVectorConvention"), TEXT("row_vector_mul_matrix"));
 			Temporal->SetStringField(TEXT("coordinateSystem"), TEXT("Unreal_left_handed_reversed_z"));
@@ -1918,7 +2035,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.3.2"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.4.0"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -2015,6 +2132,11 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Contract->SetStringField(
 		TEXT("captureOrderInvarianceProtocol"),
 		TEXT("separate_process_high_resolution_first_vs_low_resolution_first_normalized_provenance_and_numeric_comparison"));
+	Contract->SetStringField(
+		TEXT("temporalJitterPhasePolicy"),
+		ActiveJob.bLockTemporalJitterToLogicalFrame
+			? TEXT("logical_frame_plus_phase_offset_mod_sequence_length_non_shipping_debug_override")
+			: TEXT("engine_view_state_submission_order"));
 	Contract->SetBoolField(TEXT("uncapturedMainViewSuppressed"), ActiveJob.bSuppressMainViewOnUncapturedFrames);
 	Contract->SetStringField(
 		TEXT("endpointPreviousTransformScope"),

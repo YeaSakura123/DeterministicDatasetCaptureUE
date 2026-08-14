@@ -78,10 +78,18 @@ private:
 	bool PrepareJob(FString& OutError);
 	bool PrepareSemanticValidationFixture(FString& OutError);
 	void RestoreSemanticValidationFixture();
+	bool IsReverseEndpointReplay() const;
+	int32 GetEvaluationDirection() const;
+	int32 GetInitialEvaluationFrame() const;
+	int32 GetFirstCapturedFrame() const;
+	int32 GetPreviouslyCapturedFrame(int32 FrameNumber) const;
+	int32 GetTemporalJitterOverrideIndex(int32 FrameNumber) const;
+	bool IsPastEvaluationRange(int32 FrameNumber) const;
 	bool ShouldCaptureFrame(int32 FrameNumber) const;
 	void ApplyLastCapturedEndpointTransforms();
 	void SnapshotCapturedEndpointTransforms();
 	void ApplyDeterministicRuntimeState();
+	void ApplyLogicalTemporalJitter(int32 FrameNumber);
 	void RestoreDeterministicRuntimeState();
 	void SnapshotProvenance();
 	bool EnsureStreamingReady(FString& OutError);
@@ -117,6 +125,7 @@ private:
 	int32 PreviousEyeAdaptationQuality = -1;
 	int32 PreviousCustomDepthMode = -1;
 	int32 PreviousMotionVectorSimulation = -1;
+	int32 PreviousTemporalJitterOverrideIndex = -1;
 	float PreviousScreenPercentage = 100.0f;
 	int32 PreviousDynamicResolutionOperationMode = 0;
 	bool bOverrodeScreenPercentage = false;
@@ -124,6 +133,7 @@ private:
 	bool bOverrodeEyeAdaptation = false;
 	bool bOverrodeCustomDepth = false;
 	bool bOverrodeMotionVectorSimulation = false;
+	bool bOverrodeTemporalJitterIndex = false;
 	bool bPreviousWorldRenderingEnabled = true;
 	bool bOverrodeWorldRendering = false;
 	bool bMainViewCapturePending = false;

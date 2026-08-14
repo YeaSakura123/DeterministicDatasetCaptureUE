@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.3.2-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.4.0-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,13 +11,13 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.3.2 deliberately separates implemented output from certified training contracts:
+Version 0.4.0 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
 | `spatial-sr-data-v1` | Certified | Same-state HR/LR PNG and SceneCapture depth baseline. |
 | Main View temporal buffers | Experimental, validated fixture | Real AfterDOF HDR, motion, depth, jitter, matrices, masks and validity-gated history rejection are captured, but `nr-sr-data-v2` remains disabled until every production gate passes. |
-| FG endpoint/intermediate replay | Experimental, uncertified | Independent endpoint and real `tau=0.5` replay can be assembled. Reverse endpoint motion, UI RGBA, skeletal/WPO endpoint validation and production-certified bidirectional disocclusion are still missing. |
+| FG forward/reverse endpoint plus intermediate replay | Experimental, uncertified | `motion_1_to_0` and `motion_0_to_1` come from independent processes and assemble with a real `tau=0.5` frame. UI RGBA, skeletal/WPO endpoint validation and production-certified bidirectional disocclusion are still missing. |
 
 The plugin rejects `nr-sr-data-v2` and direct `nr-fg-data-v1` capture jobs. Missing fields are never filled with guesses. The experimental FG assembler emits `nr-fg-data-v1` only with `frameGenerationCertified=false` and an explicit `missingRequirements` list.
 
@@ -198,25 +198,30 @@ The validator checks motion direction/magnitude, reset motion, Velocity coverage
 
 ## Experimental frame-generation replay
 
-Frame generation uses separate processes so the real intermediate frame never becomes the endpoint's previous Main View state:
+Frame generation uses three separate processes so neither the real intermediate frame nor the opposite traversal can contaminate endpoint Main View history:
 
 ```text
-endpoint process:      t0 ------------ t1
-intermediate process:          t0.5
-assembler:             verified t0 / t0.5 / t1 pair
+forward endpoint:      t0 ------------> t1   captures motion_1_to_0 at t1
+reverse endpoint:      t0 <------------ t1   captures motion_0_to_1 at t0
+intermediate:                  t0.5           isolated real frame
+assembler:             verified t0 / t0.5 / t1 pair with both motions
 ```
 
-Run and validate the endpoint and one-intermediate jobs, then assemble them:
+Run each supplied job through `RunDatasetCapture.ps1` in a fresh Unreal process. Then validate all three sources and assemble them:
 
 ```powershell
 python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
   '.\Saved\SRDataset\fg_endpoint_validation'
 
 python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
+  '.\Saved\SRDataset\fg_reverse_endpoint_validation'
+
+python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
   '.\Saved\SRDataset\fg_intermediate_validation'
 
 python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\AssembleFrameGenerationDataset.py' `
   --endpoints '.\Saved\SRDataset\fg_endpoint_validation' `
+  --reverse-endpoints '.\Saved\SRDataset\fg_reverse_endpoint_validation' `
   --intermediate '.\Saved\SRDataset\fg_intermediate_validation' `
   --output '.\Saved\SRDataset\fg_pair_001'
 
@@ -224,7 +229,9 @@ python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateFrameGenerationD
   '.\Saved\SRDataset\fg_pair_001'
 ```
 
-The endpoint pass enables `r.MotionVectorSimulation=1` and supplies the last captured component transforms, so `motion_1_to_0` spans the complete endpoint interval. This scope is explicitly limited to rigid/component transforms. The intermediate role allows exactly one capture per process in v1, preventing an earlier intermediate from remaining in the retained View State.
+Both endpoint passes enable `r.MotionVectorSimulation=1`. The forward pass supplies the last captured component transforms, while the reverse pass starts at `t1` and supplies those future transforms when it captures `t0`; the two motion fields are never derived from each other. This scope is explicitly limited to rigid/component transforms. Reverse Sequencer evaluation currently jumps to absolute logical frames, so opaque event-driven state still requires an adapter or cache. The intermediate role allows exactly one capture per process in v1, preventing an earlier intermediate from remaining in the retained View State.
+
+FG jobs lock `r.TemporalAA.Debug.OverrideTemporalIndex` to a phase computed from the logical frame ID. This is a non-shipping diagnostic CVar; use a Development/Debug capture build. The assembler additionally requires the actual forward/reverse jitter, camera, exposure, depth, Object ID and validity raster grids to match at each endpoint before it accepts the pair.
 
 The assembler refuses unvalidated sources, mismatched engine/GPU/map/shader/CVar provenance, incorrect endpoint history, non-midpoint samples, missing files or hash mismatches. Its integrity validator prints `PASS (UNCERTIFIED)` until all declared FG requirements exist.
 
@@ -252,15 +259,16 @@ Actors spawned during capture are discovered and prepared before their first eva
 
 ## Verified release evidence
 
-Version 0.3.2 was compiled as a UE 5.7 Development Editor plugin and exercised on Windows/D3D12 with an AMD Radeon RX 7900 XTX. The checked fixture produced:
+Version 0.4.0 was compiled as a UE 5.7 Development Editor plugin and exercised on Windows/D3D12 with an AMD Radeon RX 7900 XTX. The checked fixture produced:
 
 - Unreal automation: 1/1 job-validation test passed with zero warnings/errors;
 - standard semantic deterministic replay with streaming/Mip/history/scene-state provenance: 569/569 required checks from v0.3.1;
-- capture-order standalone validation: 406/406 required checks;
-- paired capture-order invariance: 574/574 required checks;
-- FG endpoint replay regression: 410/410 required checks;
-- isolated FG intermediate replay regression: 213/213 required checks;
-- assembled FG integrity regression: 103/103 checks, intentionally uncertified.
+- capture-order standalone validation: 408/408 required checks;
+- paired capture-order invariance: 578/578 required checks;
+- FG forward endpoint replay: 415/415 required checks;
+- independent reverse endpoint replay: 415/415 required checks;
+- isolated FG intermediate replay: 216/216 required checks;
+- assembled bidirectional FG integrity: 127/127 checks, intentionally uncertified.
 
 The validation Main View used a 50% render fraction. Its GPU View Uniform reported a material texture Mip bias of `-1.296875`, exactly matching the independent formula and recorded CVar profile; both full-resolution isolated HR views reported `0`. The streaming barrier ended with 0 requests and 0 pending textures, and its 81-texture residency hash was stable across both semantic replay processes.
 
@@ -271,6 +279,8 @@ The fixture process recorded 81 actors, 99 components, two skeletal components a
 Five color files were not byte-identical in the standard replay, but remained inside the numeric gate (HUD-less PSNR at least 61.6 dB in that run). Depth, motion, validity, masks and IDs were exact. Cross-GPU or cross-driver bit identity is not promised.
 
 In the capture-order pair, all 30 non-color modality/frame pairs were byte-exact. The order-sensitive Lumen/color outputs remained within the numeric gate; the worst HUD-less comparison was 59.1 dB PSNR. This closes the fixture-level capture-order gate, while non-fixture scene coverage and Main View/reference pixel-domain equivalence remain open.
+
+For the bidirectional FG fixture, forward and reverse endpoint depth, Object ID, motion-validity and logical-frame jitter grids were byte-exact. At logical frame 0 the reverse pass measured approximately `(+71.116, +0.001)` display pixels against an analytic `(+71.111, 0)` expectation. The two independently captured motion fields were not pixelwise negations. Full scene-state hashes still differed between forward and reverse traversal because seven hidden ticking actors remain outside the control interface; the assembler allows that mismatch only for the explicit semantic fixture. It is a production blocker, not a relaxed production rule.
 
 See [`Docs/ARCHITECTURE.md`](Docs/ARCHITECTURE.md) for the full state/control contract and [`Docs/ROADMAP.md`](Docs/ROADMAP.md) for the remaining certification work.
 
