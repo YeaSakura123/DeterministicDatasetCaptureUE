@@ -59,6 +59,9 @@ namespace SRDataset::Private
 		TEXT("depth_device_raw"),
 		TEXT("depth_view_linear_meters"),
 		TEXT("depth_valid"),
+		TEXT("depth_previous_reprojected_device"),
+		TEXT("history_rejection_mask"),
+		TEXT("history_rejection_valid"),
 		TEXT("translucency_after_dof_raw"),
 		TEXT("transparency_mask"),
 		TEXT("reactive_mask"),
@@ -1040,6 +1043,12 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 	}
 
 	const int32 FrameNumber = Status.CurrentFrame;
+	const int32 FirstCapturedFrame = ActiveJob.StartFrame + ActiveJob.CaptureFrameOffset;
+	const bool bHistoryReset = FrameNumber == FirstCapturedFrame;
+	const int32 MotionPreviousLogicalFrameId =
+		ActiveJob.ReplayPass == ESRDatasetReplayPass::FrameGenerationIntermediate
+			? FrameNumber - 1
+			: (bHistoryReset ? FrameNumber : FrameNumber - ActiveJob.FrameStep);
 	ApplyLastCapturedEndpointTransforms();
 	const double TimeSeconds = FrameNumber * ActiveJob.GetFixedDeltaSeconds();
 	TMap<FString, FString> Hashes;
@@ -1091,6 +1100,9 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 		}
 		if (!CaptureRig->CaptureFrame(
 			ActiveJob,
+			FrameNumber,
+			MotionPreviousLogicalFrameId,
+			bHistoryReset,
 			MakeFramePath(TEXT("hr"), FrameNumber, TEXT("png")),
 			MakeFramePath(TEXT("lr"), FrameNumber, TEXT("png")),
 			MakeFramePath(TEXT("depth"), FrameNumber, TEXT("exr")),
@@ -1203,10 +1215,21 @@ bool USRDatasetCaptureSubsystem::FinalizePendingMainViewCapture(FString& OutErro
 	}
 
 	FSRDatasetTemporalCaptureResult TemporalResult;
+	const int32 FirstCapturedFrame = ActiveJob.StartFrame + ActiveJob.CaptureFrameOffset;
+	const bool bHistoryReset = PendingMainViewFrameNumber == FirstCapturedFrame;
+	const int32 MotionPreviousLogicalFrameId =
+		ActiveJob.ReplayPass == ESRDatasetReplayPass::FrameGenerationIntermediate
+			? PendingMainViewFrameNumber - 1
+			: (bHistoryReset
+				? PendingMainViewFrameNumber
+				: PendingMainViewFrameNumber - ActiveJob.FrameStep);
 	if (!ViewExtension->WaitAndTakeCapture(TemporalResult, OutError) ||
 		!CaptureRig->SaveTemporalCaptureResult(
 			TemporalResult,
 			MakeFramePath(TEXT("lr"), PendingMainViewFrameNumber, TEXT("png")),
+			PendingMainViewFrameNumber,
+			MotionPreviousLogicalFrameId,
+			bHistoryReset,
 			PendingMainViewHashes,
 			OutError))
 	{
@@ -1568,6 +1591,18 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 			Temporal->SetStringField(TEXT("motionOrigin"), TEXT("top_left"));
 			Temporal->SetStringField(TEXT("velocityRawUnit"), TEXT("UE_normalized_screen_current_minus_previous"));
 			Temporal->SetStringField(TEXT("motionSource"), TEXT("UE_velocity_where_covered_else_depth_camera_reconstruction"));
+			Temporal->SetStringField(
+				TEXT("historyRejectionDefinition"),
+				TEXT("one_rejects_previous_history_at_motion_reprojected_pixel"));
+			Temporal->SetStringField(
+				TEXT("historyRejectionSource"),
+				TEXT("custom_stencil_identity_else_static_camera_depth_reprojection_v1"));
+			Temporal->SetBoolField(TEXT("historyRejectionTrainingUsable"), true);
+			Temporal->SetBoolField(TEXT("historyRejectionRequiresValidityMask"), true);
+			Temporal->SetBoolField(TEXT("historyRejectionProductionCertified"), false);
+			Temporal->SetStringField(
+				TEXT("historyRejectionKnownLimit"),
+				TEXT("unlabeled_velocity_covered_geometry_is_invalid;custom_stencil_uint8_is_not_instance_unique_and_same_id_self_occlusion_is_unresolved"));
 			Temporal->SetNumberField(TEXT("motionPreviousLogicalFrameId"), MotionPreviousFrame);
 			Temporal->SetNumberField(TEXT("motionTimeSpanS"), MotionTimeSpanFrames * ActiveJob.GetFixedDeltaSeconds());
 			Temporal->SetBoolField(TEXT("motionTrainingUsable"), !bIntermediateReplay);
@@ -1692,7 +1727,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.2.1"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.3.0"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -1792,6 +1827,9 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	{
 		Contract->SetStringField(TEXT("motion"), TEXT("experimental_full_current_to_previous_display_pixels"));
 		Contract->SetStringField(TEXT("jitterAndMatrices"), TEXT("experimental_captured_from_view_uniforms"));
+		Contract->SetStringField(
+			TEXT("historyRejection"),
+			TEXT("experimental_custom_stencil_identity_else_static_depth_reprojection_with_validity"));
 		Contract->SetStringField(TEXT("temporalDiagnosticsStatus"), TEXT("experimental_uncertified"));
 		Contract->SetStringField(TEXT("temporalDiagnosticsStage"), TEXT("after_dof_before_temporal_upscaler"));
 		Contract->SetStringField(TEXT("nativeHRColor"), TEXT("isolated_hr_scene_capture_after_dof_linear_scene_rgb_pre_exposed"));
@@ -1813,6 +1851,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	{
 		Contract->SetStringField(TEXT("motion"), TEXT("not_captured"));
 		Contract->SetStringField(TEXT("jitterAndMatrices"), TEXT("not_captured"));
+		Contract->SetStringField(TEXT("historyRejection"), TEXT("not_captured"));
 	}
 	Contract->SetStringField(TEXT("pairing"), TEXT("All modalities are captured after the same world tick; LR downsampling never advances the world."));
 	Contract->SetStringField(

@@ -100,11 +100,27 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 		float LinearDepthMeters = ValidDepth ? ConvertFromDeviceZ(DeviceZ) * 0.01f : 0.0f;
 		bool ValidMotion = ValidDepth && all(isfinite(MotionCurrentToPrevious));
+		float PreviousDeviceZReprojected = 0.0f;
+		if (ValidDepth)
+		{
+			float2 ViewportUV = (float2(Pixel) + 0.5f) / float2(OutputSize);
+			float2 ScreenPos = 2.0f * float2(ViewportUV.x, 1.0f - ViewportUV.y) - 1.0f;
+			float4 PreviousClip = mul(float4(ScreenPos, DeviceZ, 1.0f), View.ClipToPrevClip);
+			if (abs(PreviousClip.w) > 1.0e-8f)
+			{
+				float Candidate = PreviousClip.z / PreviousClip.w;
+				PreviousDeviceZReprojected = isfinite(Candidate) ? Candidate : 0.0f;
+			}
+		}
 
 		OutSceneColor[Pixel] = InputSceneColor.Load(int3(InputPixel, 0));
 		OutVelocityRaw[Pixel] = float4(RawScreenVelocity, HasRenderedVelocity ? 1.0f : 0.0f, ValidMotion ? 1.0f : 0.0f);
 		OutMotionFull[Pixel] = float4(MotionCurrentToPrevious, HasRenderedVelocity ? 1.0f : 0.0f, ValidMotion ? 1.0f : 0.0f);
-		OutDepth[Pixel] = float4(LinearDepthMeters, DeviceZ, ValidDepth ? 1.0f : 0.0f, 1.0f);
+		OutDepth[Pixel] = float4(
+			LinearDepthMeters,
+			DeviceZ,
+			ValidDepth ? 1.0f : 0.0f,
+			PreviousDeviceZReprojected);
 
 		uint SeparateWidth;
 		uint SeparateHeight;

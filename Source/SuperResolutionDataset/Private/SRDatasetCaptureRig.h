@@ -29,6 +29,9 @@ public:
 	FIntPoint GetLastHUDlessColorSize() const { return LastHUDlessColorSize; }
 	bool CaptureFrame(
 		const FSRDatasetCaptureJob& Job,
+		int32 LogicalFrameNumber,
+		int32 MotionPreviousLogicalFrameId,
+		bool bHistoryReset,
 		const FString& HRPath,
 		const FString& LRPath,
 		const FString& DepthPath,
@@ -37,6 +40,9 @@ public:
 	bool SaveTemporalCaptureResult(
 		const FSRDatasetTemporalCaptureResult& Result,
 		const FString& LRPath,
+		int32 LogicalFrameNumber,
+		int32 MotionPreviousLogicalFrameId,
+		bool bHistoryReset,
 		TMap<FString, FString>& OutHashes,
 		FString& OutError);
 	bool SaveNativeHDRColorResult(
@@ -58,6 +64,12 @@ public:
 
 private:
 	static bool SaveImageAtomic(const FString& Path, const TCHAR* Format, const FImage& Image, FString& OutHash, FString& OutError);
+	static bool LoadScalarImage(const FString& Path, FIntPoint ExpectedSize, TArray<FLinearColor>& OutPixels);
+	bool EnsurePreviousTemporalState(
+		const FString& OutputRoot,
+		int32 PreviousLogicalFrameId,
+		FIntPoint ExpectedSize,
+		FString& OutError);
 	static FImageCore::EResizeImageFilter ToImageFilter(ESRDatasetResizeFilter Filter);
 	void ApplyViewToCapture(USceneCaptureComponent2D* Capture, const FMinimalViewInfo& View, bool bDisableMotionBlur, bool bLockExposure);
 
@@ -94,4 +106,8 @@ private:
 	FSRDatasetTemporalFrameMetadata LastReferenceHRMetadata;
 	FSRDatasetTemporalFrameMetadata LastHUDlessColorMetadata;
 	FIntPoint LastHUDlessColorSize = FIntPoint::ZeroValue;
+	int32 PreviousTemporalLogicalFrameId = INDEX_NONE;
+	FIntPoint PreviousTemporalSize = FIntPoint::ZeroValue;
+	TArray<FLinearColor> PreviousTemporalDepth;
+	TArray<FLinearColor> PreviousTemporalObjectId;
 };

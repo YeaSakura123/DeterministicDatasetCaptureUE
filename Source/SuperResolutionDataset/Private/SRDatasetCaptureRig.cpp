@@ -44,6 +44,11 @@ ASRDatasetCaptureRig::ASRDatasetCaptureRig()
 
 bool ASRDatasetCaptureRig::Configure(const FSRDatasetCaptureJob& Job, FString& OutError)
 {
+	PreviousTemporalLogicalFrameId = INDEX_NONE;
+	PreviousTemporalSize = FIntPoint::ZeroValue;
+	PreviousTemporalDepth.Reset();
+	PreviousTemporalObjectId.Reset();
+
 	HRTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("SRDatasetHRTarget"));
 	LRTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("SRDatasetLRTarget"));
 	DepthTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("SRDatasetDepthTarget"));
@@ -154,6 +159,9 @@ void ASRDatasetCaptureRig::ApplyViewToCapture(
 
 bool ASRDatasetCaptureRig::CaptureFrame(
 	const FSRDatasetCaptureJob& Job,
+	const int32 LogicalFrameNumber,
+	const int32 MotionPreviousLogicalFrameId,
+	const bool bHistoryReset,
 	const FString& HRPath,
 	const FString& LRPath,
 	const FString& DepthPath,
@@ -254,7 +262,14 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 		{
 			FSRDatasetTemporalCaptureResult TemporalResult;
 			if (!ViewExtension->WaitAndTakeCapture(TemporalResult, OutError) ||
-				!SaveTemporalCaptureResult(TemporalResult, LRPath, OutHashes, OutError))
+				!SaveTemporalCaptureResult(
+					TemporalResult,
+					LRPath,
+					LogicalFrameNumber,
+					MotionPreviousLogicalFrameId,
+					bHistoryReset,
+					OutHashes,
+					OutError))
 			{
 				return false;
 			}
@@ -393,6 +408,9 @@ bool ASRDatasetCaptureRig::SaveHUDlessColorResult(
 bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 	const FSRDatasetTemporalCaptureResult& Result,
 	const FString& LRPath,
+	const int32 LogicalFrameNumber,
+	const int32 MotionPreviousLogicalFrameId,
+	const bool bHistoryReset,
 	TMap<FString, FString>& OutHashes,
 	FString& OutError)
 {
@@ -447,6 +465,106 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 		FMemory::Memcpy(Image.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FLinearColor));
 		return Image;
 	};
+	const auto MakeScalarPixelsImage = [&Result](const TArray<FLinearColor>& Pixels)
+	{
+		FImage Image;
+		Image.Init(Result.Size.X, Result.Size.Y, 1, ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+		FMemory::Memcpy(Image.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FLinearColor));
+		return Image;
+	};
+
+	if (!bHistoryReset && !EnsurePreviousTemporalState(
+		OutputRoot,
+		MotionPreviousLogicalFrameId,
+		Result.Size,
+		OutError))
+	{
+		return false;
+	}
+
+	TArray<FLinearColor> HistoryRejection;
+	TArray<FLinearColor> HistoryRejectionValid;
+	HistoryRejection.SetNumUninitialized(PixelCount);
+	HistoryRejectionValid.SetNumUninitialized(PixelCount);
+	const float DisplayToRenderScale = FMath::IsFinite(Result.Metadata.ResolutionFraction)
+		? Result.Metadata.ResolutionFraction
+		: 0.0f;
+	for (int32 Y = 0; Y < Result.Size.Y; ++Y)
+	{
+		for (int32 X = 0; X < Result.Size.X; ++X)
+		{
+			const int32 Index = Y * Result.Size.X + X;
+			float Reject = 1.0f;
+			float Valid = 0.0f;
+			if (bHistoryReset)
+			{
+				// A reset has no reusable history by definition; rejecting every
+				// pixel is exact and therefore valid rather than an approximation.
+				Valid = 1.0f;
+			}
+			else
+			{
+				const FLinearColor& CurrentDepth = Result.Depth[Index];
+				const FLinearColor& CurrentMotion = Result.MotionFull[Index];
+				const bool bCurrentInputsValid = CurrentDepth.B >= 0.5f &&
+					CurrentMotion.A >= 0.5f && DisplayToRenderScale > 0.0f &&
+					FMath::IsFinite(CurrentMotion.R) && FMath::IsFinite(CurrentMotion.G);
+				if (bCurrentInputsValid)
+				{
+					const int32 PreviousX = FMath::RoundToInt(
+						X + CurrentMotion.R * DisplayToRenderScale);
+					const int32 PreviousY = FMath::RoundToInt(
+						Y + CurrentMotion.G * DisplayToRenderScale);
+					if (PreviousX < 0 || PreviousY < 0 ||
+						PreviousX >= Result.Size.X || PreviousY >= Result.Size.Y)
+					{
+						// Reprojection outside the previous render rect is a definitive
+						// history rejection.
+						Valid = 1.0f;
+					}
+					else
+					{
+						const int32 PreviousIndex = PreviousY * Result.Size.X + PreviousX;
+						const int32 CurrentId = FMath::RoundToInt(Result.ObjectId[Index].R);
+						const int32 PreviousId = FMath::RoundToInt(PreviousTemporalObjectId[PreviousIndex].R);
+						if (CurrentId != 0 || PreviousId != 0)
+						{
+							// Custom Stencil identity is the strongest available signal for
+							// rigid/deforming labeled geometry at its motion-reprojected pixel.
+							Reject = CurrentId == PreviousId ? 0.0f : 1.0f;
+							Valid = 1.0f;
+						}
+						else if (CurrentMotion.B >= 0.5f)
+						{
+							// Unlabeled moving geometry lacks a previous-object depth. Reject
+							// conservatively and expose the uncertainty in the validity mask.
+							Reject = 1.0f;
+							Valid = 0.0f;
+						}
+						else
+						{
+							const float PreviousDeviceZ = PreviousTemporalDepth[PreviousIndex].R;
+							const float ReprojectedDeviceZ = CurrentDepth.A;
+							if (PreviousDeviceZ > 0.0f && ReprojectedDeviceZ > 0.0f &&
+								FMath::IsFinite(PreviousDeviceZ) && FMath::IsFinite(ReprojectedDeviceZ))
+							{
+								// Reversed-Z: a larger previous depth value is closer. If the
+								// previous visible surface was closer than the reprojected current
+								// surface, current history was occluded and must be rejected.
+								const float Tolerance = FMath::Max(
+									1.0e-5f,
+									FMath::Abs(ReprojectedDeviceZ) * 2.0e-3f);
+								Reject = PreviousDeviceZ > ReprojectedDeviceZ + Tolerance ? 1.0f : 0.0f;
+								Valid = 1.0f;
+							}
+						}
+					}
+				}
+			}
+			HistoryRejection[Index] = FLinearColor(Reject, Reject, Reject, 1.0f);
+			HistoryRejectionValid[Index] = FLinearColor(Valid, Valid, Valid, 1.0f);
+		}
+	}
 
 	struct FOutput
 	{
@@ -462,6 +580,9 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 	Outputs.Add({ TEXT("depth_device_raw"), MakeScalarImage(Result.Depth, 1) });
 	Outputs.Add({ TEXT("depth_view_linear_meters"), MakeScalarImage(Result.Depth, 0) });
 	Outputs.Add({ TEXT("depth_valid"), MakeScalarImage(Result.Depth, 2) });
+	Outputs.Add({ TEXT("depth_previous_reprojected_device"), MakeScalarImage(Result.Depth, 3) });
+	Outputs.Add({ TEXT("history_rejection_mask"), MakeScalarPixelsImage(HistoryRejection) });
+	Outputs.Add({ TEXT("history_rejection_valid"), MakeScalarPixelsImage(HistoryRejectionValid) });
 	Outputs.Add({ TEXT("translucency_after_dof_raw"), MakeImage(Result.Translucency) });
 	Outputs.Add({ TEXT("transparency_mask"), MakeTransparencyMask() });
 	// First conservative implementation: post-DOF translucency coverage is
@@ -479,7 +600,75 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 		}
 		OutHashes.Add(Output.Name, Hash);
 	}
+	PreviousTemporalLogicalFrameId = LogicalFrameNumber;
+	PreviousTemporalSize = Result.Size;
+	PreviousTemporalDepth.SetNumUninitialized(PixelCount);
+	PreviousTemporalObjectId.SetNumUninitialized(PixelCount);
+	for (int32 Index = 0; Index < PixelCount; ++Index)
+	{
+		const float DeviceZ = Result.Depth[Index].G;
+		const float ObjectId = Result.ObjectId[Index].R;
+		PreviousTemporalDepth[Index] = FLinearColor(DeviceZ, DeviceZ, DeviceZ, 1.0f);
+		PreviousTemporalObjectId[Index] = FLinearColor(ObjectId, ObjectId, ObjectId, 1.0f);
+	}
 	LastTemporalMetadata = Result.Metadata;
+	return true;
+}
+
+bool ASRDatasetCaptureRig::LoadScalarImage(
+	const FString& Path,
+	const FIntPoint ExpectedSize,
+	TArray<FLinearColor>& OutPixels)
+{
+	FImage Image;
+	if (!FImageUtils::LoadImage(*Path, Image) ||
+		Image.SizeX != ExpectedSize.X || Image.SizeY != ExpectedSize.Y || Image.NumSlices != 1)
+	{
+		return false;
+	}
+	Image.ChangeFormat(ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+	const int32 PixelCount = ExpectedSize.X * ExpectedSize.Y;
+	if (Image.RawData.Num() != PixelCount * static_cast<int64>(sizeof(FLinearColor)))
+	{
+		return false;
+	}
+	OutPixels.SetNumUninitialized(PixelCount);
+	FMemory::Memcpy(OutPixels.GetData(), Image.RawData.GetData(), Image.RawData.Num());
+	return true;
+}
+
+bool ASRDatasetCaptureRig::EnsurePreviousTemporalState(
+	const FString& OutputRoot,
+	const int32 PreviousLogicalFrameId,
+	const FIntPoint ExpectedSize,
+	FString& OutError)
+{
+	const int32 ExpectedPixelCount = ExpectedSize.X * ExpectedSize.Y;
+	if (PreviousTemporalLogicalFrameId == PreviousLogicalFrameId &&
+		PreviousTemporalSize == ExpectedSize &&
+		PreviousTemporalDepth.Num() == ExpectedPixelCount &&
+		PreviousTemporalObjectId.Num() == ExpectedPixelCount)
+	{
+		return true;
+	}
+
+	const FString FrameName = FString::Printf(TEXT("frame_%06d.exr"), PreviousLogicalFrameId);
+	const FString DepthPath = FPaths::Combine(OutputRoot, TEXT("depth_device_raw"), FrameName);
+	const FString ObjectIdPath = FPaths::Combine(OutputRoot, TEXT("object_id"), FrameName);
+	if (!LoadScalarImage(DepthPath, ExpectedSize, PreviousTemporalDepth) ||
+		!LoadScalarImage(ObjectIdPath, ExpectedSize, PreviousTemporalObjectId))
+	{
+		PreviousTemporalLogicalFrameId = INDEX_NONE;
+		PreviousTemporalSize = FIntPoint::ZeroValue;
+		PreviousTemporalDepth.Reset();
+		PreviousTemporalObjectId.Reset();
+		OutError = FString::Printf(
+			TEXT("Could not load previous temporal depth/Object ID for history rejection: frame %d."),
+			PreviousLogicalFrameId);
+		return false;
+	}
+	PreviousTemporalLogicalFrameId = PreviousLogicalFrameId;
+	PreviousTemporalSize = ExpectedSize;
 	return true;
 }
 

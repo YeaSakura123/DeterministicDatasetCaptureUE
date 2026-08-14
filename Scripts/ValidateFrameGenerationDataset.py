@@ -30,6 +30,8 @@ REQUIRED_MODALITIES = {
     "depth_t1",
     "motion_1_to_0",
     "motion_valid_1_to_0",
+    "history_rejection_1_to_0",
+    "history_rejection_valid_1_to_0",
     "object_id_t0",
     "object_id_tau",
     "object_id_t1",
@@ -49,12 +51,20 @@ DISPLAY_MODALITIES = {
 
 MASK_MODALITIES = {
     "motion_valid_1_to_0",
+    "history_rejection_1_to_0",
+    "history_rejection_valid_1_to_0",
     "reactive_mask_t0",
     "reactive_mask_tau",
     "reactive_mask_t1",
     "transparency_mask_t0",
     "transparency_mask_tau",
     "transparency_mask_t1",
+}
+
+BINARY_MASK_MODALITIES = {
+    "motion_valid_1_to_0",
+    "history_rejection_1_to_0",
+    "history_rejection_valid_1_to_0",
 }
 
 OBJECT_ID_MODALITIES = {"object_id_t0", "object_id_tau", "object_id_t1"}
@@ -309,6 +319,7 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
     motion_semantics = semantics.get("motion1To0", {}) if isinstance(semantics, dict) else {}
     color_semantics = semantics.get("sceneColorHudless", {}) if isinstance(semantics, dict) else {}
     depth_semantics = semantics.get("depth", {}) if isinstance(semantics, dict) else {}
+    rejection_semantics = semantics.get("historyRejection1To0", {}) if isinstance(semantics, dict) else {}
     add_check(
         checks,
         "semantics.motion",
@@ -333,6 +344,17 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         depth_semantics.get("encoding") == "linear_view_meters"
         and depth_semantics.get("resolution") == "render",
         json.dumps(depth_semantics, sort_keys=True),
+    )
+    add_check(
+        checks,
+        "semantics.history_rejection",
+        rejection_semantics.get("definition")
+        == "one_rejects_t0_history_at_t1_motion_reprojected_pixel"
+        and rejection_semantics.get("source")
+        == "custom_stencil_identity_else_static_camera_depth_reprojection_v1"
+        and rejection_semantics.get("validity") == "history_rejection_valid_1_to_0"
+        and rejection_semantics.get("productionCertified") is False,
+        json.dumps(rejection_semantics, sort_keys=True),
     )
 
     pairs = manifest.get("pairs", [])
@@ -443,6 +465,14 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                 if modality in MASK_MODALITIES:
                     valid_values = bool(np.min(channel) >= -1e-6 and np.max(channel) <= 1.0 + 1e-6)
                     add_check(checks, f"{prefix}.{modality}.range", valid_values, f"min={float(np.min(channel))} max={float(np.max(channel))}")
+                    if modality in BINARY_MASK_MODALITIES:
+                        binary = bool(np.all((channel == 0.0) | (channel == 1.0)))
+                        add_check(
+                            checks,
+                            f"{prefix}.{modality}.binary",
+                            binary,
+                            f"values={np.unique(channel)[:16].tolist()}",
+                        )
                 elif modality in OBJECT_ID_MODALITIES:
                     valid_values = bool(
                         np.min(channel) >= -1e-6

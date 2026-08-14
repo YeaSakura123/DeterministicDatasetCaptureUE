@@ -26,6 +26,7 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Logical-frame/render-submission IDs and per-frame engine/GPU/CVar/content/shader provenance.
 - [ ] Complete pixel-domain Main View/native/reference comparison and capture-order invariance.
 - [x] Record the GPU View Uniform Mip bias, fixed LOD/scalability CVar profile, streaming barrier and resident-texture state hash.
+- [x] Export experimental motion-reprojected history rejection plus a per-pixel validity mask, with reset/ID/static-depth semantic tests.
 - [ ] Export production disocclusion, instance ID, normals, albedo and material/semantic IDs.
 - [ ] Add Movie Render Graph for temporal/spatial samples, path tracing and tiled ultra-high-resolution output.
 - [ ] Add configurable camera calibration export and pluggable degradation chains.
@@ -41,7 +42,7 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [ ] Capture `motion_0_to_1` independently; never infer it by negation.
 - [ ] Capture UI Color/Alpha independently and validate zero UI residue in HUD-less color.
 - [ ] Validate endpoint motion for skeletal bones, WPO, animated materials, Niagara and translucency.
-- [ ] Produce production disocclusion/visibility masks from both endpoints.
+- [ ] Certify disocclusion/visibility for unlabeled moving, skeletal, WPO and animated-material geometry and capture both endpoint directions.
 - [ ] Add static/camera-only/mixed-motion and four-direction jitter-sign fixtures.
 - [ ] Add a preflight scanner for every tickable actor, Niagara data interface and nondeterministic material input.
 - [ ] Add Niagara Sim Cache, Chaos cache and an actor-state recorder for non-Sequencer gameplay.
@@ -72,3 +73,11 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - Main View at 50% render fraction: GPU View Uniform bias `-1.296875`, matching the independent formula using offset `-0.3` and quantization `1024`.
 - Native/reference full-resolution SceneCapture views: GPU View Uniform bias `0`.
 - FG endpoint/intermediate replays: 367/367 and 192/192 required checks; assembled pair: 90/90 integrity checks, still intentionally uncertified.
+
+## Version 0.3.0 history-rejection validation snapshot
+
+- UE 5.7 Development Editor build and job-validation automation: passed.
+- Two-process semantic replay: 542/542 required checks; new rejection/validity EXRs were byte-exact.
+- Known reveal geometry: 174/174 revealed pixels rejected with valid evidence; 734 stable background pixels retained.
+- FG endpoint/intermediate replays: 403/403 and 209/209 required checks.
+- Assembled FG pair: 102/102 integrity checks, still intentionally uncertified.
