@@ -14,6 +14,59 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("JobName cannot be empty.");
 		return false;
 	}
+	if (bRequireSceneControlPreflight && !bRunSceneControlPreflight)
+	{
+		OutError = TEXT("bRequireSceneControlPreflight requires bRunSceneControlPreflight=true.");
+		return false;
+	}
+	const auto ValidateSceneControlRules = [&OutError](
+		const TArray<FString>& Rules,
+		const TCHAR* FieldName)
+	{
+		TSet<FString> UniqueRules;
+		for (const FString& RawRule : Rules)
+		{
+			const FString Rule = RawRule.TrimStartAndEnd();
+			const int32 FirstWildcard = Rule.Find(TEXT("*"), ESearchCase::CaseSensitive);
+			const FString ClassPrefix = FirstWildcard == INDEX_NONE ? Rule : Rule.Left(FirstWildcard);
+			const int32 LastClassSeparator = ClassPrefix.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+			if (Rule.IsEmpty() || !Rule.StartsWith(TEXT("/")) ||
+				(FirstWildcard != INDEX_NONE && FirstWildcard != Rule.Len() - 1) ||
+				LastClassSeparator == INDEX_NONE || LastClassSeparator >= ClassPrefix.Len() - 1)
+			{
+				OutError = FString::Printf(
+					TEXT("%s contains invalid or over-broad rule '%s'. Use an absolute module/asset class path and, if needed, one trailing '*' after a non-empty class prefix."),
+					FieldName,
+					*RawRule);
+				return false;
+			}
+			if (UniqueRules.Contains(Rule))
+			{
+				OutError = FString::Printf(
+					TEXT("%s contains duplicate rule '%s'."),
+					FieldName,
+					*Rule);
+				return false;
+			}
+			UniqueRules.Add(Rule);
+		}
+		return true;
+	};
+	if (!ValidateSceneControlRules(
+			SceneControlAllowedTickingActorClassPaths,
+			TEXT("SceneControlAllowedTickingActorClassPaths")) ||
+		!ValidateSceneControlRules(
+			SceneControlAllowedTickingComponentClassPaths,
+			TEXT("SceneControlAllowedTickingComponentClassPaths")) ||
+		!ValidateSceneControlRules(
+			SceneControlAllowedNiagaraDataInterfaceClassPaths,
+			TEXT("SceneControlAllowedNiagaraDataInterfaceClassPaths")) ||
+		!ValidateSceneControlRules(
+			SceneControlAllowedMaterialExpressionClassPaths,
+			TEXT("SceneControlAllowedMaterialExpressionClassPaths")))
+	{
+		return false;
+	}
 	if (StartFrame < 0 || EndFrame < StartFrame)
 	{
 		OutError = TEXT("Frame range must satisfy 0 <= StartFrame <= EndFrame.");
@@ -42,11 +95,12 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 	if (bUseDeterministicCameraTransform &&
 		(DeterministicCameraLocationCm.ContainsNaN() ||
 		 DeterministicCameraRotationDegrees.ContainsNaN() ||
+		 DeterministicCameraTranslationPerLogicalFrameCm.ContainsNaN() ||
 		 !FMath::IsFinite(DeterministicCameraFOVDegrees) ||
 		 DeterministicCameraFOVDegrees < 5.0f ||
 		 DeterministicCameraFOVDegrees > 170.0f))
 	{
-		OutError = TEXT("Deterministic camera transform must be finite and its FOV must be in [5, 170] degrees.");
+		OutError = TEXT("Deterministic camera transform/trajectory must be finite and its FOV must be in [5, 170] degrees.");
 		return false;
 	}
 	if (bLockTemporalJitterToLogicalFrame &&
@@ -76,6 +130,18 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("bCaptureTemporalDiagnostics requires LRMode=NativeRender so Velocity, Depth and HDR Color come from the real LR view.");
 		return false;
 	}
+	if (bAssignStableInstanceIds && !bCaptureTemporalDiagnostics)
+	{
+		OutError = TEXT("bAssignStableInstanceIds requires temporal diagnostics so the labeled object_id raster is captured.");
+		return false;
+	}
+	if (bAssignStableInstanceIds &&
+		(bEnableSemanticValidationFixture || bValidateNonFixtureSkeletalAnimation ||
+		 bValidateProjectAnimatedMaterial))
+	{
+		OutError = TEXT("Stable production instance IDs cannot be combined with semantic or project-probe validation fixtures that reserve Custom Stencil values.");
+		return false;
+	}
 	if (AuxiliaryCaptureOrder == ESRDatasetAuxiliaryCaptureOrder::LowResolutionFirst &&
 		LRMode != ESRDatasetLRMode::NativeRender)
 	{
@@ -85,6 +151,27 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 	if (bCaptureMainViewTemporalDiagnostics && !bCaptureTemporalDiagnostics)
 	{
 		OutError = TEXT("bCaptureMainViewTemporalDiagnostics requires bCaptureTemporalDiagnostics=true.");
+		return false;
+	}
+	if (bCaptureSceneCaptureLRComparison &&
+		(!bCaptureTemporalDiagnostics || !bCaptureMainViewTemporalDiagnostics ||
+		 LRMode != ESRDatasetLRMode::NativeRender))
+	{
+		OutError = TEXT("bCaptureSceneCaptureLRComparison requires temporal diagnostics from the real Main View and LRMode=NativeRender.");
+		return false;
+	}
+	if (bValidateMainViewSceneCapturePixelDomain && !bCaptureSceneCaptureLRComparison)
+	{
+		OutError = TEXT("bValidateMainViewSceneCapturePixelDomain requires bCaptureSceneCaptureLRComparison=true.");
+		return false;
+	}
+	if (bValidateMainViewSceneCapturePixelDomain &&
+		(!bEnableSemanticValidationFixture ||
+		 SemanticMotionScenario != ESRDatasetSemanticMotionScenario::Static ||
+		 !bUseDeterministicCameraTransform || !bLockExposure ||
+		 !bDisableMotionBlur || !bLockTemporalJitterToLogicalFrame))
+	{
+		OutError = TEXT("The Main View/SceneCapture pixel-domain gate requires the Static semantic fixture, a deterministic camera, locked exposure, disabled motion blur and logical-frame jitter locking.");
 		return false;
 	}
 	if (bCaptureReferenceHR && !bCaptureTemporalDiagnostics)
@@ -154,6 +241,26 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("bEnableSemanticValidationFixture requires real Main View temporal diagnostics.");
 		return false;
 	}
+	if (SemanticMotionScenario != ESRDatasetSemanticMotionScenario::LegacyCameraRelative &&
+		(!bEnableSemanticValidationFixture || !bUseDeterministicCameraTransform ||
+		 ReplayPass != ESRDatasetReplayPass::Standard || FrameStep != 1))
+	{
+		OutError = TEXT("An analytic semantic motion scenario requires the semantic fixture, a deterministic camera, Standard replay, and consecutive frames.");
+		return false;
+	}
+	const bool bSemanticCameraMotion =
+		SemanticMotionScenario == ESRDatasetSemanticMotionScenario::CameraOnly ||
+		SemanticMotionScenario == ESRDatasetSemanticMotionScenario::Mixed;
+	const bool bConfiguredCameraTranslation =
+		!DeterministicCameraTranslationPerLogicalFrameCm.IsNearlyZero(UE_SMALL_NUMBER);
+	if (SemanticMotionScenario != ESRDatasetSemanticMotionScenario::LegacyCameraRelative &&
+		bSemanticCameraMotion != bConfiguredCameraTranslation)
+	{
+		OutError = bSemanticCameraMotion
+			? TEXT("CameraOnly/Mixed semantic validation requires a non-zero deterministic camera translation per logical frame.")
+			: TEXT("Static/ObjectOnly semantic validation requires zero deterministic camera translation per logical frame.");
+		return false;
+	}
 	const int32 PoseCacheFrameCount = EndFrame - StartFrame + 1;
 	if ((!SkeletalPoseCacheInputFile.IsEmpty() || !SkeletalPoseCacheOutputFile.IsEmpty()) &&
 		!bCacheSkeletalAnimationPosesForReplay)
@@ -214,6 +321,17 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = FString::Printf(
 			TEXT("This semantic validation replay role requires at least %d captured frame(s)."),
 			RequiredSemanticFrames);
+		return false;
+	}
+	if (bValidateTemporalJitterSignCoverage &&
+		(!bEnableSemanticValidationFixture ||
+		 SemanticMotionScenario != ESRDatasetSemanticMotionScenario::Static ||
+		 !bLockTemporalJitterToLogicalFrame ||
+		 TemporalJitterSequenceLength < 4 ||
+		 CapturedFrameCount < TemporalJitterSequenceLength ||
+		 FrameStep != 1 || ReplayPass != ESRDatasetReplayPass::Standard))
+	{
+		OutError = TEXT("Temporal jitter sign coverage requires a Static semantic fixture, Standard consecutive replay, logical-frame jitter locking, a sequence length of at least four, and at least one full captured cycle.");
 		return false;
 	}
 	if (ReplayPass == ESRDatasetReplayPass::FrameGenerationEndpoints &&

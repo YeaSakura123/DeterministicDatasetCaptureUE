@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.5.0-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.9.0-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,12 +11,12 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.5.0 deliberately separates implemented output from certified training contracts:
+Version 0.9.0 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
 | `spatial-sr-data-v1` | Certified | Same-state HR/LR PNG and SceneCapture depth baseline. |
-| Main View temporal buffers | Experimental, validated fixture | Real AfterDOF HDR, motion, depth, jitter, matrices, masks and validity-gated history rejection are captured, but `nr-sr-data-v2` remains disabled until every production gate passes. |
+| Main View temporal buffers | Experimental, validated fixture | Real AfterDOF HDR, motion, depth, jitter, matrices, masks and reason-coded, validity-gated disocclusion/history rejection are captured. Cross-instance and static-depth decisions are independently reconstructed; uncertain dynamic same-instance pixels are rejected with validity zero. A same-stage Main View/native-LR SceneCapture pixel-domain gate passes, but `nr-sr-data-v2` remains disabled until every production gate passes. |
 | FG forward/reverse endpoint plus intermediate replay | Experimental, uncertified | `motion_1_to_0` and `motion_0_to_1` come from independent processes and assemble with a real `tau=0.5` frame. Controlled skinning/WPO fixtures, project AnimBP replay, project animated-material logical time, bidirectional skeletal disocclusion, independent UI RGBA and zero visible `UWidgetComponent` residue have passed. The checked project has no project-authored WPO asset, so that external-content gate remains open. |
 
 The plugin rejects `nr-sr-data-v2` and direct `nr-fg-data-v1` capture jobs. Missing fields are never filled with guesses. The experimental FG assembler emits `nr-fg-data-v1` only with `frameGenerationCertified=false` and an explicit `missingRequirements` list.
@@ -30,12 +30,14 @@ hr/                                  # display-referred FinalColorLDR PNG
 lr/                                  # paired or native FinalColorLDR PNG
 depth/                               # SceneCapture depth EXR, Unreal centimeters
 manifest.json
+instance_id_map.json                  # optional stable ID -> component/Actor/class map
 ```
 
 The real Main View diagnostic path can additionally write:
 
 ```text
 color_lr_scene_hdr/                    # LR AfterDOF, linear scene RGB, pre-exposed
+color_lr_scene_capture_hdr/            # optional paired native-LR SceneCapture comparison
 color_hr_native_scene_hdr/             # isolated non-jittered native HR
 color_hr_reference_scene_hdr/          # 2x/4x spatial supersample -> fixed HR grid
 color_main_view_hudless_after_tonemap/ # display-size, before Slate/UI
@@ -49,10 +51,14 @@ depth_valid/
 depth_previous_reprojected_device/  # current surface reprojected into previous device-Z
 history_rejection_mask/             # 1 = reject motion-reprojected previous history
 history_rejection_valid/            # 1 = decision has reset/ID/depth evidence
+history_rejection_reason/           # integer reason code 0..8
+disocclusion_mask/                  # exact explicit alias of history_rejection_mask
+disocclusion_valid/                 # exact explicit alias of history_rejection_valid
+disocclusion_reason/                # exact explicit alias of history_rejection_reason
 translucency_after_dof_raw/
 transparency_mask/
 reactive_mask/
-object_id/                             # Custom Stencil uint8; 0 = unlabeled
+object_id/                             # Custom Stencil uint8; optional stable component IDs
 ui_color_alpha/                        # independent display-size Slate/UMG RGBA PNG
 ```
 
@@ -65,7 +71,7 @@ previous_pixel = current_pixel + motion_current_to_previous
 
 Pixels without object Velocity are completed from depth and the unjittered current/previous camera transforms. The manifest records the original Velocity coverage so downstream code can distinguish both sources.
 
-The experimental history-rejection mask uses motion-reprojected Custom Stencil identity where labels exist, then falls back to previous-frame Reversed-Z depth for static/camera-only pixels. Reset and out-of-bounds pixels are rejected exactly. Unlabeled Velocity-covered geometry is rejected conservatively with `history_rejection_valid=0`; always gate training or losses with the validity mask. Custom Stencil is uint8 rather than instance-unique, so same-ID self-occlusion remains unresolved. This is useful deterministic data, not yet production-certified disocclusion ground truth for skeletal, WPO or unlabeled moving geometry.
+The experimental v2 history-rejection/disocclusion policy first compares motion-reprojected component identity, then uses previous-frame Reversed-Z depth for static/camera-only pixels. Reset, out-of-bounds and cross-instance changes are exact reject-valid decisions. Static depth can retain history or identify occlusion. Velocity-covered geometry with the same component ID cannot prove per-surface identity, so it is conservatively emitted as `reject=1, valid=0`; unlabeled moving geometry follows the same safe policy. `history_rejection_reason` records one of nine audited reasons, and validator v14 independently reconstructs every non-reset decision from the saved current/previous buffers. Always gate training or losses with the validity mask. Dynamic same-instance self-occlusion still needs a per-surface/wider identity solution before production certification.
 
 ## Scene control
 
@@ -85,6 +91,8 @@ The experimental history-rejection mask uses motion-reprojected Custom Stencil i
 - A pre-capture streaming barrier that fails on timeout, plus per-frame resident-texture counts and a sorted streaming-state SHA-1.
 - Actual GPU View Uniform Mip bias for Main View, native HR, reference HR and HUD-less color; the validator independently reproduces UE's quantized automatic-bias formula.
 - A per-frame scene-state SHA-1 over sorted Actor/component transforms, visibility/tick state, skeletal component-space bones, Niagara component time/seed controls and Cascade component state. The manifest also lists actors that tick without implementing `SRDatasetControllable`.
+- A pre-warmup scene-control preflight that inventories every registered ticking Actor/component, loaded Niagara Data Interface, and known time/per-instance/particle-random material input. It writes a canonical SHA-1 report and can reject any unclassified record before frame zero.
+- Optional fixed-topology stable instance IDs finalized after warmup and the streaming barrier. The plugin assigns collision-free Custom Stencil IDs in sorted component-path order, writes a hashed ID→component/Actor/class map, fails on later topology/label drift and restores every prior stencil state. The v1 encoding rejects more than 255 instances.
 
 “Absolute control” is an explicit protocol, not a claim that arbitrary live input becomes deterministic automatically. The plugin can cache and reapply evaluated skeletal poses, lock ordinary game-time material expressions to the logical frame, and explicitly drive supported Niagara systems. Network traffic, audio-driven state, nondeterministic third-party data interfaces, custom async work, AnimBP logic that consumes external state, Material Parameter Collections and project-authored WPO without an explicit previous-frame contract still require an adapter, cache or project-specific validation. The included fixtures and project-asset probes prove the declared paths, not every possible asset.
 
@@ -142,7 +150,22 @@ From the Unreal project directory:
   -Project '.\YourProject.uproject'
 ```
 
-The runner reads `EngineAssociation` from the project and resolves an installed Unreal Editor. Use `-Editor` for a source build or unregistered installation. When Main View capture is enabled, it launches an HR-sized offscreen viewport and sets the internal render fraction from LR/HR.
+The runner reads `EngineAssociation` from the project and resolves an installed Unreal Editor. Use `-Editor` for a source build or unregistered installation. When Main View capture is enabled, it launches an HR-sized offscreen viewport and sets the internal render fraction from LR/HR. It verifies that this run wrote a fresh manifest, prints the captured sample count, and returns exit code 1 when the manifest state is not `Completed`, even if Unreal itself loses an early startup failure code.
+
+### Strict scene-control preflight
+
+`bRunSceneControlPreflight=true` writes `scene_control_preflight.json` before warmup. Report-only mode is the default so an existing project can discover its gaps. Set `bRequireSceneControlPreflight=true` for production jobs; every unclassified ticking Actor/component, Niagara Data Interface or scanned material input then fails the job before frame zero.
+
+Exception rules are case-sensitive class paths. They are exact unless the sole `*` is the final character after a non-empty class-name prefix, which makes the rule a prefix match. Module-wide forms such as `/Script/Engine.*` are rejected. Keep rules narrow and review each exception; an allowlist says that the project has audited the class, not that the plugin has invented a deterministic adapter for it.
+
+The checked First Person strict fixture is [`Config/job.scene-control-preflight-validation.json`](Config/job.scene-control-preflight-validation.json). The negative fixture intentionally has no exceptions and must fail with zero samples:
+
+```powershell
+& '.\Plugins\DeterministicDatasetCaptureUE\Scripts\RunDatasetCapture.ps1' `
+  -Map '/Game/FirstPerson/Lvl_FirstPerson' `
+  -Job '.\Plugins\DeterministicDatasetCaptureUE\Config\job.scene-control-preflight-validation.json' `
+  -Project '.\YourProject.uproject'
+```
 
 ## PIE console commands
 
@@ -179,7 +202,21 @@ python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
   --compare '.\Saved\SRDataset\run_a'
 ```
 
-The v9 validator requires exact provenance and temporal/native-HR/reference-HR/HUD-less/UI/semantic/streaming metadata. It verifies the effective material texture Mip bias, logical material time, signed reverse-time delta and zero visible `UWidgetComponent` residue. Geometry, depth, motion, masks and IDs must be numerically exact; color permits a narrow documented floating-point tolerance and writes heatmaps when hashes differ.
+The v14 validator requires exact provenance and temporal/native-HR/reference-HR/HUD-less/UI/semantic/streaming metadata. It independently reconstructs the scene-control report, stable instance-map SHA-1 and v2 disocclusion reason grids, checks every count and exact allowlist/ID record, and enforces the requested zero-unclassified and fixed-topology gates. It also verifies the effective material texture Mip bias, logical material time, signed reverse-time delta, zero visible `UWidgetComponent` residue and the optional Main View/SceneCapture pixel-domain contract. Geometry, depth, motion, masks and IDs must be numerically exact; color permits a narrow documented floating-point tolerance and writes heatmaps when hashes differ.
+
+### Main View / SceneCapture LR pixel-domain gate
+
+Set `bCaptureSceneCaptureLRComparison=true` to extract `color_lr_scene_capture_hdr` from the already scheduled native-LR SceneCapture. This does not submit another render and does not advance the world. The real Main View still owns `color_lr_scene_hdr` and all temporal buffers. Each frame records independent exposure, jitter, projection and View metadata for both paths.
+
+[`Config/job.main-view-scene-capture-pixel-domain-validation.json`](Config/job.main-view-scene-capture-pixel-domain-validation.json) also enables `bValidateMainViewSceneCapturePixelDomain`. The validator divides each image by its own pre-exposure, translates the non-jittered SceneCapture image by the Main View's recorded current render-pixel jitter, crops the interpolation border and applies a hard fixture threshold. The job is restricted to a deterministic Static semantic fixture with locked exposure, disabled motion blur and logical-frame jitter locking, so motion cannot masquerade as a capture-path difference.
+
+The supplied validation job deliberately uses `512x288` HR and `256x144` LR for fast regression. Smoke and semantic jobs may be even smaller. These are test resolutions, not production defaults. [`Config/job.production-first-person-2x-strict.json`](Config/job.production-first-person-2x-strict.json) is a directly runnable two-frame First Person example at `1920x1080` HR and `960x540` LR, with stable IDs and strict scene-control preflight. [`Config/job.production-2x.json`](Config/job.production-2x.json) is the longer project-agnostic template; replace its map and audit settings before use.
+
+### Stable instance-ID gate
+
+Set `bAssignStableInstanceIds=true` on a native temporal job to replace ambiguous scene-authored stencil reuse with component-unique IDs for a fixed loaded topology. Assignment occurs only after renderer warmup and the streaming barrier. ID `0` is reserved for background; IDs `1..N` follow case-sensitive sorted component paths. `instance_id_map.json` records the component path, owner Actor path, Actor class and component class for every ID, plus a canonical SHA-1 that the validator independently reconstructs.
+
+[`Config/job.stable-instance-id-validation.json`](Config/job.stable-instance-id-validation.json) exercises this mode. It intentionally fails if the renderable component set changes after assignment, if another system changes a stencil, or if more than 255 components require labels. It cannot be combined with validation fixtures that reserve stencil values. This closes collisions between mapped components. Dynamic same-component self-occlusion is now conservatively invalid instead of silently trusted, but production-valid supervision for those pixels and dynamic spawn/despawn topology still need a per-surface/wider encoding.
 
 ### Capture-order invariance gate
 
@@ -274,6 +311,36 @@ Actors spawned during capture are discovered and prepared before their first eva
 
 ## Verified release evidence
 
+Version 0.9.0 adds reason-coded, validity-gated disocclusion/history rejection with explicit output aliases and independent cross-frame reconstruction. The checked UE 5.7 runs produced:
+
+- stable-ID two-frame validation: validator v14 passed 423/423 checks; on the non-reset 256x144 LR frame it independently reconstructed all 36,864 decisions with zero mask, validity or reason mismatch, including 21 instance-identity changes and 7,708 static-depth occlusions;
+- moving semantic fixture: 534/534 checks, including all 134 newly revealed pixels rejected with valid evidence, 624 stable-background pixels retained, and 305 dynamic same-instance pixels conservatively marked reject-invalid;
+- a second clean stable-ID process: 662/662 exact-replay checks, including the new mask/valid/reason EXRs and the unchanged 60-entry mapping SHA-1;
+- the directly runnable strict production example captured two real `1920x1080` HR / `960x540` LR frames without a validation fixture and passed 466/466 checks, with zero uncontrolled preflight records, 60 stable IDs and both disocclusion/stable-ID gates passing;
+- validator v14 backward compatibility: the retained v0.8 stable-ID dataset still passed its original 376/376 required checks.
+
+Version 0.8.0 adds fixed-topology component-unique instance IDs and a hashed semantic map. The checked UE 5.7 runs produced:
+
+- 60 deterministic component records with a mapping SHA-1 of `AC6D1AFC22F85CBC194939683025C0B9C88B5E19` in two independent processes;
+- two-frame single-run validation: 376/376 required checks, with every nonzero `object_id` value resolving through the map;
+- clean-process replay comparison: 599/599 checks, including byte-exact `object_id` EXRs for both frames and exact mapping/frame metadata;
+- an initial pre-warmup prototype correctly failed at zero samples when topology grew from 59 to 60; assignment was therefore moved after warmup/streaming, while later drift remains a hard failure.
+
+Version 0.7.0 adds the same-stage Main View/native-LR SceneCapture pixel-domain gate. The checked UE 5.7 run produced:
+
+- Development Editor UHT/C++ build: 11/11 actions passed; Unreal automation job validation passed 1/1;
+- two real First Person samples with no extra LR render submission or simulation advance: validator v12 passed 439/439 required checks;
+- exact unjittered projection and View-matrix agreement; SceneCapture jitter was zero while Main View used two distinct subpixel jitter phases;
+- after independent pre-exposure normalization and metadata-defined alignment: 24.24–24.27 dB PSNR and 2.40%–2.54% normalized mean absolute error, with the recorded jitter sign outperforming the opposite sign in both frames.
+
+Version 0.6.0 adds the hashed scene-control preflight and explicit static/camera-only/object-only/mixed-motion plus four-quadrant jitter gates. The checked UE 5.7 runs produced:
+
+- report-only smoke capture: 56/56 validator-v11 checks, with five plugin-owned SceneCapture components classified as controlled and all remaining project classes listed explicitly;
+- strict positive preflight: two frames, 408/408 checks, 4 audited ticking Actors, 5 audited ticking components, 8 subsystem-controlled components and zero unclassified records;
+- strict negative preflight: rejected before frame zero, wrote the violation report and failed the runner with exit code 1;
+- Static, Camera-only, Object-only and Mixed semantic motion captures: 398/398, 398/398, 405/405 and 405/405 validator-v10 checks before the preflight evidence was added;
+- one complete eight-phase jitter cycle: 1538/1538 validator-v10 checks with both signs on both axes and all four sign quadrants.
+
 Version 0.5.0 was compiled as a UE 5.7 Development Editor plugin and exercised on Windows/D3D12 with an AMD Radeon RX 7900 XTX. The checked captures produced:
 
 - Unreal automation: 1/1 job-validation test passed with zero warnings/errors;
@@ -290,7 +357,7 @@ The validation Main View used a 50% render fraction. Its GPU View Uniform report
 
 The known reveal fixture rejected all 174/174 revealed pixels with valid evidence and retained 734 stable background pixels. Both history-rejection EXRs were byte-exact across the two replay processes. This validates the declared scope; it does not extend production certification to unlabeled moving, skeletal or WPO geometry.
 
-The fixture process recorded 81 actors, 105 components, three skeletal components and 180 component-space bones in the formal run. Its pure-skinning gate measured the analytic endpoint displacement within 0.02 display pixels. Its WPO object had 100% native velocity coverage in both endpoint directions: expected `-17.23077/+17.23077` pixels and measured `-17.23032/+17.23033` pixels. The project AnimBP probe produced 17–18 revealed/occluded pixels per direction and rejected every valid revealed pixel. The project material probe showed a maximum mean-RGB logical-time change of `0.421563`, while matching the same logical frame across opposite traversal directions within the numeric color gate. Seven ticking actors lacked `SRDatasetControllable`; their paths/classes are listed for audit rather than automatically treated as failures. GPU particle payload readback and project-authored WPO coverage remain outside this certification scope.
+The fixture process recorded 81 actors, 105 components, three skeletal components and 180 component-space bones in the formal run. Its pure-skinning gate measured the analytic endpoint displacement within 0.02 display pixels. Its WPO object had 100% native velocity coverage in both endpoint directions: expected `-17.23077/+17.23077` pixels and measured `-17.23032/+17.23033` pixels. The project AnimBP probe produced 17–18 revealed/occluded pixels per direction and rejected every valid revealed pixel. The project material probe showed a maximum mean-RGB logical-time change of `0.421563`, while matching the same logical frame across opposite traversal directions within the numeric color gate. Seven ticking actors lacked `SRDatasetControllable`; v0.6.0 now moves this audit to a dedicated pre-warmup report and makes zero unclassified records a configurable hard gate. GPU particle payload readback and project-authored WPO coverage remain outside this certification scope.
 
 Five color files were not byte-identical in the standard replay, but remained inside the numeric gate (HUD-less PSNR at least 61.6 dB in that run). Depth, motion, validity, masks and IDs were exact. Cross-GPU or cross-driver bit identity is not promised.
 

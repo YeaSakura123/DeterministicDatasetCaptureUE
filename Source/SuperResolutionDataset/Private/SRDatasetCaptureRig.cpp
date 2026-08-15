@@ -244,6 +244,7 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 {
 	LastTemporalMetadata = FSRDatasetTemporalFrameMetadata();
 	LastNativeHRMetadata = FSRDatasetTemporalFrameMetadata();
+	LastSceneCaptureLRMetadata = FSRDatasetTemporalFrameMetadata();
 	LastReferenceHRMetadata = FSRDatasetTemporalFrameMetadata();
 	LastHUDlessColorMetadata = FSRDatasetTemporalFrameMetadata();
 	LastHUDlessColorSize = FIntPoint::ZeroValue;
@@ -317,7 +318,9 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 		{
 			return true;
 		}
-		if (Job.bCaptureTemporalDiagnostics && !Job.bCaptureMainViewTemporalDiagnostics)
+		const bool bExtractSceneCaptureDiagnostics = Job.bCaptureTemporalDiagnostics &&
+			(!Job.bCaptureMainViewTemporalDiagnostics || Job.bCaptureSceneCaptureLRComparison);
+		if (bExtractSceneCaptureDiagnostics)
 		{
 			if (!ViewExtension->RequestCapture(Job.LRResolution, Job.HRResolution, false, OutError))
 			{
@@ -332,18 +335,28 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 			return false;
 		}
 
-		if (Job.bCaptureTemporalDiagnostics && !Job.bCaptureMainViewTemporalDiagnostics)
+		if (bExtractSceneCaptureDiagnostics)
 		{
 			FSRDatasetTemporalCaptureResult TemporalResult;
-			if (!ViewExtension->WaitAndTakeCapture(TemporalResult, OutError) ||
-				!SaveTemporalCaptureResult(
-					TemporalResult,
-					LRPath,
-					LogicalFrameNumber,
-					MotionPreviousLogicalFrameId,
-					bHistoryReset,
-					OutHashes,
-					OutError))
+			if (!ViewExtension->WaitAndTakeCapture(TemporalResult, OutError))
+			{
+				return false;
+			}
+			if (Job.bCaptureMainViewTemporalDiagnostics)
+			{
+				if (!SaveSceneCaptureLRHDRColorResult(TemporalResult, LRPath, OutHashes, OutError))
+				{
+					return false;
+				}
+			}
+			else if (!SaveTemporalCaptureResult(
+				TemporalResult,
+				LRPath,
+				LogicalFrameNumber,
+				MotionPreviousLogicalFrameId,
+				bHistoryReset,
+				OutHashes,
+				OutError))
 			{
 				return false;
 			}
@@ -433,6 +446,35 @@ bool ASRDatasetCaptureRig::SaveNativeHDRColorResult(
 	}
 	OutHashes.Add(TEXT("color_hr_native_scene_hdr"), Hash);
 	LastNativeHRMetadata = Result.Metadata;
+	return true;
+}
+
+bool ASRDatasetCaptureRig::SaveSceneCaptureLRHDRColorResult(
+	const FSRDatasetTemporalCaptureResult& Result,
+	const FString& LRPath,
+	TMap<FString, FString>& OutHashes,
+	FString& OutError)
+{
+	const int32 PixelCount = Result.Size.X * Result.Size.Y;
+	if (PixelCount <= 0 || Result.SceneColor.Num() != PixelCount || !Result.Metadata.bValid)
+	{
+		OutError = TEXT("RDG SceneCapture LR comparison color has inconsistent dimensions or metadata.");
+		return false;
+	}
+
+	FImage Image;
+	Image.Init(Result.Size.X, Result.Size.Y, 1, ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+	FMemory::Memcpy(Image.RawData.GetData(), Result.SceneColor.GetData(), Result.SceneColor.Num() * sizeof(FLinearColor));
+	const FString OutputRoot = FPaths::GetPath(FPaths::GetPath(LRPath));
+	const FString FrameName = FPaths::ChangeExtension(FPaths::GetCleanFilename(LRPath), TEXT("exr"));
+	const FString Path = FPaths::Combine(OutputRoot, TEXT("color_lr_scene_capture_hdr"), FrameName);
+	FString Hash;
+	if (!SaveImageAtomic(Path, TEXT("exr"), Image, Hash, OutError))
+	{
+		return false;
+	}
+	OutHashes.Add(TEXT("color_lr_scene_capture_hdr"), Hash);
+	LastSceneCaptureLRMetadata = Result.Metadata;
 	return true;
 }
 
@@ -671,8 +713,10 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 
 	TArray<FLinearColor> HistoryRejection;
 	TArray<FLinearColor> HistoryRejectionValid;
+	TArray<FLinearColor> HistoryRejectionReason;
 	HistoryRejection.SetNumUninitialized(PixelCount);
 	HistoryRejectionValid.SetNumUninitialized(PixelCount);
+	HistoryRejectionReason.SetNumUninitialized(PixelCount);
 	const float DisplayToRenderScale = FMath::IsFinite(Result.Metadata.ResolutionFraction)
 		? Result.Metadata.ResolutionFraction
 		: 0.0f;
@@ -683,11 +727,13 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 			const int32 Index = Y * Result.Size.X + X;
 			float Reject = 1.0f;
 			float Valid = 0.0f;
+			float Reason = 2.0f; // Invalid current inputs.
 			if (bHistoryReset)
 			{
 				// A reset has no reusable history by definition; rejecting every
 				// pixel is exact and therefore valid rather than an approximation.
 				Valid = 1.0f;
+				Reason = 1.0f;
 			}
 			else
 			{
@@ -708,25 +754,32 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 						// Reprojection outside the previous render rect is a definitive
 						// history rejection.
 						Valid = 1.0f;
+						Reason = 3.0f;
 					}
 					else
 					{
 						const int32 PreviousIndex = PreviousY * Result.Size.X + PreviousX;
 						const int32 CurrentId = FMath::RoundToInt(Result.ObjectId[Index].R);
 						const int32 PreviousId = FMath::RoundToInt(PreviousTemporalObjectId[PreviousIndex].R);
-						if (CurrentId != 0 || PreviousId != 0)
+						const bool bAnyLabeled = CurrentId != 0 || PreviousId != 0;
+						const bool bSameLabeledInstance = CurrentId != 0 && CurrentId == PreviousId;
+						const bool bNativeVelocityCovered = CurrentMotion.B >= 0.5f;
+						if (bAnyLabeled && !bSameLabeledInstance)
 						{
-							// Custom Stencil identity is the strongest available signal for
-							// rigid/deforming labeled geometry at its motion-reprojected pixel.
-							Reject = CurrentId == PreviousId ? 0.0f : 1.0f;
+							// Different component identities at the motion-reprojected pixel
+							// are definitive cross-instance occlusion/disocclusion evidence.
+							Reject = 1.0f;
 							Valid = 1.0f;
+							Reason = 4.0f;
 						}
-						else if (CurrentMotion.B >= 0.5f)
+						else if (bNativeVelocityCovered)
 						{
-							// Unlabeled moving geometry lacks a previous-object depth. Reject
-							// conservatively and expose the uncertainty in the validity mask.
+							// Component identity cannot prove surface identity inside a moving
+							// rigid or deforming component. Reject conservatively and expose
+							// the uncertainty instead of emitting over-trusted supervision.
 							Reject = 1.0f;
 							Valid = 0.0f;
+							Reason = bSameLabeledInstance ? 6.0f : 7.0f;
 						}
 						else
 						{
@@ -741,8 +794,16 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 								const float Tolerance = FMath::Max(
 									1.0e-5f,
 									FMath::Abs(ReprojectedDeviceZ) * 2.0e-3f);
-								Reject = PreviousDeviceZ > ReprojectedDeviceZ + Tolerance ? 1.0f : 0.0f;
+								const bool bOccluded = PreviousDeviceZ > ReprojectedDeviceZ + Tolerance;
+								Reject = bOccluded ? 1.0f : 0.0f;
 								Valid = 1.0f;
+								Reason = bOccluded ? 5.0f : 0.0f;
+							}
+							else
+							{
+								Reject = 1.0f;
+								Valid = 0.0f;
+								Reason = 8.0f;
 							}
 						}
 					}
@@ -750,6 +811,7 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 			}
 			HistoryRejection[Index] = FLinearColor(Reject, Reject, Reject, 1.0f);
 			HistoryRejectionValid[Index] = FLinearColor(Valid, Valid, Valid, 1.0f);
+			HistoryRejectionReason[Index] = FLinearColor(Reason, Reason, Reason, 1.0f);
 		}
 	}
 
@@ -770,6 +832,12 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 	Outputs.Add({ TEXT("depth_previous_reprojected_device"), MakeScalarImage(Result.Depth, 3) });
 	Outputs.Add({ TEXT("history_rejection_mask"), MakeScalarPixelsImage(HistoryRejection) });
 	Outputs.Add({ TEXT("history_rejection_valid"), MakeScalarPixelsImage(HistoryRejectionValid) });
+	Outputs.Add({ TEXT("history_rejection_reason"), MakeScalarPixelsImage(HistoryRejectionReason) });
+	// Explicit disocclusion aliases make the supervision discoverable without
+	// changing the established history-rejection modality names.
+	Outputs.Add({ TEXT("disocclusion_mask"), MakeScalarPixelsImage(HistoryRejection) });
+	Outputs.Add({ TEXT("disocclusion_valid"), MakeScalarPixelsImage(HistoryRejectionValid) });
+	Outputs.Add({ TEXT("disocclusion_reason"), MakeScalarPixelsImage(HistoryRejectionReason) });
 	Outputs.Add({ TEXT("translucency_after_dof_raw"), MakeImage(Result.Translucency) });
 	Outputs.Add({ TEXT("transparency_mask"), MakeTransparencyMask() });
 	// First conservative implementation: post-DOF translucency coverage is

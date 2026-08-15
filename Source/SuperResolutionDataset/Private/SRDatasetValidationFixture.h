@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Camera/CameraTypes.h"
 #include "GameFramework/Actor.h"
+#include "SRDatasetTypes.h"
 #include "SRDatasetValidationFixture.generated.h"
 
 class UMaterialInterface;
@@ -17,9 +18,15 @@ struct FSRDatasetValidationFixtureFrame
 {
 	bool bValid = false;
 	int32 LogicalFrame = INDEX_NONE;
+	ESRDatasetSemanticMotionScenario MotionScenario = ESRDatasetSemanticMotionScenario::LegacyCameraRelative;
+	bool bWorldAnchored = false;
+	bool bObjectMotionEnabled = true;
+	FVector CurrentCameraLocationCm = FVector::ZeroVector;
+	FVector PreviousCameraLocationCm = FVector::ZeroVector;
 	float MovingCurrentRightCm = 0.0f;
 	float MovingPreviousRightCm = 0.0f;
 	FVector2f ExpectedMovingMotionDisplayPixels = FVector2f::ZeroVector;
+	FVector2f ExpectedBackgroundMotionDisplayPixels = FVector2f::ZeroVector;
 	float SkeletalCurrentRightCm = 0.0f;
 	float SkeletalPreviousRightCm = 0.0f;
 	FVector2f ExpectedSkeletalMotionDisplayPixels = FVector2f::ZeroVector;
@@ -47,7 +54,8 @@ public:
 		int32 LogicalFrame,
 		int32 StartFrame,
 		FIntPoint DisplaySize,
-		bool bUseLastCapturedEndpointAsPrevious);
+		bool bUseLastCapturedEndpointAsPrevious,
+		ESRDatasetSemanticMotionScenario MotionScenario);
 	void CommitCapturedFrame();
 	const FSRDatasetValidationFixtureFrame& GetFrameMetadata() const { return FrameMetadata; }
 
@@ -69,6 +77,11 @@ private:
 		float RightCm,
 		float UpCm,
 		FVector SizeCm);
+	static bool ProjectWorldToDisplayPixels(
+		const FVector& WorldPosition,
+		const FMinimalViewInfo& CameraView,
+		FIntPoint DisplaySize,
+		FVector2f& OutDisplayPixels);
 
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<USceneComponent> SceneRoot;
@@ -119,7 +132,13 @@ private:
 	TObjectPtr<UNiagaraSystem> NiagaraSystem;
 
 	FSRDatasetValidationFixtureFrame FrameMetadata;
+	bool bHasWorldAnchor = false;
+	FMinimalViewInfo WorldAnchorCameraView;
 	int32 LastEvaluatedFrame = INDEX_NONE;
+	bool bHasLastEvaluatedCameraView = false;
+	FMinimalViewInfo LastEvaluatedCameraView;
+	bool bHasCapturedCameraView = false;
+	FMinimalViewInfo LastCapturedCameraView;
 	float LastMovingRightCm = 0.0f;
 	bool bHasCapturedMovingRight = false;
 	float LastCapturedMovingRightCm = 0.0f;

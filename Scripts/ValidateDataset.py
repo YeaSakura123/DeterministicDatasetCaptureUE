@@ -23,7 +23,7 @@ except ImportError as exc:
     ) from exc
 
 
-TEMPORAL_MODALITIES = (
+TEMPORAL_MODALITIES_V1 = (
     "color_hr_native_scene_hdr",
     "color_lr_scene_hdr",
     "velocity_raw",
@@ -41,7 +41,15 @@ TEMPORAL_MODALITIES = (
     "reactive_mask",
     "object_id",
 )
+DISOCCLUSION_MODALITIES_V2 = (
+    "history_rejection_reason",
+    "disocclusion_mask",
+    "disocclusion_valid",
+    "disocclusion_reason",
+)
+TEMPORAL_MODALITIES = TEMPORAL_MODALITIES_V1 + DISOCCLUSION_MODALITIES_V2
 REFERENCE_MODALITIES = ("color_hr_reference_scene_hdr",)
+SCENE_CAPTURE_LR_COMPARISON_MODALITIES = ("color_lr_scene_capture_hdr",)
 HUDLESS_MODALITIES = ("color_main_view_hudless_after_tonemap",)
 UI_MODALITIES = ("ui_color_alpha",)
 MASK_MODALITIES = {
@@ -50,9 +58,24 @@ MASK_MODALITIES = {
     "depth_valid",
     "history_rejection_mask",
     "history_rejection_valid",
+    "disocclusion_mask",
+    "disocclusion_valid",
+}
+
+HISTORY_REJECTION_REASON_CODES_V2 = {
+    "0": "accepted_static_or_camera_depth",
+    "1": "history_reset",
+    "2": "invalid_current_inputs",
+    "3": "previous_pixel_out_of_bounds",
+    "4": "instance_identity_mismatch",
+    "5": "static_depth_occlusion",
+    "6": "dynamic_same_instance_uncertain",
+    "7": "unlabeled_dynamic_uncertain",
+    "8": "depth_evidence_unavailable",
 }
 COLOR_MODALITIES = {"hr", "lr", "color_lr_scene_hdr"}
 COLOR_MODALITIES.add("color_hr_native_scene_hdr")
+COLOR_MODALITIES.add("color_lr_scene_capture_hdr")
 COLOR_MODALITIES.add("color_hr_reference_scene_hdr")
 COLOR_MODALITIES.add("color_main_view_hudless_after_tonemap")
 COLOR_MODALITIES.add("ui_color_alpha")
@@ -72,6 +95,13 @@ AUXILIARY_CAPTURE_ORDERS = {
     "HighResolutionFirst",
     "LowResolutionFirst",
 }
+SEMANTIC_MOTION_SCENARIOS = {
+    "LegacyCameraRelative",
+    "Static",
+    "CameraOnly",
+    "ObjectOnly",
+    "Mixed",
+}
 REPLAY_METADATA_FIELDS = (
     "logicalFrameId",
     "simulationTick",
@@ -88,6 +118,9 @@ REPLAY_METADATA_FIELDS = (
     "pendingStreamingTextureCount",
     "streamingRequestsWanting",
     "sceneStateSha1",
+    "stableInstanceIdsEnabled",
+    "stableInstanceIdMappingSha1",
+    "stableInstanceIdCount",
     "sceneActorCount",
     "sceneComponentCount",
     "sceneSkeletalComponentCount",
@@ -110,6 +143,7 @@ REPLAY_METADATA_FIELDS = (
     "camera",
     "temporalDiagnostics",
     "nativeHRDiagnostics",
+    "sceneCaptureLRComparisonDiagnostics",
     "referenceHRDiagnostics",
     "hudlessColorDiagnostics",
     "uiColorAlphaDiagnostics",
@@ -296,6 +330,38 @@ def numeric_comparison(left: np.ndarray, right: np.ndarray) -> dict[str, float |
     }
 
 
+def translate_bilinear(
+    pixels: np.ndarray, shift_x: float, shift_y: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Translate an HxWxC image; output(x,y) samples input(x-shift_x,y-shift_y)."""
+    height, width = pixels.shape[:2]
+    output_y, output_x = np.mgrid[0:height, 0:width]
+    source_x = output_x.astype(np.float64) - float(shift_x)
+    source_y = output_y.astype(np.float64) - float(shift_y)
+    x0 = np.floor(source_x).astype(np.int64)
+    y0 = np.floor(source_y).astype(np.int64)
+    x1 = x0 + 1
+    y1 = y0 + 1
+    valid = (x0 >= 0) & (y0 >= 0) & (x1 < width) & (y1 < height)
+    clipped_x0 = np.clip(x0, 0, width - 1)
+    clipped_x1 = np.clip(x1, 0, width - 1)
+    clipped_y0 = np.clip(y0, 0, height - 1)
+    clipped_y1 = np.clip(y1, 0, height - 1)
+    weight_x = (source_x - x0)[..., None]
+    weight_y = (source_y - y0)[..., None]
+    top = (
+        pixels[clipped_y0, clipped_x0] * (1.0 - weight_x)
+        + pixels[clipped_y0, clipped_x1] * weight_x
+    )
+    bottom = (
+        pixels[clipped_y1, clipped_x0] * (1.0 - weight_x)
+        + pixels[clipped_y1, clipped_x1] * weight_x
+    )
+    return (top * (1.0 - weight_y) + bottom * weight_y).astype(
+        np.float32, copy=False
+    ), valid
+
+
 def write_heatmap(left: np.ndarray, right: np.ndarray, path: Path) -> None:
     difference = np.max(np.abs(left.astype(np.float64)[..., :3] - right.astype(np.float64)[..., :3]), axis=-1)
     robust_scale = max(float(np.quantile(difference, 0.99)), float(np.max(difference)) * 0.1, 1e-12)
@@ -389,6 +455,8 @@ def validate_temporal_frame(
     lr_size: tuple[int, int],
     hr_size: tuple[int, int],
     main_view: bool,
+    scene_capture_lr_comparison: bool,
+    pixel_domain_required: bool,
     cvars: dict[str, Any],
 ) -> None:
     frame_id = int(frame["logicalFrameId"])
@@ -473,6 +541,166 @@ def validate_temporal_frame(
             bool(np.allclose(native_unjittered, matrix(temporal.get("viewToClipCurrentUnjittered")), rtol=0.0, atol=1e-6))
             and bool(np.allclose(native_view, main_view_matrix, rtol=0.0, atol=1e-6)),
             f"projection_max_error={float(np.max(np.abs(native_unjittered - matrix(temporal.get('viewToClipCurrentUnjittered'))))):.9g} view_max_error={float(np.max(np.abs(native_view - main_view_matrix))):.9g}",
+        )
+
+    scene_capture_lr = frame.get("sceneCaptureLRComparisonDiagnostics")
+    add_check(
+        checks,
+        f"{prefix}.scene_capture_lr_comparison_metadata",
+        isinstance(scene_capture_lr, dict) is scene_capture_lr_comparison,
+        f"expected={scene_capture_lr_comparison} present={isinstance(scene_capture_lr, dict)}",
+    )
+    if scene_capture_lr_comparison and isinstance(scene_capture_lr, dict):
+        validate_mip_bias_metadata(
+            checks,
+            f"{prefix}.scene_capture_lr",
+            scene_capture_lr,
+            expected_full_resolution_mip_bias,
+            global_mip_bias,
+        )
+        scene_jitter = np.asarray(
+            scene_capture_lr.get("jitterCurrentNDC", (math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        scene_jittered = matrix(scene_capture_lr.get("viewToClipCurrentJittered"))
+        scene_unjittered = matrix(scene_capture_lr.get("viewToClipCurrentUnjittered"))
+        scene_view = matrix(scene_capture_lr.get("translatedWorldToViewCurrent"))
+        main_projection = matrix(temporal.get("viewToClipCurrentUnjittered"))
+        main_view_matrix = matrix(temporal.get("translatedWorldToViewCurrent"))
+        add_check(
+            checks,
+            f"{prefix}.scene_capture_lr_contract",
+            tuple(scene_capture_lr.get("renderSize", ())) == lr_size
+            and tuple(scene_capture_lr.get("displaySize", ())) == hr_size
+            and scene_capture_lr.get("pipelineStage")
+            == "after_dof_before_temporal_upscaler"
+            and scene_capture_lr.get("colorSpace") == "linear_scene_rgb"
+            and scene_capture_lr.get("preExposed") is True
+            and scene_capture_lr.get("viewState")
+            == "isolated_native_lr_scene_capture"
+            and scene_capture_lr.get("historyAdvance") is False
+            and scene_capture_lr.get("simulationAdvance") is False
+            and scene_capture_lr.get("pixelAlignment")
+            == "scene_capture_resampled_to_main_view_using_main_view_current_render_pixel_jitter",
+            json.dumps(
+                {
+                    key: scene_capture_lr.get(key)
+                    for key in (
+                        "renderSize",
+                        "displaySize",
+                        "pipelineStage",
+                        "colorSpace",
+                        "preExposed",
+                        "viewState",
+                        "historyAdvance",
+                        "simulationAdvance",
+                        "pixelAlignment",
+                    )
+                },
+                sort_keys=True,
+            ),
+        )
+        add_check(
+            checks,
+            f"{prefix}.scene_capture_lr_fixed_grid",
+            scene_capture_lr.get("fixedOutputGrid") is True
+            and bool(np.allclose(scene_jitter, 0.0, rtol=0.0, atol=1e-7))
+            and bool(
+                np.allclose(
+                    scene_jittered, scene_unjittered, rtol=0.0, atol=1e-7
+                )
+            ),
+            f"jitter={scene_jitter.tolist()} fixed={scene_capture_lr.get('fixedOutputGrid')}",
+        )
+        add_check(
+            checks,
+            f"{prefix}.scene_capture_lr_main_view_alignment",
+            bool(np.allclose(scene_unjittered, main_projection, rtol=0.0, atol=1e-6))
+            and bool(np.allclose(scene_view, main_view_matrix, rtol=0.0, atol=1e-6)),
+            f"projection_max_error={float(np.max(np.abs(scene_unjittered - main_projection))):.9g} "
+            f"view_max_error={float(np.max(np.abs(scene_view - main_view_matrix))):.9g}",
+        )
+        main_pre_exposure = float(temporal.get("preExposure", math.nan))
+        scene_pre_exposure = float(scene_capture_lr.get("preExposure", math.nan))
+        add_check(
+            checks,
+            f"{prefix}.scene_capture_lr_exposure_valid",
+            math.isfinite(main_pre_exposure)
+            and main_pre_exposure > 0.0
+            and math.isfinite(scene_pre_exposure)
+            and scene_pre_exposure > 0.0,
+            f"main={main_pre_exposure} scene_capture={scene_pre_exposure}",
+        )
+
+        main_pixels = pixels.get("color_lr_scene_hdr")
+        scene_pixels = pixels.get("color_lr_scene_capture_hdr")
+        pixel_metrics: dict[str, Any] = {"valid": False, "reason": "missing pixels"}
+        pixel_gate = False
+        if (
+            main_pixels is not None
+            and scene_pixels is not None
+            and main_pixels.shape == scene_pixels.shape
+            and math.isfinite(main_pre_exposure)
+            and main_pre_exposure > 0.0
+            and math.isfinite(scene_pre_exposure)
+            and scene_pre_exposure > 0.0
+        ):
+            main_scene_rgb = main_pixels[..., :3] / main_pre_exposure
+            isolated_scene_rgb = scene_pixels[..., :3] / scene_pre_exposure
+            jitter = np.asarray(
+                temporal.get("jitterCurrentRenderPixel", (math.nan, math.nan)),
+                dtype=np.float64,
+            )
+            if jitter.shape == (2,) and bool(np.isfinite(jitter).all()):
+                aligned_scene, valid = translate_bilinear(
+                    isolated_scene_rgb, float(jitter[0]), float(jitter[1])
+                )
+                opposite_scene, opposite_valid = translate_bilinear(
+                    isolated_scene_rgb, -float(jitter[0]), -float(jitter[1])
+                )
+                border = 2
+                interior = np.zeros(valid.shape, dtype=bool)
+                if valid.shape[0] > 2 * border and valid.shape[1] > 2 * border:
+                    interior[border:-border, border:-border] = True
+                valid &= interior
+                opposite_valid &= interior
+                aligned_metrics = numeric_comparison(
+                    main_scene_rgb[valid], aligned_scene[valid]
+                )
+                opposite_metrics = numeric_comparison(
+                    main_scene_rgb[opposite_valid], opposite_scene[opposite_valid]
+                )
+                robust_peak = max(
+                    float(np.quantile(np.abs(main_scene_rgb[valid]), 0.99)),
+                    float(np.quantile(np.abs(aligned_scene[valid]), 0.99)),
+                    1.0e-3,
+                )
+                normalized_mean_abs = float(aligned_metrics.get("meanAbs", math.inf)) / robust_peak
+                aligned_better = float(aligned_metrics.get("meanAbs", math.inf)) <= (
+                    float(opposite_metrics.get("meanAbs", math.inf)) + 1.0e-7
+                )
+                pixel_metrics = {
+                    "valid": bool(aligned_metrics.get("valid", False)),
+                    "alignmentShiftRenderPixels": jitter.tolist(),
+                    "comparedPixelCount": int(np.count_nonzero(valid)),
+                    "robustPeakP99": robust_peak,
+                    "normalizedMeanAbs": normalized_mean_abs,
+                    "aligned": aligned_metrics,
+                    "oppositeSign": opposite_metrics,
+                    "alignedSignNoWorse": aligned_better,
+                }
+                pixel_gate = bool(
+                    aligned_metrics.get("valid", False)
+                    and aligned_better
+                    and normalized_mean_abs <= 0.05
+                    and float(aligned_metrics.get("psnrDb", -math.inf)) >= 20.0
+                )
+        add_check(
+            checks,
+            f"{prefix}.main_view_scene_capture_pixel_domain",
+            pixel_gate,
+            json.dumps(pixel_metrics, sort_keys=True),
+            required=pixel_domain_required,
         )
 
     reference_enabled = bool(frame.get("referenceHRDiagnostics"))
@@ -635,7 +863,7 @@ def validate_temporal_frame(
         f"max_error={float(np.max(np.abs(world_to_view @ current_projection - world_to_clip))):.9g}",
     )
 
-    needed = set(TEMPORAL_MODALITIES) - {"color_lr_scene_hdr"}
+    needed = set(TEMPORAL_MODALITIES_V1) - {"color_lr_scene_hdr"}
     if not needed.issubset(pixels):
         return
     velocity_raw = pixels["velocity_raw"]
@@ -659,13 +887,21 @@ def validate_temporal_frame(
         bool(np.isfinite(depth_previous_reprojected).all() and np.min(depth_previous_reprojected) >= 0.0),
         f"min={float(np.min(depth_previous_reprojected)):.9g} max={float(np.max(depth_previous_reprojected)):.9g}",
     )
+    history_rejection_source = temporal.get("historyRejectionSource")
+    history_rejection_v2 = (
+        history_rejection_source
+        == "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
+    )
     add_check(
         checks,
         f"{prefix}.history_rejection_contract",
         temporal.get("historyRejectionDefinition")
         == "one_rejects_previous_history_at_motion_reprojected_pixel"
-        and temporal.get("historyRejectionSource")
-        == "custom_stencil_identity_else_static_camera_depth_reprojection_v1"
+        and history_rejection_source
+        in {
+            "custom_stencil_identity_else_static_camera_depth_reprojection_v1",
+            "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2",
+        }
         and temporal.get("historyRejectionTrainingUsable") is True
         and temporal.get("historyRejectionRequiresValidityMask") is True
         and temporal.get("historyRejectionProductionCertified") is False,
@@ -683,6 +919,59 @@ def validate_temporal_frame(
             sort_keys=True,
         ),
     )
+    if history_rejection_v2:
+        v2_present = set(DISOCCLUSION_MODALITIES_V2).issubset(pixels)
+        add_check(
+            checks,
+            f"{prefix}.disocclusion_v2_modalities",
+            v2_present,
+            "history rejection reason plus explicit disocclusion mask/valid/reason aliases",
+        )
+        if v2_present:
+            history_reason = pixels["history_rejection_reason"][..., 0]
+            disocclusion = pixels["disocclusion_mask"][..., 0]
+            disocclusion_valid = pixels["disocclusion_valid"][..., 0]
+            disocclusion_reason = pixels["disocclusion_reason"][..., 0]
+            reason_integer = np.rint(history_reason)
+            reason_contract = temporal.get("historyRejectionReasonCodes")
+            add_check(
+                checks,
+                f"{prefix}.disocclusion_alias_exact",
+                bool(
+                    np.array_equal(disocclusion, history_rejection)
+                    and np.array_equal(disocclusion_valid, history_rejection_valid)
+                    and np.array_equal(disocclusion_reason, history_reason)
+                    and temporal.get("disocclusionMaskAlias")
+                    == "history_rejection_mask"
+                    and temporal.get("disocclusionValidityAlias")
+                    == "history_rejection_valid"
+                    and temporal.get("disocclusionReasonAlias")
+                    == "history_rejection_reason"
+                ),
+                "disocclusion files and metadata are exact history-rejection aliases",
+            )
+            add_check(
+                checks,
+                f"{prefix}.history_rejection_reason_codes",
+                bool(
+                    np.array_equal(history_reason, reason_integer)
+                    and np.all((reason_integer >= 0.0) & (reason_integer <= 8.0))
+                    and reason_contract == HISTORY_REJECTION_REASON_CODES_V2
+                ),
+                f"values={np.unique(history_reason).tolist()} contract={json.dumps(reason_contract, sort_keys=True)}",
+            )
+            reason = reason_integer.astype(np.int32)
+            expected_reject = np.where(reason == 0, 0.0, 1.0)
+            expected_valid = np.isin(reason, (0, 1, 3, 4, 5)).astype(np.float32)
+            add_check(
+                checks,
+                f"{prefix}.history_rejection_reason_semantics",
+                bool(
+                    np.array_equal(history_rejection, expected_reject)
+                    and np.array_equal(history_rejection_valid, expected_valid)
+                ),
+                "reason 0 keeps; 1/3/4/5 reject-valid; 2/6/7/8 reject-invalid",
+            )
     if frame.get("reset") is True:
         add_check(
             checks,
@@ -690,6 +979,13 @@ def validate_temporal_frame(
             bool(np.all(history_rejection == 1.0) and np.all(history_rejection_valid == 1.0)),
             f"reject_mean={float(np.mean(history_rejection)):.9g} valid_mean={float(np.mean(history_rejection_valid)):.9g}",
         )
+        if history_rejection_v2 and "history_rejection_reason" in pixels:
+            add_check(
+                checks,
+                f"{prefix}.history_rejection_reset_reason",
+                bool(np.all(pixels["history_rejection_reason"][..., 0] == 1.0)),
+                "all reset pixels use reason 1",
+            )
     else:
         add_check(
             checks,
@@ -740,7 +1036,11 @@ def validate_temporal_frame(
     add_check(
         checks,
         f"{prefix}.object_id_contract",
-        temporal.get("objectIdSource") == "custom_stencil_uint8_zero_unlabeled",
+        temporal.get("objectIdSource")
+        in {
+            "custom_stencil_uint8_zero_unlabeled",
+            "stable_component_unique_custom_stencil_uint8_zero_background",
+        },
         str(temporal.get("objectIdSource")),
     )
 
@@ -781,6 +1081,176 @@ def validate_temporal_frame(
         )
 
 
+def validate_history_rejection_v2_cross_frame(
+    checks: list[dict[str, Any]],
+    frames: list[dict[str, Any]],
+    frame_paths: dict[tuple[int, str], Path],
+) -> None:
+    """Independently reconstruct the v2 per-pixel rejection policy."""
+
+    for frame in frames:
+        temporal = frame.get("temporalDiagnostics")
+        if (
+            not isinstance(temporal, dict)
+            or temporal.get("historyRejectionSource")
+            != "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
+            or frame.get("reset") is True
+        ):
+            continue
+        frame_id = int(frame["logicalFrameId"])
+        previous_frame_id = int(
+            frame.get("motionPreviousLogicalFrameId", frame_id)
+        )
+        current_names = (
+            "motion_full_current_to_previous",
+            "motion_valid",
+            "depth_valid",
+            "depth_previous_reprojected_device",
+            "velocity_coverage",
+            "object_id",
+            "history_rejection_mask",
+            "history_rejection_valid",
+            "history_rejection_reason",
+        )
+        previous_names = ("depth_device_raw", "object_id")
+        paths_present = all(
+            (frame_id, name) in frame_paths for name in current_names
+        ) and all(
+            (previous_frame_id, name) in frame_paths for name in previous_names
+        )
+        prefix = f"frame_{frame_id:06d}.history_rejection_v2"
+        add_check(
+            checks,
+            f"{prefix}.cross_frame_inputs",
+            paths_present,
+            f"previousLogicalFrameId={previous_frame_id}",
+        )
+        if not paths_present:
+            continue
+
+        current = {
+            name: exr_rgba(frame_paths[(frame_id, name)])
+            for name in current_names
+        }
+        previous = {
+            name: exr_rgba(frame_paths[(previous_frame_id, name)])
+            for name in previous_names
+        }
+        motion = current["motion_full_current_to_previous"]
+        motion_valid = current["motion_valid"][..., 0]
+        depth_valid = current["depth_valid"][..., 0]
+        previous_reprojected_depth = current[
+            "depth_previous_reprojected_device"
+        ][..., 0]
+        velocity_coverage = current["velocity_coverage"][..., 0]
+        current_id = np.rint(current["object_id"][..., 0]).astype(np.int32)
+        previous_id_image = np.rint(previous["object_id"][..., 0]).astype(
+            np.int32
+        )
+        previous_depth_image = previous["depth_device_raw"][..., 0]
+        actual_reject = current["history_rejection_mask"][..., 0]
+        actual_valid = current["history_rejection_valid"][..., 0]
+        actual_reason = current["history_rejection_reason"][..., 0]
+
+        height, width = motion_valid.shape
+        yy, xx = np.mgrid[:height, :width]
+        resolution_fraction = float(temporal.get("resolutionFraction", 0.0))
+        reprojection_x = xx + motion[..., 0] * resolution_fraction
+        reprojection_y = yy + motion[..., 1] * resolution_fraction
+        # FMath::RoundToInt uses nearest integer with half values away from zero.
+        previous_x = np.where(
+            reprojection_x >= 0.0,
+            np.floor(reprojection_x + 0.5),
+            np.ceil(reprojection_x - 0.5),
+        ).astype(np.int64)
+        previous_y = np.where(
+            reprojection_y >= 0.0,
+            np.floor(reprojection_y + 0.5),
+            np.ceil(reprojection_y - 0.5),
+        ).astype(np.int64)
+
+        expected_reject = np.ones((height, width), dtype=np.float32)
+        expected_valid = np.zeros((height, width), dtype=np.float32)
+        expected_reason = np.full((height, width), 2.0, dtype=np.float32)
+        inputs_valid = (
+            (depth_valid >= 0.5)
+            & (motion_valid >= 0.5)
+            & math.isfinite(resolution_fraction)
+            & (resolution_fraction > 0.0)
+            & np.isfinite(motion[..., 0])
+            & np.isfinite(motion[..., 1])
+        )
+        in_bounds = (
+            inputs_valid
+            & (previous_x >= 0)
+            & (previous_y >= 0)
+            & (previous_x < width)
+            & (previous_y < height)
+        )
+        out_of_bounds = inputs_valid & ~in_bounds
+        expected_valid[out_of_bounds] = 1.0
+        expected_reason[out_of_bounds] = 3.0
+
+        safe_x = np.clip(previous_x, 0, width - 1)
+        safe_y = np.clip(previous_y, 0, height - 1)
+        previous_id = previous_id_image[safe_y, safe_x]
+        previous_depth = previous_depth_image[safe_y, safe_x]
+        any_labeled = (current_id != 0) | (previous_id != 0)
+        same_labeled = (current_id != 0) & (current_id == previous_id)
+        identity_mismatch = in_bounds & any_labeled & ~same_labeled
+        expected_valid[identity_mismatch] = 1.0
+        expected_reason[identity_mismatch] = 4.0
+
+        identity_not_decisive = in_bounds & ~identity_mismatch
+        native_velocity = identity_not_decisive & (velocity_coverage >= 0.5)
+        expected_reason[native_velocity & same_labeled] = 6.0
+        expected_reason[native_velocity & ~same_labeled] = 7.0
+
+        depth_candidate = identity_not_decisive & ~native_velocity
+        depth_evidence = (
+            depth_candidate
+            & (previous_depth > 0.0)
+            & (previous_reprojected_depth > 0.0)
+            & np.isfinite(previous_depth)
+            & np.isfinite(previous_reprojected_depth)
+        )
+        tolerance = np.maximum(
+            1.0e-5, np.abs(previous_reprojected_depth) * 2.0e-3
+        )
+        depth_occlusion = depth_evidence & (
+            previous_depth > previous_reprojected_depth + tolerance
+        )
+        depth_accept = depth_evidence & ~depth_occlusion
+        expected_reject[depth_accept] = 0.0
+        expected_valid[depth_accept] = 1.0
+        expected_reason[depth_accept] = 0.0
+        expected_valid[depth_occlusion] = 1.0
+        expected_reason[depth_occlusion] = 5.0
+        expected_reason[depth_candidate & ~depth_evidence] = 8.0
+
+        reject_mismatch = int(np.count_nonzero(actual_reject != expected_reject))
+        valid_mismatch = int(np.count_nonzero(actual_valid != expected_valid))
+        reason_mismatch = int(np.count_nonzero(actual_reason != expected_reason))
+        add_check(
+            checks,
+            f"{prefix}.independent_reconstruction",
+            reject_mismatch == 0 and valid_mismatch == 0 and reason_mismatch == 0,
+            json.dumps(
+                {
+                    "pixels": width * height,
+                    "rejectMismatch": reject_mismatch,
+                    "validMismatch": valid_mismatch,
+                    "reasonMismatch": reason_mismatch,
+                    "reasonCounts": {
+                        str(code): int(np.count_nonzero(actual_reason == code))
+                        for code in range(9)
+                    },
+                },
+                sort_keys=True,
+            ),
+        )
+
+
 def validate_semantic_fixture_frame(
     checks: list[dict[str, Any]],
     frame: dict[str, Any],
@@ -792,6 +1262,7 @@ def validate_semantic_fixture_frame(
     required_modalities = {
         "object_id",
         "motion_full_current_to_previous",
+        "motion_valid",
         "velocity_coverage",
         "depth_view_linear_meters",
         "depth_valid",
@@ -807,8 +1278,17 @@ def validate_semantic_fixture_frame(
         return
 
     object_id = np.rint(pixels["object_id"][..., 0]).astype(np.int32)
+    motion_valid = pixels["motion_valid"][..., 0]
     velocity_coverage = pixels["velocity_coverage"][..., 0]
     intermediate_replay = frame.get("replayPass") == "FrameGenerationIntermediate"
+    motion_scenario = str(fixture.get("motionScenario") or "LegacyCameraRelative")
+    object_motion_enabled = fixture.get("objectMotionEnabled") is True
+    add_check(
+        checks,
+        f"{prefix}.analytic_projection_valid",
+        fixture.get("analyticProjectionValid") is True,
+        f"scenario={motion_scenario} worldAnchored={fixture.get('worldAnchored')}",
+    )
 
     def validate_motion_object(
         label: str,
@@ -817,6 +1297,7 @@ def validate_semantic_fixture_frame(
         minimum_pixels: int,
         reset_tolerance: float,
         motion_tolerance: float,
+        require_velocity_coverage: bool,
     ) -> None:
         mask = object_id == stencil_id
         visible_pixels = int(np.count_nonzero(mask))
@@ -832,13 +1313,27 @@ def validate_semantic_fixture_frame(
         covered = mask & (velocity_coverage == 1.0)
         covered_count = int(np.count_nonzero(covered))
         covered_fraction = covered_count / visible_pixels
+        full_motion_valid = mask & (motion_valid == 1.0)
+        full_motion_valid_count = int(np.count_nonzero(full_motion_valid))
+        full_motion_valid_fraction = full_motion_valid_count / visible_pixels
         expected_is_finite = expected_motion.shape == (2,) and bool(
             np.all(np.isfinite(expected_motion))
         )
         expected_is_moving = expected_is_finite and bool(
             np.max(np.abs(expected_motion)) > reset_tolerance
         )
-        if (not frame.get("reset", False) or intermediate_replay) and expected_is_moving:
+        if not frame.get("reset", False) or intermediate_replay:
+            add_check(
+                checks,
+                f"{prefix}.{label}_full_motion_valid",
+                full_motion_valid_fraction >= 0.75,
+                f"valid={full_motion_valid_count} fraction={full_motion_valid_fraction:.9f}",
+            )
+        if (
+            require_velocity_coverage
+            and (not frame.get("reset", False) or intermediate_replay)
+            and expected_is_moving
+        ):
             add_check(
                 checks,
                 f"{prefix}.{label}_velocity_coverage",
@@ -854,19 +1349,20 @@ def validate_semantic_fixture_frame(
                 f"max_abs={float(np.max(np.abs(reset_motion))):.9g}",
             )
         elif not expected_is_moving:
-            static_motion = pixels["motion_full_current_to_previous"][mask, :2]
+            static_motion = pixels["motion_full_current_to_previous"][full_motion_valid, :2]
             add_check(
                 checks,
                 f"{prefix}.{label}_static_motion_zero",
                 expected_is_finite
+                and bool(static_motion.size)
                 and bool(np.max(np.abs(static_motion)) <= reset_tolerance),
                 f"expected={expected_motion.tolist()} "
-                f"max_abs={float(np.max(np.abs(static_motion))):.9g} "
-                f"covered={covered_count}",
+                f"max_abs={float(np.max(np.abs(static_motion))) if static_motion.size else math.nan:.9g} "
+                f"valid={full_motion_valid_count} covered={covered_count}",
             )
-        elif covered_count:
+        elif full_motion_valid_count:
             measured_motion = np.median(
-                pixels["motion_full_current_to_previous"][covered, :2].astype(np.float64),
+                pixels["motion_full_current_to_previous"][full_motion_valid, :2].astype(np.float64),
                 axis=0,
             )
             error = np.abs(measured_motion - expected_motion)
@@ -888,6 +1384,19 @@ def validate_semantic_fixture_frame(
         8,
         1e-4,
         1.5,
+        object_motion_enabled,
+    )
+    validate_motion_object(
+        "background",
+        int(fixture.get("backgroundObjectId", -1)),
+        np.asarray(
+            fixture.get("expectedBackgroundMotionDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        ),
+        32,
+        1e-4,
+        1.0,
+        False,
     )
     validate_motion_object(
         "skeletal",
@@ -899,6 +1408,7 @@ def validate_semantic_fixture_frame(
         32,
         0.01,
         2.0,
+        object_motion_enabled,
     )
     validate_motion_object(
         "wpo",
@@ -910,6 +1420,7 @@ def validate_semantic_fixture_frame(
         32,
         0.01,
         1.5,
+        object_motion_enabled,
     )
 
     linear_depth = pixels["depth_view_linear_meters"][..., 0]
@@ -982,6 +1493,393 @@ def validate_semantic_fixture_frame(
         )
 
 
+def validate_scene_control_preflight(
+    dataset: Path,
+    manifest: dict[str, Any],
+    job: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> None:
+    enabled = bool(job.get("bRunSceneControlPreflight", False))
+    required = bool(job.get("bRequireSceneControlPreflight", False))
+    manifest_state = manifest.get("sceneControlPreflight", {})
+    contract = manifest.get("determinismContract", {})
+    add_check(
+        checks,
+        "scene_control_preflight.job_contract",
+        not required or enabled,
+        f"enabled={enabled} required={required}",
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.manifest_contract",
+        isinstance(manifest_state, dict)
+        and manifest_state.get("enabled") is enabled
+        and manifest_state.get("required") is required
+        and contract.get("sceneControlPreflightEnabled") is enabled
+        and contract.get("sceneControlPreflightRequired") is required
+        and contract.get("sceneControlPreflightScope")
+        == "registered_ticking_actors_and_components_loaded_niagara_data_interfaces_and_material_time_per_instance_random_particle_random_expressions",
+        json.dumps(manifest_state, sort_keys=True),
+    )
+    if not enabled:
+        return
+
+    relative_report = manifest_state.get("file")
+    try:
+        report_path = safe_dataset_file(dataset, relative_report)
+    except (TypeError, ValueError) as exc:
+        add_check(checks, "scene_control_preflight.safe_path", False, str(exc))
+        return
+    add_check(
+        checks,
+        "scene_control_preflight.file_present",
+        report_path.is_file(),
+        str(report_path),
+    )
+    if not report_path.is_file():
+        return
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        add_check(checks, "scene_control_preflight.json", False, str(exc))
+        return
+
+    add_check(
+        checks,
+        "scene_control_preflight.schema_and_flags",
+        report.get("schemaVersion") == 1
+        and report.get("ran") is True
+        and report.get("required") is required
+        and manifest_state.get("ran") is True,
+        json.dumps(
+            {
+                "schemaVersion": report.get("schemaVersion"),
+                "ran": report.get("ran"),
+                "required": report.get("required"),
+            },
+            sort_keys=True,
+        ),
+    )
+
+    array_fields = (
+        "controlledTickingActors",
+        "allowedTickingActors",
+        "uncontrolledTickingActors",
+        "controlledTickingComponents",
+        "allowedTickingComponents",
+        "uncontrolledTickingComponents",
+        "niagaraDataInterfaces",
+        "allowedNiagaraDataInterfaces",
+        "uncontrolledNiagaraDataInterfaces",
+        "controlledMaterialInputs",
+        "allowedMaterialInputs",
+        "uncontrolledMaterialInputs",
+    )
+    arrays: dict[str, list[str]] = {}
+    arrays_valid = True
+    for field in array_fields:
+        value = report.get(field)
+        valid = (
+            isinstance(value, list)
+            and all(isinstance(item, str) and item for item in value)
+            and value == sorted(value)
+            and len(value) == len(set(value))
+        )
+        arrays_valid = arrays_valid and valid
+        arrays[field] = value if isinstance(value, list) else []
+    add_check(
+        checks,
+        "scene_control_preflight.sorted_unique_records",
+        arrays_valid,
+        json.dumps({field: len(arrays[field]) for field in array_fields}, sort_keys=True),
+    )
+
+    allowlists = report.get("allowlists", {})
+    allowlist_fields = {
+        "tickingActorClassPaths": "sceneControlAllowedTickingActorClassPaths",
+        "tickingComponentClassPaths": "sceneControlAllowedTickingComponentClassPaths",
+        "niagaraDataInterfaceClassPaths": "sceneControlAllowedNiagaraDataInterfaceClassPaths",
+        "materialExpressionClassPaths": "sceneControlAllowedMaterialExpressionClassPaths",
+    }
+    normalized_allowlists: dict[str, list[str]] = {}
+    allowlists_valid = isinstance(allowlists, dict)
+    for report_field, job_field in allowlist_fields.items():
+        value = allowlists.get(report_field, []) if isinstance(allowlists, dict) else []
+        expected = sorted(str(item).strip() for item in job.get(job_field, []))
+        valid = (
+            isinstance(value, list)
+            and all(isinstance(item, str) and item for item in value)
+            and value == sorted(value)
+            and len(value) == len(set(value))
+            and value == expected
+        )
+        allowlists_valid = allowlists_valid and valid
+        normalized_allowlists[report_field] = value if isinstance(value, list) else []
+    add_check(
+        checks,
+        "scene_control_preflight.allowlists_exact",
+        allowlists_valid,
+        json.dumps(normalized_allowlists, sort_keys=True),
+    )
+
+    counts = report.get("counts", {})
+    counts_valid = isinstance(counts, dict) and all(
+        counts.get(field) == len(arrays[field]) for field in array_fields
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.counts_exact",
+        counts_valid,
+        json.dumps(counts, sort_keys=True),
+    )
+
+    canonical_lines = ["schemaVersion=1", f"required={1 if required else 0}"]
+    canonical_allowlist_labels = {
+        "tickingActorClassPaths": "allowedTickingActorClassPath",
+        "tickingComponentClassPaths": "allowedTickingComponentClassPath",
+        "niagaraDataInterfaceClassPaths": "allowedNiagaraDataInterfaceClassPath",
+        "materialExpressionClassPaths": "allowedMaterialExpressionClassPath",
+    }
+    for field, label in canonical_allowlist_labels.items():
+        canonical_lines.extend(f"{label}|{value}" for value in normalized_allowlists[field])
+    canonical_array_labels = {
+        "controlledTickingActors": "controlledTickingActor",
+        "allowedTickingActors": "allowedTickingActor",
+        "uncontrolledTickingActors": "uncontrolledTickingActor",
+        "controlledTickingComponents": "controlledTickingComponent",
+        "allowedTickingComponents": "allowedTickingComponent",
+        "uncontrolledTickingComponents": "uncontrolledTickingComponent",
+        "niagaraDataInterfaces": "niagaraDataInterface",
+        "allowedNiagaraDataInterfaces": "allowedNiagaraDataInterface",
+        "uncontrolledNiagaraDataInterfaces": "uncontrolledNiagaraDataInterface",
+        "controlledMaterialInputs": "controlledMaterialInput",
+        "allowedMaterialInputs": "allowedMaterialInput",
+        "uncontrolledMaterialInputs": "uncontrolledMaterialInput",
+    }
+    for field, label in canonical_array_labels.items():
+        canonical_lines.extend(f"{label}|{value}" for value in arrays[field])
+    calculated_hash = hashlib.sha1("\n".join(canonical_lines).encode("utf-8")).hexdigest().upper()
+    report_hash = str(report.get("sha1", ""))
+    expected_scope = (
+        "schema_required_sorted_allowlist_rules_and_classified_tick_niagara_di_material_input_records"
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.sha1",
+        len(report_hash) == 40
+        and report_hash == calculated_hash
+        and manifest_state.get("sha1") == report_hash
+        and report.get("hashScope") == expected_scope
+        and manifest_state.get("hashScope") == expected_scope,
+        f"reported={report_hash} calculated={calculated_hash}",
+    )
+
+    uncontrolled_fields = (
+        "uncontrolledTickingActors",
+        "uncontrolledTickingComponents",
+        "uncontrolledNiagaraDataInterfaces",
+        "uncontrolledMaterialInputs",
+    )
+    derived_passed = all(not arrays[field] for field in uncontrolled_fields)
+    manifest_count_fields = {
+        "uncontrolledTickingActors": "uncontrolledTickingActorCount",
+        "uncontrolledTickingComponents": "uncontrolledTickingComponentCount",
+        "uncontrolledNiagaraDataInterfaces": "uncontrolledNiagaraDataInterfaceCount",
+        "uncontrolledMaterialInputs": "uncontrolledMaterialInputCount",
+    }
+    manifest_counts_valid = all(
+        manifest_state.get(manifest_count_fields[field]) == len(arrays[field])
+        for field in uncontrolled_fields
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.outcome_consistent",
+        report.get("passed") is derived_passed
+        and manifest_state.get("passed") is derived_passed
+        and contract.get("sceneControlPreflightPassed") is derived_passed
+        and manifest_counts_valid,
+        f"derived={derived_passed} report={report.get('passed')} manifest={manifest_state.get('passed')}",
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.strict_gate",
+        derived_passed,
+        json.dumps({field: len(arrays[field]) for field in uncontrolled_fields}, sort_keys=True),
+        required=required,
+    )
+
+
+def validate_stable_instance_ids(
+    dataset: Path,
+    manifest: dict[str, Any],
+    job: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> tuple[str, set[int]]:
+    enabled = bool(job.get("bAssignStableInstanceIds", False))
+    state = manifest.get("stableInstanceIds")
+    contract = manifest.get("determinismContract", {})
+    if not enabled:
+        legacy_or_disabled = state is None or bool(state.get("enabled", False)) is False
+        add_check(
+            checks,
+            "stable_instance_ids.disabled_contract",
+            legacy_or_disabled
+            and bool(contract.get("objectIdInstanceUnique", False)) is False,
+            json.dumps(
+                {
+                    "manifest": state,
+                    "contractInstanceUnique": contract.get("objectIdInstanceUnique"),
+                },
+                sort_keys=True,
+            ),
+        )
+        return "", set()
+
+    add_check(
+        checks,
+        "stable_instance_ids.job_contract",
+        job.get("bCaptureTemporalDiagnostics") is True
+        and job.get("lRMode") == "NativeRender"
+        and job.get("bEnableSemanticValidationFixture") is not True
+        and job.get("bValidateNonFixtureSkeletalAnimation") is not True
+        and job.get("bValidateProjectAnimatedMaterial") is not True,
+        json.dumps(
+            {
+                key: job.get(key)
+                for key in (
+                    "bCaptureTemporalDiagnostics",
+                    "lRMode",
+                    "bEnableSemanticValidationFixture",
+                    "bValidateNonFixtureSkeletalAnimation",
+                    "bValidateProjectAnimatedMaterial",
+                )
+            },
+            sort_keys=True,
+        ),
+    )
+    add_check(
+        checks,
+        "stable_instance_ids.manifest_contract",
+        isinstance(state, dict)
+        and state.get("enabled") is True
+        and state.get("preparedAfterWarmupAndStreaming") is True
+        and state.get("encoding") == "custom_stencil_uint8"
+        and state.get("mappingFile") == "instance_id_map.json"
+        and int(state.get("backgroundId", -1)) == 0
+        and int(state.get("maximumAssignableId", -1)) == 255
+        and state.get("fixedTopologyRequired") is True
+        and contract.get("objectIdEncoding")
+        == "fixed_topology_component_unique_custom_stencil_uint8_with_hashed_mapping_zero_background"
+        and contract.get("objectIdInstanceUnique") is True
+        and contract.get("objectIdFixedTopologyRequired") is True
+        and int(contract.get("objectIdMaximumInstances", -1)) == 255,
+        json.dumps(
+            {
+                "manifest": state,
+                "contract": {
+                    key: contract.get(key)
+                    for key in (
+                        "objectIdEncoding",
+                        "objectIdInstanceUnique",
+                        "objectIdFixedTopologyRequired",
+                        "objectIdMaximumInstances",
+                    )
+                },
+            },
+            sort_keys=True,
+        ),
+    )
+    if not isinstance(state, dict):
+        return "", set()
+    try:
+        mapping_path = safe_dataset_file(dataset, state.get("mappingFile"))
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        mapping_error = ""
+    except Exception as exc:
+        mapping_path = dataset / "__missing_instance_map__"
+        mapping = {}
+        mapping_error = str(exc)
+    add_check(
+        checks,
+        "stable_instance_ids.mapping_file",
+        not mapping_error and mapping_path.is_file(),
+        f"path={state.get('mappingFile')} error={mapping_error}",
+    )
+    if mapping_error or not isinstance(mapping, dict):
+        return "", set()
+
+    instances = mapping.get("instances")
+    if not isinstance(instances, list):
+        instances = []
+    required_fields = (
+        "componentPath",
+        "actorPath",
+        "actorClassPath",
+        "componentClassPath",
+    )
+    records_valid = all(
+        isinstance(record, dict)
+        and isinstance(record.get("instanceId"), int)
+        and all(
+            isinstance(record.get(field), str)
+            and bool(record.get(field))
+            and not any(character in record.get(field) for character in "\t\r\n")
+            for field in required_fields
+        )
+        for record in instances
+    )
+    ids = [int(record.get("instanceId", -1)) for record in instances if isinstance(record, dict)]
+    component_paths = [
+        str(record.get("componentPath", "")) for record in instances if isinstance(record, dict)
+    ]
+    expected_ids = list(range(1, len(instances) + 1))
+    schema_valid = bool(
+        mapping.get("schemaVersion") == 1
+        and mapping.get("encoding") == "custom_stencil_uint8"
+        and int(mapping.get("backgroundId", -1)) == 0
+        and int(mapping.get("maximumAssignableId", -1)) == 255
+        and mapping.get("fixedTopologyRequired") is True
+        and 0 < len(instances) <= 255
+        and int(mapping.get("instanceCount", -1)) == len(instances)
+        and records_valid
+        and ids == expected_ids
+        and component_paths == sorted(component_paths)
+        and len(set(component_paths)) == len(component_paths)
+    )
+    add_check(
+        checks,
+        "stable_instance_ids.mapping_schema",
+        schema_valid,
+        f"instances={len(instances)} ids={ids[:4]}..{ids[-4:] if ids else []}",
+    )
+    canonical = "".join(
+        f"{record['instanceId']}\t{record['componentPath']}\t{record['actorPath']}\t"
+        f"{record['actorClassPath']}\t{record['componentClassPath']}\n"
+        for record in instances
+        if isinstance(record, dict) and all(field in record for field in required_fields)
+    )
+    calculated_hash = hashlib.sha1(canonical.encode("utf-8")).hexdigest().upper()
+    reported_hash = str(mapping.get("sha1", "")).upper()
+    expected_scope = (
+        "instance_id_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_component_path"
+    )
+    hash_valid = bool(
+        schema_valid
+        and len(reported_hash) == 40
+        and reported_hash == calculated_hash
+        and str(state.get("mappingSha1", "")).upper() == reported_hash
+        and int(state.get("instanceCount", -1)) == len(instances)
+        and mapping.get("hashScope") == expected_scope
+    )
+    add_check(
+        checks,
+        "stable_instance_ids.mapping_sha1",
+        hash_valid,
+        f"reported={reported_hash} calculated={calculated_hash}",
+    )
+    return (reported_hash if hash_valid else ""), set(expected_ids if schema_valid else [])
+
+
 def validate(
     dataset: Path,
     compare: Path | None,
@@ -1002,8 +1900,26 @@ def validate(
     hr_size = (int(job.get("hRResolution", {}).get("x", 0)), int(job.get("hRResolution", {}).get("y", 0)))
     lr_size = (int(job.get("lRResolution", {}).get("x", 0)), int(job.get("lRResolution", {}).get("y", 0)))
     temporal_enabled = bool(job.get("bCaptureTemporalDiagnostics", False))
+    history_rejection_v2 = temporal_enabled and any(
+        isinstance(frame.get("temporalDiagnostics"), dict)
+        and frame["temporalDiagnostics"].get("historyRejectionSource")
+        == "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
+        for frame in frames
+    )
+    active_temporal_modalities = (
+        TEMPORAL_MODALITIES if history_rejection_v2 else TEMPORAL_MODALITIES_V1
+    )
     main_view = bool(job.get("bCaptureMainViewTemporalDiagnostics", False))
+    scene_capture_lr_comparison = bool(
+        job.get("bCaptureSceneCaptureLRComparison", False)
+    )
+    pixel_domain_required = bool(
+        job.get("bValidateMainViewSceneCapturePixelDomain", False)
+    )
     auxiliary_capture_order = str(job.get("auxiliaryCaptureOrder") or "HighResolutionFirst")
+    semantic_motion_scenario = str(
+        job.get("semanticMotionScenario") or "LegacyCameraRelative"
+    )
     add_check(
         checks,
         "capture_order.job_contract",
@@ -1013,6 +1929,12 @@ def validate(
             and job.get("lRMode") != "NativeRender"
         ),
         f"order={auxiliary_capture_order} lrMode={job.get('lRMode')}",
+    )
+    add_check(
+        checks,
+        "semantic_motion.job_contract",
+        semantic_motion_scenario in SEMANTIC_MOTION_SCENARIOS,
+        semantic_motion_scenario,
     )
     replay_role = str(manifest.get("replayPass") or job.get("replayPass") or "Standard")
     job_replay_role = str(job.get("replayPass") or "Standard")
@@ -1079,6 +2001,43 @@ def validate(
             ),
         )
     determinism_contract = manifest.get("determinismContract", {})
+    validate_scene_control_preflight(dataset, manifest, job, checks)
+    stable_instance_mapping_sha1, stable_instance_valid_ids = (
+        validate_stable_instance_ids(dataset, manifest, job, checks)
+    )
+    add_check(
+        checks,
+        "main_view_scene_capture.job_and_contract",
+        bool(determinism_contract.get("sceneCaptureLRComparisonEnabled", False))
+        is scene_capture_lr_comparison
+        and bool(
+            determinism_contract.get(
+                "mainViewSceneCapturePixelDomainValidationRequired", False
+            )
+        )
+        is pixel_domain_required
+        and (
+            scene_capture_lr_comparison
+            is bool(
+                determinism_contract.get(
+                    "sceneCaptureLRComparison", "not_captured"
+                )
+                == "existing_native_lr_scene_capture_after_dof_linear_scene_rgb_paired_without_simulation_advance"
+            )
+        )
+        and (not scene_capture_lr_comparison or (temporal_enabled and main_view)),
+        json.dumps(
+            {
+                key: determinism_contract.get(key)
+                for key in (
+                    "sceneCaptureLRComparisonEnabled",
+                    "mainViewSceneCapturePixelDomainValidationRequired",
+                    "sceneCaptureLRComparison",
+                )
+            },
+            sort_keys=True,
+        ),
+    )
     if job.get("bLockMaterialTimeToLogicalFrame", False):
         add_check(
             checks,
@@ -1373,13 +2332,27 @@ def validate(
             configured_rotation = job.get(
                 "deterministicCameraRotationDegrees", {}
             )
-            expected_location = np.asarray(
+            configured_translation = job.get(
+                "deterministicCameraTranslationPerLogicalFrameCm", {}
+            )
+            base_location = np.asarray(
                 [
                     configured_location.get("x", math.nan),
                     configured_location.get("y", math.nan),
                     configured_location.get("z", math.nan),
                 ],
                 dtype=np.float64,
+            )
+            translation_per_frame = np.asarray(
+                [
+                    configured_translation.get("x", 0.0),
+                    configured_translation.get("y", 0.0),
+                    configured_translation.get("z", 0.0),
+                ],
+                dtype=np.float64,
+            )
+            expected_location = base_location + translation_per_frame * (
+                frame_id - int(job.get("startFrame", 0))
             )
             expected_rotation = np.asarray(
                 [
@@ -1787,6 +2760,7 @@ def validate(
             for metadata_name in (
                 "temporalDiagnostics",
                 "nativeHRDiagnostics",
+                "sceneCaptureLRComparisonDiagnostics",
                 "referenceHRDiagnostics",
                 "hudlessColorDiagnostics",
             ):
@@ -1823,7 +2797,9 @@ def validate(
         frame_pixels: dict[str, np.ndarray] = {}
         required = ["hr", "lr"] + (["depth"] if job.get("bCaptureDepth", False) else [])
         if temporal_enabled:
-            required.extend(TEMPORAL_MODALITIES)
+            required.extend(active_temporal_modalities)
+        if scene_capture_lr_comparison:
+            required.extend(SCENE_CAPTURE_LR_COMPARISON_MODALITIES)
         if job.get("bCaptureReferenceHR", False):
             required.extend(REFERENCE_MODALITIES)
         if job.get("bCaptureMainViewHUDlessColor", False):
@@ -1894,7 +2870,17 @@ def validate(
             pixels = exr_rgba(path)
             frame_pixels[modality] = pixels
             height, width, _ = pixels.shape
-            expected_size = hr_size if modality in HR_TEMPORAL_MODALITIES else (lr_size if modality in TEMPORAL_MODALITIES else hr_size)
+            expected_size = (
+                hr_size
+                if modality in HR_TEMPORAL_MODALITIES
+                else (
+                    lr_size
+                    if modality
+                    in TEMPORAL_MODALITIES
+                    + SCENE_CAPTURE_LR_COMPARISON_MODALITIES
+                    else hr_size
+                )
+            )
             add_check(
                 checks,
                 f"frame_{frame_id:06d}.{modality}.size",
@@ -1992,8 +2978,85 @@ def validate(
                     )
 
                 validate_temporal_frame(
-                    checks, frame, temporal, frame_pixels, lr_size, hr_size, main_view, cvars
+                    checks,
+                    frame,
+                    temporal,
+                    frame_pixels,
+                    lr_size,
+                    hr_size,
+                    main_view,
+                    scene_capture_lr_comparison,
+                    pixel_domain_required,
+                    cvars,
                 )
+                if job.get("bAssignStableInstanceIds", False):
+                    stable_frame_contract = bool(
+                        frame.get("stableInstanceIdsEnabled") is True
+                        and str(frame.get("stableInstanceIdMappingSha1", "")).upper()
+                        == stable_instance_mapping_sha1
+                        and int(frame.get("stableInstanceIdCount", -1))
+                        == len(stable_instance_valid_ids)
+                        and temporal.get("objectIdSource")
+                        == "stable_component_unique_custom_stencil_uint8_zero_background"
+                        and temporal.get("objectIdInstanceUnique") is True
+                        and str(temporal.get("objectIdMappingSha1", "")).upper()
+                        == stable_instance_mapping_sha1
+                        and int(temporal.get("objectIdInstanceCount", -1))
+                        == len(stable_instance_valid_ids)
+                    )
+                    add_check(
+                        checks,
+                        f"frame_{frame_id:06d}.stable_instance_id_metadata",
+                        stable_frame_contract,
+                        json.dumps(
+                            {
+                                "frameEnabled": frame.get("stableInstanceIdsEnabled"),
+                                "frameHash": frame.get("stableInstanceIdMappingSha1"),
+                                "frameCount": frame.get("stableInstanceIdCount"),
+                                "source": temporal.get("objectIdSource"),
+                                "instanceUnique": temporal.get(
+                                    "objectIdInstanceUnique"
+                                ),
+                                "temporalHash": temporal.get("objectIdMappingSha1"),
+                                "temporalCount": temporal.get(
+                                    "objectIdInstanceCount"
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+                    object_pixels = frame_pixels.get("object_id")
+                    if object_pixels is None:
+                        raster_valid = False
+                        raster_detail = "missing object_id pixels"
+                    else:
+                        values = object_pixels[..., 0]
+                        rounded = np.rint(values)
+                        unique_ids = set(int(value) for value in np.unique(rounded))
+                        nonzero_pixels = int(np.count_nonzero(rounded > 0.0))
+                        raster_valid = bool(
+                            np.allclose(values, rounded, rtol=0.0, atol=1e-6)
+                            and unique_ids.issubset(
+                                stable_instance_valid_ids | {0}
+                            )
+                            and nonzero_pixels > 0
+                        )
+                        raster_detail = json.dumps(
+                            {
+                                "uniqueIds": sorted(unique_ids),
+                                "nonzeroPixelCount": nonzero_pixels,
+                                "mappedInstanceCount": len(
+                                    stable_instance_valid_ids
+                                ),
+                            },
+                            sort_keys=True,
+                        )
+                    add_check(
+                        checks,
+                        f"frame_{frame_id:06d}.stable_instance_id_raster",
+                        raster_valid,
+                        raster_detail,
+                    )
                 temporal_records.append((frame_id, temporal, bool(frame.get("reset", False))))
                 if job.get("bEnableSemanticValidationFixture", False):
                     fixture = frame.get("semanticValidationFixture")
@@ -2004,6 +3067,29 @@ def validate(
                         "present",
                     )
                     if isinstance(fixture, dict):
+                        add_check(
+                            checks,
+                            f"frame_{frame_id:06d}.semantic_fixture_motion_contract",
+                            fixture.get("motionScenario") == semantic_motion_scenario
+                            and fixture.get("worldAnchored")
+                            is (semantic_motion_scenario != "LegacyCameraRelative")
+                            and fixture.get("objectMotionEnabled")
+                            is (
+                                semantic_motion_scenario
+                                in {"LegacyCameraRelative", "ObjectOnly", "Mixed"}
+                            ),
+                            json.dumps(
+                                {
+                                    "jobScenario": semantic_motion_scenario,
+                                    "fixtureScenario": fixture.get("motionScenario"),
+                                    "worldAnchored": fixture.get("worldAnchored"),
+                                    "objectMotionEnabled": fixture.get(
+                                        "objectMotionEnabled"
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                        )
                         validate_semantic_fixture_frame(checks, frame, fixture, frame_pixels)
                         semantic_records.append((frame_id, fixture, frame_pixels))
                 if job.get("bCaptureReferenceHR", False):
@@ -2385,6 +3471,9 @@ def validate(
         f"count={len(all_render_submission_ids)} first={all_render_submission_ids[:4]} last={all_render_submission_ids[-4:]}",
     )
 
+    if history_rejection_v2:
+        validate_history_rejection_v2_cross_frame(checks, frames, frame_paths)
+
     if job.get("bValidateProjectAnimatedMaterial", False):
         material_colors = [
             color
@@ -2616,6 +3705,60 @@ def validate(
                 f"expected={expected_span_frames} actual={frame.get('motionTimeSpanFrames')}",
             )
 
+    if job.get("bValidateTemporalJitterSignCoverage", False):
+        sequence_length = int(job.get("temporalJitterSequenceLength", 0))
+        jitter_indices: set[int] = set()
+        jitter_vectors: list[np.ndarray] = []
+        for _, temporal, _ in temporal_records:
+            jitter_indices.add(int(temporal.get("jitterIndex", -1)))
+            vector = np.asarray(
+                temporal.get("jitterCurrentRenderPixel", (math.nan, math.nan)),
+                dtype=np.float64,
+            )
+            if vector.shape == (2,) and np.all(np.isfinite(vector)):
+                jitter_vectors.append(vector)
+        expected_indices = set(range(sequence_length))
+        add_check(
+            checks,
+            "jitter_sign.full_logical_sequence_coverage",
+            sequence_length >= 4
+            and expected_indices.issubset(jitter_indices)
+            and len(jitter_vectors) >= sequence_length,
+            f"sequenceLength={sequence_length} indices={sorted(jitter_indices)} finiteVectors={len(jitter_vectors)}",
+        )
+        if jitter_vectors:
+            jitter_array = np.stack(jitter_vectors, axis=0)
+            epsilon = 1e-6
+            axis_signs = {
+                "xNegative": bool(np.any(jitter_array[:, 0] < -epsilon)),
+                "xPositive": bool(np.any(jitter_array[:, 0] > epsilon)),
+                "yNegative": bool(np.any(jitter_array[:, 1] < -epsilon)),
+                "yPositive": bool(np.any(jitter_array[:, 1] > epsilon)),
+            }
+            quadrants = {
+                (
+                    -1 if vector[0] < -epsilon else 1,
+                    -1 if vector[1] < -epsilon else 1,
+                )
+                for vector in jitter_array
+                if abs(vector[0]) > epsilon and abs(vector[1]) > epsilon
+            }
+            add_check(
+                checks,
+                "jitter_sign.left_right_up_down",
+                all(axis_signs.values()),
+                json.dumps(axis_signs, sort_keys=True),
+            )
+            add_check(
+                checks,
+                "jitter_sign.four_quadrants",
+                quadrants == {(-1, -1), (-1, 1), (1, -1), (1, 1)},
+                f"quadrants={sorted(quadrants)}",
+            )
+        else:
+            add_check(checks, "jitter_sign.left_right_up_down", False, "no finite jitter vectors")
+            add_check(checks, "jitter_sign.four_quadrants", False, "no finite jitter vectors")
+
     # Preserve process order for the same reason as temporal history above.
     if len(semantic_records) > 1:
         semantic_frame_ids = {frame_id for frame_id, _, _ in semantic_records}
@@ -2631,9 +3774,105 @@ def validate(
             f"frames={len(semantic_records)} uniqueSceneStateHashes={len(semantic_scene_hashes)}",
         )
     validated_moving_transitions = 0
+    validated_scenario_transitions = 0
     for index in range(1, len(semantic_records)):
         frame_id, fixture, current_pixels = semantic_records[index]
         _, previous_fixture, previous_pixels = semantic_records[index - 1]
+        expected_moving = np.asarray(
+            fixture.get("expectedMovingMotionDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        expected_background = np.asarray(
+            fixture.get("expectedBackgroundMotionDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        current_camera = np.asarray(
+            fixture.get("currentCameraLocationCm", (math.nan, math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        previous_camera = np.asarray(
+            fixture.get("previousCameraLocationCm", (math.nan, math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        current_right_metadata = float(fixture.get("movingCurrentRightCm", math.nan))
+        previous_right_metadata = float(fixture.get("movingPreviousRightCm", math.nan))
+        finite_contract = bool(
+            expected_moving.shape == (2,)
+            and expected_background.shape == (2,)
+            and current_camera.shape == (3,)
+            and previous_camera.shape == (3,)
+            and np.all(np.isfinite(expected_moving))
+            and np.all(np.isfinite(expected_background))
+            and np.all(np.isfinite(current_camera))
+            and np.all(np.isfinite(previous_camera))
+            and math.isfinite(current_right_metadata)
+            and math.isfinite(previous_right_metadata)
+        )
+        if semantic_motion_scenario != "LegacyCameraRelative":
+            moving_magnitude = (
+                float(np.linalg.norm(expected_moving)) if finite_contract else math.nan
+            )
+            background_magnitude = (
+                float(np.linalg.norm(expected_background)) if finite_contract else math.nan
+            )
+            camera_moved = finite_contract and not np.allclose(
+                current_camera, previous_camera, atol=1e-6, rtol=0.0
+            )
+            object_moved = finite_contract and not math.isclose(
+                current_right_metadata, previous_right_metadata, abs_tol=1e-6
+            )
+            zero_tolerance = 1e-4
+            motion_floor = 0.05
+            scenario_ok = False
+            if semantic_motion_scenario == "Static":
+                scenario_ok = (
+                    finite_contract
+                    and not camera_moved
+                    and not object_moved
+                    and moving_magnitude <= zero_tolerance
+                    and background_magnitude <= zero_tolerance
+                )
+            elif semantic_motion_scenario == "CameraOnly":
+                scenario_ok = (
+                    finite_contract
+                    and camera_moved
+                    and not object_moved
+                    and moving_magnitude >= motion_floor
+                    and background_magnitude >= motion_floor
+                )
+            elif semantic_motion_scenario == "ObjectOnly":
+                scenario_ok = (
+                    finite_contract
+                    and not camera_moved
+                    and object_moved
+                    and moving_magnitude >= motion_floor
+                    and background_magnitude <= zero_tolerance
+                )
+            elif semantic_motion_scenario == "Mixed":
+                scenario_ok = (
+                    finite_contract
+                    and camera_moved
+                    and object_moved
+                    and moving_magnitude >= motion_floor
+                    and background_magnitude >= motion_floor
+                    and float(np.linalg.norm(expected_moving - expected_background))
+                    >= motion_floor
+                )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.semantic_fixture.{semantic_motion_scenario.lower()}_scenario_signature",
+                scenario_ok,
+                json.dumps(
+                    {
+                        "expectedMoving": expected_moving.tolist(),
+                        "expectedBackground": expected_background.tolist(),
+                        "cameraMoved": bool(camera_moved),
+                        "objectMoved": bool(object_moved),
+                    },
+                    sort_keys=True,
+                ),
+            )
+            validated_scenario_transitions += int(scenario_ok)
         current_right_cm = float(fixture.get("movingCurrentRightCm", math.nan))
         previous_right_cm = float(
             previous_fixture.get("movingCurrentRightCm", math.nan)
@@ -2698,11 +3937,30 @@ def validate(
             f"stable_background_kept_valid={stable_kept}",
         )
     if len(semantic_records) > 1:
+        expected_scenario_transitions = (
+            len(semantic_records) - 1
+            if semantic_motion_scenario != "LegacyCameraRelative"
+            else 0
+        )
+        if expected_scenario_transitions:
+            add_check(
+                checks,
+                "semantic_fixture.motion_scenario_transition_coverage",
+                validated_scenario_transitions == expected_scenario_transitions,
+                f"scenario={semantic_motion_scenario} validated={validated_scenario_transitions} expected={expected_scenario_transitions}",
+            )
+        object_motion_expected = semantic_motion_scenario in {
+            "LegacyCameraRelative",
+            "ObjectOnly",
+            "Mixed",
+        }
         add_check(
             checks,
             "semantic_fixture.moving_transition_coverage",
-            validated_moving_transitions >= 1,
-            f"validatedMovingTransitions={validated_moving_transitions}",
+            validated_moving_transitions >= 1
+            if object_motion_expected
+            else validated_moving_transitions == 0,
+            f"scenario={semantic_motion_scenario} validatedMovingTransitions={validated_moving_transitions}",
         )
 
     if compare is not None:
@@ -3430,9 +4688,61 @@ def validate(
 
     required_checks = [check for check in checks if check["required"]]
     passed = all(check["passed"] for check in required_checks)
+    pixel_domain_checks = [
+        check
+        for check in checks
+        if check["name"].endswith(".main_view_scene_capture_pixel_domain")
+    ]
+    pixel_domain_gate = (
+        "pass"
+        if pixel_domain_required
+        and bool(pixel_domain_checks)
+        and all(check["passed"] for check in pixel_domain_checks)
+        else "fail"
+        if pixel_domain_required
+        else "diagnostic"
+        if scene_capture_lr_comparison
+        else "not_run"
+    )
+    stable_instance_checks = [
+        check
+        for check in checks
+        if check["name"].startswith("stable_instance_ids.")
+        or ".stable_instance_id_" in check["name"]
+    ]
+    stable_instance_gate = (
+        "pass"
+        if bool(job.get("bAssignStableInstanceIds", False))
+        and bool(stable_instance_checks)
+        and all(check["passed"] for check in stable_instance_checks)
+        else "fail"
+        if bool(job.get("bAssignStableInstanceIds", False))
+        else "not_run"
+    )
+    disocclusion_checks = [
+        check
+        for check in checks
+        if ".history_rejection_v2." in check["name"]
+        or ".disocclusion_" in check["name"]
+        or ".history_rejection_reason_" in check["name"]
+    ]
+    disocclusion_gate = (
+        "pass"
+        if history_rejection_v2
+        and bool(disocclusion_checks)
+        and all(check["passed"] for check in disocclusion_checks)
+        else "fail"
+        if history_rejection_v2
+        else "legacy_v1"
+        if temporal_enabled
+        else "not_run"
+    )
     report = {
-        "validatorVersion": 9,
+        "validatorVersion": 14,
         "comparisonMode": compare_mode if compare is not None else "none",
+        "mainViewSceneCapturePixelDomainGate": pixel_domain_gate,
+        "stableInstanceIdGate": stable_instance_gate,
+        "disocclusionGate": disocclusion_gate,
         "captureOrderInvarianceGate": (
             "pass" if compare is not None and compare_mode == "capture-order" and passed
             else "fail" if compare is not None and compare_mode == "capture-order"
@@ -3464,7 +4774,7 @@ def validate(
         "checks": checks,
         "statistics": stats,
         "replayMetrics": replay_metrics,
-        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU Niagara particle counts and a visible AfterDOF VFX probe. The non-fixture skeletal gate requires a visible project-authored Actor and AnimBP, exact application of the shared cached pose and covered endpoint motion; skeletal-reverse requires exact absolute project poses, camera metadata and object-ID grids, tightly bounded depth-grid differences, and independent directional motion evidence. GPU particle payload readback, arbitrary Niagara data interfaces, non-fixture animated-material/WPO motion, production disocclusion and Main View/reference-HR pixel equivalence remain separate gates.",
+        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. Scene-control preflight evidence inventories and hashes ticking Actors/components, loaded Niagara Data Interfaces and known time/random material inputs; strict jobs reject every unclassified record. The optional Main View/SceneCapture LR gate compares the same AfterDOF linear-HDR stage after independent pre-exposure normalization and metadata-defined subpixel jitter alignment, without an extra render submission or simulation advance. Stable instance-ID jobs finalize a fixed renderable-component topology after warmup/streaming, assign collision-free uint8 Custom Stencil IDs, hash an ID-to-component/Actor/class map, fail on topology or label drift and verify that every nonzero raster value resolves through that map; the 255-instance/fixed-topology limit remains explicit. Disocclusion v2 independently reconstructs every non-reset reason from current motion/depth/ID plus the previous saved depth/ID buffers; cross-instance and static-depth decisions are valid, while dynamic same-instance or unlabeled motion is conservatively rejected with validity zero. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU Niagara particle counts and a visible AfterDOF VFX probe. The non-fixture skeletal gate requires a visible project-authored Actor and AnimBP, exact application of the shared cached pose and covered endpoint motion; skeletal-reverse requires exact absolute project poses, camera metadata and object-ID grids, tightly bounded depth-grid differences, and independent directional motion evidence. GPU particle payload readback, generalized actor-state recording, dynamic same-instance surface identity and Main View/reference-HR pixel equivalence remain separate gates.",
     }
     return report, passed
 

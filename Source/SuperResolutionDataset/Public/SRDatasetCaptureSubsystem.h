@@ -90,6 +90,29 @@ private:
 		TArray<FNiagaraSummary> NiagaraComponents;
 	};
 
+	struct FSceneControlPreflightReport
+	{
+		bool bRan = false;
+		bool bPassed = false;
+		FString Sha1;
+		TArray<FString> AllowedTickingActorClassPaths;
+		TArray<FString> AllowedTickingComponentClassPaths;
+		TArray<FString> AllowedNiagaraDataInterfaceClassPaths;
+		TArray<FString> AllowedMaterialExpressionClassPaths;
+		TArray<FString> ControlledTickingActors;
+		TArray<FString> AllowedTickingActors;
+		TArray<FString> UncontrolledTickingActors;
+		TArray<FString> ControlledTickingComponents;
+		TArray<FString> AllowedTickingComponents;
+		TArray<FString> UncontrolledTickingComponents;
+		TArray<FString> NiagaraDataInterfaces;
+		TArray<FString> AllowedNiagaraDataInterfaces;
+		TArray<FString> UncontrolledNiagaraDataInterfaces;
+		TArray<FString> ControlledMaterialInputs;
+		TArray<FString> AllowedMaterialInputs;
+		TArray<FString> UncontrolledMaterialInputs;
+	};
+
 	struct FNiagaraComponentState
 	{
 		uint8 AgeUpdateMode = 0;
@@ -132,6 +155,15 @@ private:
 		uint8 CustomDepthStencilWriteMask = 0;
 	};
 
+	struct FStableInstanceIdRecord
+	{
+		int32 InstanceId = 0;
+		FString ComponentPath;
+		FString ActorPath;
+		FString ActorClassPath;
+		FString ComponentClassPath;
+	};
+
 	void HandleWorldPreActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	void HandleWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	void HandleWorldTickEnd(UWorld* World, ELevelTick TickType, float DeltaSeconds);
@@ -159,8 +191,13 @@ private:
 	bool PrepareProjectAnimatedMaterialValidation(FString& OutError);
 	void PositionProjectAnimatedMaterialValidationReceiver();
 	void RestoreProjectAnimatedMaterialValidation();
+	bool PrepareStableInstanceIds(FString& OutError);
+	bool ValidateStableInstanceIds(FString& OutError) const;
+	bool WriteStableInstanceIdMap(FString& OutError) const;
+	void RestoreStableInstanceIds();
+	TArray<class UPrimitiveComponent*> CollectStableInstanceComponents() const;
 	bool PrepareDeterministicCamera(FString& OutError);
-	void EnforceDeterministicCamera();
+	void EnforceDeterministicCamera(int32 LogicalFrame);
 	void RestoreDeterministicCamera();
 	void ApplyDeterministicRuntimeState();
 	void ApplyLogicalTemporalJitter(int32 FrameNumber);
@@ -173,6 +210,9 @@ private:
 	bool EnsureStreamingReady(FString& OutError);
 	FString ComputeStreamingStateSha1(int32& OutTextureCount, int32& OutPendingTextureCount) const;
 	FSceneStateSummary ComputeSceneStateSummary() const;
+	bool RunSceneControlPreflight(FString& OutError);
+	bool WriteSceneControlPreflightReport(FString& OutError) const;
+	static bool MatchesSceneControlClassRule(const FString& ClassPath, const TArray<FString>& Rules);
 	void DiscoverAndControlNiagara(float TimeSeconds);
 	void FinalizeNiagaraForCapture();
 	void RestoreNiagara();
@@ -227,6 +267,7 @@ private:
 	FString CaptureCVarProfileCanonical;
 	FString ContentMapSha1;
 	FString ShaderSourceSha1;
+	FSceneControlPreflightReport SceneControlPreflight;
 	bool bStreamingBarrierComplete = false;
 	int32 StreamingRequestsAfterBarrier = INDEX_NONE;
 	int32 StreamingTextureCountAfterBarrier = 0;
@@ -282,6 +323,10 @@ private:
 	TMap<int32, TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState>> CachedSkeletalPoseFrames;
 	TMap<TWeakObjectPtr<USkinnedMeshComponent>, int32> NonFixtureSkeletalObjectIds;
 	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FPrimitiveStencilState> NonFixtureSkeletalStencilStates;
+	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FPrimitiveStencilState> StableInstanceStencilStates;
+	TArray<FStableInstanceIdRecord> StableInstanceIdRecords;
+	FString StableInstanceIdMappingSha1;
+	bool bStableInstanceIdsPrepared = false;
 	TMap<TWeakObjectPtr<AActor>, bool> NonFixtureHiddenActorStates;
 	int32 WarmupPoseCacheFrame = INDEX_NONE;
 	int32 AppliedCachedSkeletalPoseComponentCount = 0;

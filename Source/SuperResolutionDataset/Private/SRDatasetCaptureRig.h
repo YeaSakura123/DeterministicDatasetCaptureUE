@@ -26,6 +26,7 @@ public:
 	const FMinimalViewInfo& GetLastCameraView() const { return LastCameraView; }
 	const FSRDatasetTemporalFrameMetadata& GetLastTemporalMetadata() const { return LastTemporalMetadata; }
 	const FSRDatasetTemporalFrameMetadata& GetLastNativeHRMetadata() const { return LastNativeHRMetadata; }
+	const FSRDatasetTemporalFrameMetadata& GetLastSceneCaptureLRMetadata() const { return LastSceneCaptureLRMetadata; }
 	const FSRDatasetTemporalFrameMetadata& GetLastReferenceHRMetadata() const { return LastReferenceHRMetadata; }
 	const FSRDatasetTemporalFrameMetadata& GetLastHUDlessColorMetadata() const { return LastHUDlessColorMetadata; }
 	FIntPoint GetLastHUDlessColorSize() const { return LastHUDlessColorSize; }
@@ -55,6 +56,11 @@ public:
 	bool SaveNativeHDRColorResult(
 		const FSRDatasetTemporalCaptureResult& Result,
 		const FString& HRPath,
+		TMap<FString, FString>& OutHashes,
+		FString& OutError);
+	bool SaveSceneCaptureLRHDRColorResult(
+		const FSRDatasetTemporalCaptureResult& Result,
+		const FString& LRPath,
 		TMap<FString, FString>& OutHashes,
 		FString& OutError);
 	bool SaveReferenceHDRColorResult(
@@ -124,6 +130,7 @@ private:
 	FMinimalViewInfo LastCameraView;
 	FSRDatasetTemporalFrameMetadata LastTemporalMetadata;
 	FSRDatasetTemporalFrameMetadata LastNativeHRMetadata;
+	FSRDatasetTemporalFrameMetadata LastSceneCaptureLRMetadata;
 	FSRDatasetTemporalFrameMetadata LastReferenceHRMetadata;
 	FSRDatasetTemporalFrameMetadata LastHUDlessColorMetadata;
 	FIntPoint LastHUDlessColorSize = FIntPoint::ZeroValue;

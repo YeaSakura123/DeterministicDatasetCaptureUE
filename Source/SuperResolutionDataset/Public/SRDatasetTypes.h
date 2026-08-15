@@ -52,6 +52,21 @@ enum class ESRDatasetAuxiliaryCaptureOrder : uint8
 };
 
 /**
+ * Analytic motion contract used by the semantic fixture. LegacyCameraRelative
+ * preserves the original camera-following chart; every other mode anchors the
+ * chart in world space so camera and object motion can be isolated explicitly.
+ */
+UENUM(BlueprintType)
+enum class ESRDatasetSemanticMotionScenario : uint8
+{
+	LegacyCameraRelative,
+	Static,
+	CameraOnly,
+	ObjectOnly,
+	Mixed
+};
+
+/**
  * A serializable capture job. The same struct is accepted by Blueprint and by
  * the -SRDatasetJob=<json-file> command-line entry point.
  */
@@ -95,6 +110,10 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (EditCondition = "bUseDeterministicCameraTransform", ClampMin = "5.0", ClampMax = "170.0"))
 	float DeterministicCameraFOVDegrees = 90.0f;
+
+	/** World-space translation added per logical frame relative to StartFrame. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (EditCondition = "bUseDeterministicCameraTransform"))
+	FVector DeterministicCameraTranslationPerLogicalFrameCm = FVector::ZeroVector;
 
 	/** Inclusive source-frame interval in CaptureFrameRate time. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Frames", meta = (ClampMin = "0"))
@@ -144,6 +163,15 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	bool bCaptureDepth = true;
 
 	/**
+	 * Temporarily assign deterministic, component-unique Custom Stencil IDs to
+	 * the fixed set of registered renderable primitive components. ID 0 remains
+	 * background. The v1 encoding is uint8 and therefore rejects more than 255
+	 * instances instead of allowing collisions.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
+	bool bAssignStableInstanceIds = false;
+
+	/**
 	 * Experimental UE RDG extraction from the native LR view. Writes HDR Color,
 	 * raw/full motion, device/linear depth and validity diagnostics. These files
 	 * are not temporal-training certified until the validation suite passes.
@@ -154,6 +182,22 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	/** Capture diagnostics from the real player Main View instead of the LR SceneCapture. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureTemporalDiagnostics"))
 	bool bCaptureMainViewTemporalDiagnostics = false;
+
+	/**
+	 * Also extract the existing native-LR SceneCapture at the same linear-HDR
+	 * AfterDOF stage. This is an isolated comparison input; it does not submit an
+	 * additional render or replace the real Main View temporal modalities.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCaptureMainViewTemporalDiagnostics"))
+	bool bCaptureSceneCaptureLRComparison = false;
+
+	/**
+	 * Require the validator's jitter-aligned Main View versus SceneCapture LR
+	 * pixel-domain gate. Restricted to the locked static semantic fixture so the
+	 * comparison measures capture-path differences rather than scene motion.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCaptureSceneCaptureLRComparison"))
+	bool bValidateMainViewSceneCapturePixelDomain = false;
 
 	/**
 	 * Render an isolated, non-jittered spatial supersample and downsample it to
@@ -226,6 +270,37 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	bool bLockMaterialTimeToLogicalFrame = true;
 
 	/**
+	 * Scan the prepared world before warmup and write scene_control_preflight.json.
+	 * The report inventories ticking Actors/components, Niagara Data Interfaces,
+	 * and material expressions whose values can vary independently of scene state.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control")
+	bool bRunSceneControlPreflight = true;
+
+	/** Fail the job when the scene-control preflight finds an unclassified source. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	bool bRequireSceneControlPreflight = false;
+
+	/**
+	 * Audited ticking Actor class paths. Rules are case-sensitive exact class
+	 * paths; a single trailing '*' enables a prefix match.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	TArray<FString> SceneControlAllowedTickingActorClassPaths;
+
+	/** Audited ticking component class paths; the same exact/trailing-'*' rule syntax applies. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	TArray<FString> SceneControlAllowedTickingComponentClassPaths;
+
+	/** Audited Niagara Data Interface class paths; the same exact/trailing-'*' rule syntax applies. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	TArray<FString> SceneControlAllowedNiagaraDataInterfaceClassPaths;
+
+	/** Audited material-expression class paths; the same exact/trailing-'*' rule syntax applies. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	TArray<FString> SceneControlAllowedMaterialExpressionClassPaths;
+
+	/**
 	 * Fail before and during capture if any visible registered UWidgetComponent
 	 * exists. Screen-space Slate/UMG is captured separately; world/component UI
 	 * must not silently remain in the HUD-less scene target.
@@ -296,6 +371,14 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation")
 	bool bEnableSemanticValidationFixture = false;
+
+	/** Selects the analytic camera/object motion combination exercised by the semantic fixture. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bEnableSemanticValidationFixture"))
+	ESRDatasetSemanticMotionScenario SemanticMotionScenario = ESRDatasetSemanticMotionScenario::LegacyCameraRelative;
+
+	/** Require a full logical jitter cycle with both signs on both axes and all four sign quadrants. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bEnableSemanticValidationFixture"))
+	bool bValidateTemporalJitterSignCoverage = false;
 
 	/** Assign temporary Custom Stencil IDs to non-fixture skeletal components and require their production-scene pose/motion gate. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheSkeletalAnimationPosesForReplay"))

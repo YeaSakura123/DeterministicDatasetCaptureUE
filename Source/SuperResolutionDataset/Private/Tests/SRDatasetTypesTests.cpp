@@ -36,6 +36,22 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Disabled streaming barrier ignores its timeout"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
+	Job.bRunSceneControlPreflight = false;
+	Job.bRequireSceneControlPreflight = true;
+	TestFalse(TEXT("Required scene-control preflight cannot be disabled"), Job.Validate(Error));
+	Job.bRunSceneControlPreflight = true;
+	Job.SceneControlAllowedTickingActorClassPaths = { TEXT("/Script/Engine.SkyAtmosphere*") };
+	TestTrue(TEXT("Scene-control rules accept an absolute class prefix with one trailing wildcard"), Job.Validate(Error));
+	Job.SceneControlAllowedTickingActorClassPaths = { TEXT("Script/Engine.Actor") };
+	TestFalse(TEXT("Scene-control rules reject relative class paths"), Job.Validate(Error));
+	Job.SceneControlAllowedTickingActorClassPaths = { TEXT("/Script/*/Actor") };
+	TestFalse(TEXT("Scene-control rules reject embedded wildcards"), Job.Validate(Error));
+	Job.SceneControlAllowedTickingActorClassPaths = { TEXT("/Script/Engine.*") };
+	TestFalse(TEXT("Scene-control rules reject module-wide wildcard exceptions"), Job.Validate(Error));
+	Job.SceneControlAllowedTickingActorClassPaths = { TEXT("/Script/Engine.Actor"), TEXT("/Script/Engine.Actor") };
+	TestFalse(TEXT("Scene-control rules reject duplicate exceptions"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
 	Job.ContractVersion = TEXT("nr-sr-data-v2");
 	TestFalse(TEXT("Unimplemented temporal contract is rejected instead of emitting incomplete data"), Job.Validate(Error));
 	TestTrue(TEXT("Temporal rejection explains the certification boundary"), Error.Contains(TEXT("not certified")));
@@ -47,8 +63,38 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Temporal diagnostics accept native LR"), Job.Validate(Error));
 	Job.bCaptureMainViewTemporalDiagnostics = true;
 	TestTrue(TEXT("Main View diagnostics accept a native LR job"), Job.Validate(Error));
+	Job.bCaptureSceneCaptureLRComparison = true;
+	TestTrue(TEXT("Main View diagnostics accept a paired native-LR SceneCapture extraction"), Job.Validate(Error));
 	Job.CameraActorTag = TEXT("DatasetCamera");
 	TestFalse(TEXT("Main View diagnostics reject a camera that is not guaranteed to drive the player view"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
+	Job.bAssignStableInstanceIds = true;
+	TestFalse(TEXT("Stable instance IDs require the temporal object-ID raster"), Job.Validate(Error));
+	Job.LRMode = ESRDatasetLRMode::NativeRender;
+	Job.bCaptureTemporalDiagnostics = true;
+	TestTrue(TEXT("Stable instance IDs accept a native temporal capture"), Job.Validate(Error));
+	Job.bEnableSemanticValidationFixture = true;
+	TestFalse(TEXT("Stable instance IDs reject fixtures that reserve Custom Stencil values"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
+	Job.bValidateMainViewSceneCapturePixelDomain = true;
+	TestFalse(TEXT("Pixel-domain validation cannot be enabled without the paired SceneCapture extraction"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
+	Job.bCaptureSceneCaptureLRComparison = true;
+	TestFalse(TEXT("SceneCapture LR comparison requires real Main View temporal diagnostics"), Job.Validate(Error));
+	Job.LRMode = ESRDatasetLRMode::NativeRender;
+	Job.bCaptureTemporalDiagnostics = true;
+	Job.bCaptureMainViewTemporalDiagnostics = true;
+	TestTrue(TEXT("SceneCapture LR comparison accepts the paired native-render paths"), Job.Validate(Error));
+	Job.bValidateMainViewSceneCapturePixelDomain = true;
+	TestFalse(TEXT("Pixel-domain validation rejects an uncontrolled scene"), Job.Validate(Error));
+	Job.bEnableSemanticValidationFixture = true;
+	Job.bUseDeterministicCameraTransform = true;
+	Job.SemanticMotionScenario = ESRDatasetSemanticMotionScenario::Static;
+	Job.bLockTemporalJitterToLogicalFrame = true;
+	TestTrue(TEXT("Pixel-domain validation accepts the locked static semantic fixture"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
 	Job.LRMode = ESRDatasetLRMode::NativeRender;
@@ -71,6 +117,39 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("Semantic fixture requires consecutive frames"), Job.Validate(Error));
 	Job.FrameStep = 1;
 	TestTrue(TEXT("Semantic fixture accepts a two-frame Main View job"), Job.Validate(Error));
+	Job.SemanticMotionScenario = ESRDatasetSemanticMotionScenario::Static;
+	TestFalse(TEXT("Analytic motion scenarios require a deterministic camera"), Job.Validate(Error));
+	Job.bUseDeterministicCameraTransform = true;
+	TestTrue(TEXT("Static analytic motion accepts a fixed deterministic camera"), Job.Validate(Error));
+	Job.SemanticMotionScenario = ESRDatasetSemanticMotionScenario::CameraOnly;
+	TestFalse(TEXT("Camera-only analytic motion requires a non-zero camera trajectory"), Job.Validate(Error));
+	Job.DeterministicCameraTranslationPerLogicalFrameCm = FVector(0.0, 20.0, 0.0);
+	TestTrue(TEXT("Camera-only analytic motion accepts a deterministic camera trajectory"), Job.Validate(Error));
+	Job.SemanticMotionScenario = ESRDatasetSemanticMotionScenario::ObjectOnly;
+	TestFalse(TEXT("Object-only analytic motion rejects camera translation"), Job.Validate(Error));
+	Job.DeterministicCameraTranslationPerLogicalFrameCm = FVector::ZeroVector;
+	TestTrue(TEXT("Object-only analytic motion accepts a fixed camera"), Job.Validate(Error));
+	Job.SemanticMotionScenario = ESRDatasetSemanticMotionScenario::Mixed;
+	TestFalse(TEXT("Mixed analytic motion requires camera translation"), Job.Validate(Error));
+	Job.DeterministicCameraTranslationPerLogicalFrameCm = FVector(0.0, 20.0, 0.0);
+	TestTrue(TEXT("Mixed analytic motion accepts combined camera/object motion"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
+	Job.LRMode = ESRDatasetLRMode::NativeRender;
+	Job.bCaptureTemporalDiagnostics = true;
+	Job.bCaptureMainViewTemporalDiagnostics = true;
+	Job.bEnableSemanticValidationFixture = true;
+	Job.bUseDeterministicCameraTransform = true;
+	Job.SemanticMotionScenario = ESRDatasetSemanticMotionScenario::Static;
+	Job.StartFrame = 0;
+	Job.EndFrame = 7;
+	Job.bValidateTemporalJitterSignCoverage = true;
+	TestFalse(TEXT("Jitter sign coverage requires logical-frame jitter locking"), Job.Validate(Error));
+	Job.bLockTemporalJitterToLogicalFrame = true;
+	Job.TemporalJitterSequenceLength = 8;
+	TestTrue(TEXT("Jitter sign coverage accepts one complete static eight-phase cycle"), Job.Validate(Error));
+	Job.EndFrame = 6;
+	TestFalse(TEXT("Jitter sign coverage rejects an incomplete logical cycle"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
 	Job.bCaptureReferenceHR = true;

@@ -10,6 +10,7 @@
 #include "Camera/PlayerCameraManager.h"
 #include "ContentStreaming.h"
 #include "Dom/JsonObject.h"
+#include "Components/ActorComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -43,12 +44,20 @@
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Misc/SecureHash.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialExpressionParticleRandom.h"
+#include "Materials/MaterialExpressionPerInstanceRandom.h"
+#include "Materials/MaterialExpressionTime.h"
 #include "Materials/MaterialInterface.h"
 #include "NiagaraCommon.h"
 #include "NiagaraComponent.h"
+#include "NiagaraDataInterface.h"
 #include "NiagaraEmitterInstance.h"
+#include "NiagaraParameterStore.h"
 #include "NiagaraRendererProperties.h"
+#include "NiagaraScript.h"
 #include "NiagaraSystem.h"
+#include "NiagaraSystemImpl.h"
 #include "NiagaraSystemInstance.h"
 #include "NiagaraSystemInstanceController.h"
 #include "Particles/ParticleSystemComponent.h"
@@ -88,11 +97,16 @@ namespace SRDataset::Private
 		TEXT("depth_previous_reprojected_device"),
 		TEXT("history_rejection_mask"),
 		TEXT("history_rejection_valid"),
+		TEXT("history_rejection_reason"),
+		TEXT("disocclusion_mask"),
+		TEXT("disocclusion_valid"),
+		TEXT("disocclusion_reason"),
 		TEXT("translucency_after_dof_raw"),
 		TEXT("transparency_mask"),
 		TEXT("reactive_mask"),
 		TEXT("object_id")
 	};
+	constexpr const TCHAR* SceneCaptureLRComparisonModality = TEXT("color_lr_scene_capture_hdr");
 	constexpr const TCHAR* ReferenceHRModality = TEXT("color_hr_reference_scene_hdr");
 	constexpr const TCHAR* HUDlessColorModality = TEXT("color_main_view_hudless_after_tonemap");
 	constexpr const TCHAR* UIColorAlphaModality = TEXT("ui_color_alpha");
@@ -272,6 +286,7 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 	PendingMainViewTimeSeconds = 0.0;
 	PendingMainViewHashes.Reset();
 	PendingMainViewRenderSubmissions.Reset();
+	SceneControlPreflight = FSceneControlPreflightReport();
 	bStreamingBarrierComplete = false;
 	StreamingRequestsAfterBarrier = INDEX_NONE;
 	StreamingTextureCountAfterBarrier = 0;
@@ -281,7 +296,10 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 	NonFixtureSkeletalObjectIds.Reset();
 	NonFixtureSkeletalStencilStates.Reset();
 	NonFixtureHiddenActorStates.Reset();
-	NonFixtureHiddenActorStates.Reset();
+	StableInstanceStencilStates.Reset();
+	StableInstanceIdRecords.Reset();
+	StableInstanceIdMappingSha1.Reset();
+	bStableInstanceIdsPrepared = false;
 	WarmupPoseCacheFrame = INDEX_NONE;
 	AppliedCachedSkeletalPoseComponentCount = 0;
 	AppliedCachedSkeletalPoseBoneCount = 0;
@@ -328,6 +346,10 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 		{
 			OutputDirectories.Add(Modality);
 		}
+	}
+	if (ActiveJob.bCaptureSceneCaptureLRComparison)
+	{
+		OutputDirectories.Add(SRDataset::Private::SceneCaptureLRComparisonModality);
 	}
 	if (ActiveJob.bCaptureReferenceHR)
 	{
@@ -423,6 +445,14 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 	}
 	SnapshotProvenance();
 	NotifyControllablesPrepare();
+	// Install Niagara's deterministic/solo controls before the preflight so the
+	// report can inspect runtime instance parameters without touching a shared
+	// simulation. Age zero preserves the progressive warmup ramp.
+	DiscoverAndControlNiagara(0.0f);
+	if (!RunSceneControlPreflight(OutError))
+	{
+		return false;
+	}
 	WarmupFramesRemaining = ActiveJob.WarmupFrames;
 	Status.State = WarmupFramesRemaining > 0 ? ESRDatasetCaptureState::WarmingUp : ESRDatasetCaptureState::Capturing;
 	Status.CurrentFrame = GetInitialEvaluationFrame();
@@ -839,6 +869,253 @@ void USRDatasetCaptureSubsystem::RestoreProjectAnimatedMaterialValidation()
 	}
 }
 
+TArray<UPrimitiveComponent*> USRDatasetCaptureSubsystem::CollectStableInstanceComponents() const
+{
+	TArray<UPrimitiveComponent*> Components;
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return Components;
+	}
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!IsValid(Actor) || Actor == CaptureRig || Actor == ValidationFixture ||
+			Actor == ProjectAnimatedMaterialValidationReceiver)
+		{
+			continue;
+		}
+		TInlineComponentArray<UPrimitiveComponent*> ActorComponents;
+		Actor->GetComponents(ActorComponents);
+		for (UPrimitiveComponent* Component : ActorComponents)
+		{
+			if (IsValid(Component) && Component->IsRegistered() &&
+				Component->CanEverRender() && !Component->IsVisualizationComponent())
+			{
+				Components.Add(Component);
+			}
+		}
+	}
+	Components.Sort([](const UPrimitiveComponent& Left, const UPrimitiveComponent& Right)
+	{
+		return Left.GetPathName().Compare(Right.GetPathName(), ESearchCase::CaseSensitive) < 0;
+	});
+	return Components;
+}
+
+bool USRDatasetCaptureSubsystem::PrepareStableInstanceIds(FString& OutError)
+{
+	StableInstanceStencilStates.Reset();
+	StableInstanceIdRecords.Reset();
+	StableInstanceIdMappingSha1.Reset();
+	bStableInstanceIdsPrepared = false;
+	if (!ActiveJob.bAssignStableInstanceIds)
+	{
+		return true;
+	}
+
+	const TArray<UPrimitiveComponent*> Components = CollectStableInstanceComponents();
+	if (Components.IsEmpty())
+	{
+		OutError = TEXT("Stable instance-ID assignment found no registered renderable primitive components.");
+		return false;
+	}
+	if (Components.Num() > 255)
+	{
+		OutError = FString::Printf(
+			TEXT("Stable instance-ID v1 supports at most 255 components, but the fixed topology contains %d. Use a smaller loaded scene or a future wider encoding."),
+			Components.Num());
+		return false;
+	}
+
+	FString Canonical;
+	for (int32 Index = 0; Index < Components.Num(); ++Index)
+	{
+		UPrimitiveComponent* Component = Components[Index];
+		AActor* Owner = Component->GetOwner();
+		const int32 InstanceId = Index + 1;
+		FPrimitiveStencilState State;
+		State.bRenderCustomDepth = Component->bRenderCustomDepth;
+		State.CustomDepthStencilValue = static_cast<uint8>(Component->CustomDepthStencilValue);
+		State.CustomDepthStencilWriteMask = static_cast<uint8>(Component->CustomDepthStencilWriteMask);
+		StableInstanceStencilStates.Add(Component, State);
+
+		FStableInstanceIdRecord Record;
+		Record.InstanceId = InstanceId;
+		Record.ComponentPath = Component->GetPathName();
+		Record.ActorPath = Owner ? Owner->GetPathName() : TEXT("none");
+		Record.ActorClassPath = Owner ? Owner->GetClass()->GetPathName() : TEXT("none");
+		Record.ComponentClassPath = Component->GetClass()->GetPathName();
+		for (const FString* Value : {
+			&Record.ComponentPath, &Record.ActorPath, &Record.ActorClassPath, &Record.ComponentClassPath })
+		{
+			if (Value->Contains(TEXT("\t")) || Value->Contains(TEXT("\n")) || Value->Contains(TEXT("\r")))
+			{
+				OutError = FString::Printf(TEXT("Stable instance-ID path contains a forbidden tab/newline: %s"), **Value);
+				RestoreStableInstanceIds();
+				return false;
+			}
+		}
+		StableInstanceIdRecords.Add(Record);
+		Canonical += FString::Printf(
+			TEXT("%d\t%s\t%s\t%s\t%s\n"),
+			Record.InstanceId,
+			*Record.ComponentPath,
+			*Record.ActorPath,
+			*Record.ActorClassPath,
+			*Record.ComponentClassPath);
+
+		Component->SetRenderCustomDepth(true);
+		Component->SetCustomDepthStencilWriteMask(ERendererStencilMask::ERSM_Default);
+		Component->SetCustomDepthStencilValue(InstanceId);
+	}
+	StableInstanceIdMappingSha1 = HashString(Canonical);
+	if (!WriteStableInstanceIdMap(OutError))
+	{
+		RestoreStableInstanceIds();
+		return false;
+	}
+	bStableInstanceIdsPrepared = true;
+	return true;
+}
+
+bool USRDatasetCaptureSubsystem::ValidateStableInstanceIds(FString& OutError) const
+{
+	if (!ActiveJob.bAssignStableInstanceIds)
+	{
+		return true;
+	}
+	if (!bStableInstanceIdsPrepared)
+	{
+		OutError = TEXT("Stable instance IDs were not prepared after warmup and the streaming barrier.");
+		return false;
+	}
+	const TArray<UPrimitiveComponent*> Components = CollectStableInstanceComponents();
+	if (Components.Num() != StableInstanceIdRecords.Num())
+	{
+		TSet<FString> PreparedPaths;
+		TSet<FString> CurrentPaths;
+		for (const FStableInstanceIdRecord& Record : StableInstanceIdRecords)
+		{
+			PreparedPaths.Add(Record.ComponentPath);
+		}
+		for (const UPrimitiveComponent* Component : Components)
+		{
+			CurrentPaths.Add(Component->GetPathName());
+		}
+		TArray<FString> Added;
+		TArray<FString> Removed;
+		for (const FString& Path : CurrentPaths)
+		{
+			if (!PreparedPaths.Contains(Path))
+			{
+				Added.Add(Path);
+			}
+		}
+		for (const FString& Path : PreparedPaths)
+		{
+			if (!CurrentPaths.Contains(Path))
+			{
+				Removed.Add(Path);
+			}
+		}
+		Added.Sort();
+		Removed.Sort();
+		OutError = FString::Printf(
+			TEXT("Stable instance topology changed: prepared=%d current=%d added=[%s] removed=[%s]."),
+			StableInstanceIdRecords.Num(),
+			Components.Num(),
+			*FString::Join(Added, TEXT(",")),
+			*FString::Join(Removed, TEXT(",")));
+		return false;
+	}
+	for (int32 Index = 0; Index < Components.Num(); ++Index)
+	{
+		const UPrimitiveComponent* Component = Components[Index];
+		const FStableInstanceIdRecord& Record = StableInstanceIdRecords[Index];
+		if (Component->GetPathName() != Record.ComponentPath ||
+			!Component->bRenderCustomDepth ||
+			Component->CustomDepthStencilValue != Record.InstanceId ||
+			Component->CustomDepthStencilWriteMask != ERendererStencilMask::ERSM_Default)
+		{
+			OutError = FString::Printf(
+				TEXT("Stable instance topology/label drift at ID %d: expected=%s current=%s stencil=%d enabled=%s."),
+				Record.InstanceId,
+				*Record.ComponentPath,
+				*Component->GetPathName(),
+				Component->CustomDepthStencilValue,
+				Component->bRenderCustomDepth ? TEXT("true") : TEXT("false"));
+			return false;
+		}
+	}
+	return true;
+}
+
+bool USRDatasetCaptureSubsystem::WriteStableInstanceIdMap(FString& OutError) const
+{
+	if (!ActiveJob.bAssignStableInstanceIds)
+	{
+		return true;
+	}
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("schemaVersion"), 1);
+	Root->SetStringField(TEXT("encoding"), TEXT("custom_stencil_uint8"));
+	Root->SetNumberField(TEXT("backgroundId"), 0);
+	Root->SetNumberField(TEXT("maximumAssignableId"), 255);
+	Root->SetBoolField(TEXT("fixedTopologyRequired"), true);
+	Root->SetNumberField(TEXT("instanceCount"), StableInstanceIdRecords.Num());
+	Root->SetStringField(
+		TEXT("hashScope"),
+		TEXT("instance_id_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_component_path"));
+	Root->SetStringField(TEXT("sha1"), StableInstanceIdMappingSha1);
+	TArray<TSharedPtr<FJsonValue>> Instances;
+	Instances.Reserve(StableInstanceIdRecords.Num());
+	for (const FStableInstanceIdRecord& Record : StableInstanceIdRecords)
+	{
+		TSharedRef<FJsonObject> Instance = MakeShared<FJsonObject>();
+		Instance->SetNumberField(TEXT("instanceId"), Record.InstanceId);
+		Instance->SetStringField(TEXT("componentPath"), Record.ComponentPath);
+		Instance->SetStringField(TEXT("actorPath"), Record.ActorPath);
+		Instance->SetStringField(TEXT("actorClassPath"), Record.ActorClassPath);
+		Instance->SetStringField(TEXT("componentClassPath"), Record.ComponentClassPath);
+		Instances.Add(MakeShared<FJsonValueObject>(Instance));
+	}
+	Root->SetArrayField(TEXT("instances"), Instances);
+
+	FString Json;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Json);
+	if (!FJsonSerializer::Serialize(Root, Writer))
+	{
+		OutError = TEXT("Could not serialize stable instance-ID mapping JSON.");
+		return false;
+	}
+	const FString Path = FPaths::Combine(ResolvedOutputDirectory, TEXT("instance_id_map.json"));
+	const FString TempPath = Path + TEXT(".part");
+	if (!FFileHelper::SaveStringToFile(Json, *TempPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ||
+		!IFileManager::Get().Move(*Path, *TempPath, true, true, false, true))
+	{
+		OutError = FString::Printf(TEXT("Could not write stable instance-ID map: %s"), *Path);
+		return false;
+	}
+	return true;
+}
+
+void USRDatasetCaptureSubsystem::RestoreStableInstanceIds()
+{
+	for (const TPair<TWeakObjectPtr<UPrimitiveComponent>, FPrimitiveStencilState>& Pair :
+		StableInstanceStencilStates)
+	{
+		if (UPrimitiveComponent* Component = Pair.Key.Get())
+		{
+			Component->SetRenderCustomDepth(Pair.Value.bRenderCustomDepth);
+			Component->SetCustomDepthStencilWriteMask(
+				static_cast<ERendererStencilMask>(Pair.Value.CustomDepthStencilWriteMask));
+			Component->SetCustomDepthStencilValue(Pair.Value.CustomDepthStencilValue);
+		}
+	}
+	StableInstanceStencilStates.Reset();
+}
+
 bool USRDatasetCaptureSubsystem::PrepareDeterministicCamera(FString& OutError)
 {
 	if (!ActiveJob.bUseDeterministicCameraTransform)
@@ -880,18 +1157,21 @@ bool USRDatasetCaptureSubsystem::PrepareDeterministicCamera(FString& OutError)
 	}
 	DeterministicCameraPlayerController = Controller;
 	PreviousPlayerViewTarget = Controller->GetViewTarget();
-	EnforceDeterministicCamera();
+	EnforceDeterministicCamera(GetInitialEvaluationFrame());
 	return true;
 }
 
-void USRDatasetCaptureSubsystem::EnforceDeterministicCamera()
+void USRDatasetCaptureSubsystem::EnforceDeterministicCamera(const int32 LogicalFrame)
 {
 	if (!ActiveJob.bUseDeterministicCameraTransform || !DeterministicCameraActor)
 	{
 		return;
 	}
+	const FVector LogicalLocation = ActiveJob.DeterministicCameraLocationCm +
+		ActiveJob.DeterministicCameraTranslationPerLogicalFrameCm *
+		static_cast<double>(LogicalFrame - ActiveJob.StartFrame);
 	DeterministicCameraActor->SetActorLocationAndRotation(
-		ActiveJob.DeterministicCameraLocationCm,
+		LogicalLocation,
 		ActiveJob.DeterministicCameraRotationDegrees,
 		false,
 		nullptr,
@@ -2008,6 +2288,474 @@ USRDatasetCaptureSubsystem::FSceneStateSummary USRDatasetCaptureSubsystem::Compu
 	return Summary;
 }
 
+bool USRDatasetCaptureSubsystem::MatchesSceneControlClassRule(
+	const FString& ClassPath,
+	const TArray<FString>& Rules)
+{
+	for (const FString& RawRule : Rules)
+	{
+		const FString Rule = RawRule.TrimStartAndEnd();
+		if (Rule.EndsWith(TEXT("*"), ESearchCase::CaseSensitive))
+		{
+			if (ClassPath.StartsWith(Rule.LeftChop(1), ESearchCase::CaseSensitive))
+			{
+				return true;
+			}
+		}
+		else if (ClassPath.Equals(Rule, ESearchCase::CaseSensitive))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool USRDatasetCaptureSubsystem::RunSceneControlPreflight(FString& OutError)
+{
+	SceneControlPreflight = FSceneControlPreflightReport();
+	if (!ActiveJob.bRunSceneControlPreflight)
+	{
+		return true;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		OutError = TEXT("Scene-control preflight requires a valid world.");
+		return false;
+	}
+
+	SceneControlPreflight.bRan = true;
+	const auto NormalizeRules = [](const TArray<FString>& Source, TArray<FString>& Destination)
+	{
+		Destination.Reset(Source.Num());
+		for (const FString& Rule : Source)
+		{
+			Destination.Add(Rule.TrimStartAndEnd());
+		}
+		Destination.Sort([](const FString& Left, const FString& Right)
+		{
+			return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+		});
+	};
+	NormalizeRules(
+		ActiveJob.SceneControlAllowedTickingActorClassPaths,
+		SceneControlPreflight.AllowedTickingActorClassPaths);
+	NormalizeRules(
+		ActiveJob.SceneControlAllowedTickingComponentClassPaths,
+		SceneControlPreflight.AllowedTickingComponentClassPaths);
+	NormalizeRules(
+		ActiveJob.SceneControlAllowedNiagaraDataInterfaceClassPaths,
+		SceneControlPreflight.AllowedNiagaraDataInterfaceClassPaths);
+	NormalizeRules(
+		ActiveJob.SceneControlAllowedMaterialExpressionClassPaths,
+		SceneControlPreflight.AllowedMaterialExpressionClassPaths);
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!IsValid(Actor))
+		{
+			continue;
+		}
+
+		const bool bActorControlledByInterface = Actor->GetClass()->ImplementsInterface(
+			USRDatasetControllable::StaticClass());
+		const bool bActorControlledBySubsystem =
+			Actor == CaptureRig.Get() ||
+			Actor == ValidationFixture.Get() ||
+			Actor == SequenceActor.Get() ||
+			Actor == DeterministicCameraActor.Get() ||
+			Actor == NonFixtureSkeletalValidationActor.Get() ||
+			Actor == ProjectAnimatedMaterialValidationReceiver.Get();
+		const bool bActorControlled = bActorControlledByInterface || bActorControlledBySubsystem;
+		if (Actor->IsActorTickEnabled())
+		{
+			const FString ClassPath = Actor->GetClass()->GetPathName();
+			const FString Entry = FString::Printf(
+				TEXT("%s|%s|tick=actor"),
+				*Actor->GetPathName(),
+				*ClassPath);
+			if (bActorControlled)
+			{
+				SceneControlPreflight.ControlledTickingActors.Add(Entry);
+			}
+			else if (MatchesSceneControlClassRule(
+				ClassPath,
+				SceneControlPreflight.AllowedTickingActorClassPaths))
+			{
+				SceneControlPreflight.AllowedTickingActors.Add(Entry);
+			}
+			else
+			{
+				SceneControlPreflight.UncontrolledTickingActors.Add(Entry);
+			}
+		}
+
+		TInlineComponentArray<UActorComponent*> Components;
+		Actor->GetComponents(Components);
+		for (UActorComponent* Component : Components)
+		{
+			if (!IsValid(Component))
+			{
+				continue;
+			}
+
+			if (Component->IsRegistered() && Component->IsComponentTickEnabled())
+			{
+				const FString ClassPath = Component->GetClass()->GetPathName();
+				const FString Entry = FString::Printf(
+					TEXT("%s|%s|owner=%s|tick=component"),
+					*Component->GetPathName(),
+					*ClassPath,
+					*Actor->GetPathName());
+				if (bActorControlled)
+				{
+					SceneControlPreflight.ControlledTickingComponents.Add(Entry);
+				}
+				else if (MatchesSceneControlClassRule(
+					ClassPath,
+					SceneControlPreflight.AllowedTickingComponentClassPaths))
+				{
+					SceneControlPreflight.AllowedTickingComponents.Add(Entry);
+				}
+				else
+				{
+					SceneControlPreflight.UncontrolledTickingComponents.Add(Entry);
+				}
+			}
+
+			UNiagaraComponent* Niagara = Cast<UNiagaraComponent>(Component);
+			if (Niagara && Niagara->GetAsset())
+			{
+				UNiagaraSystem* System = Niagara->GetAsset();
+				const FString ComponentPath = Niagara->GetPathName();
+				const FString AssetPath = System->GetPathName();
+				const auto RecordDataInterface = [this, &ComponentPath, &AssetPath](
+					const FString& Source,
+					const FString& VariableName,
+					const UNiagaraDataInterface* DataInterface)
+				{
+					if (!IsValid(DataInterface))
+					{
+						return;
+					}
+					const FString ClassPath = DataInterface->GetClass()->GetPathName();
+					const FString Entry = FString::Printf(
+						TEXT("%s|asset=%s|source=%s|variable=%s|object=%s|class=%s"),
+						*ComponentPath,
+						*AssetPath,
+						*Source,
+						*VariableName,
+						*DataInterface->GetPathName(),
+						*ClassPath);
+					SceneControlPreflight.NiagaraDataInterfaces.AddUnique(Entry);
+					if (MatchesSceneControlClassRule(
+						ClassPath,
+						SceneControlPreflight.AllowedNiagaraDataInterfaceClassPaths))
+					{
+						SceneControlPreflight.AllowedNiagaraDataInterfaces.AddUnique(Entry);
+					}
+					else
+					{
+						SceneControlPreflight.UncontrolledNiagaraDataInterfaces.AddUnique(Entry);
+					}
+				};
+				const auto RecordParameterStore = [&RecordDataInterface](
+					const FString& Source,
+					const FNiagaraParameterStore& Store)
+				{
+					for (const UNiagaraDataInterface* DataInterface : Store.GetDataInterfaces())
+					{
+						const FNiagaraVariableBase* Variable = Store.FindVariableFromDataInterface(DataInterface);
+						RecordDataInterface(
+							Source,
+							Variable ? Variable->GetName().ToString() : TEXT("unknown"),
+							DataInterface);
+					}
+				};
+
+				RecordParameterStore(TEXT("component_override"), Niagara->GetOverrideParameters());
+				RecordParameterStore(TEXT("system_exposed"), System->GetExposedParameters());
+				if (Niagara->GetForceSolo())
+				{
+					if (FNiagaraSystemInstanceControllerPtr Controller = Niagara->GetSystemInstanceController())
+					{
+						if (FNiagaraSystemInstance* Instance = Controller->GetSoloSystemInstance())
+						{
+							RecordParameterStore(TEXT("runtime_instance"), Instance->GetInstanceParameters());
+						}
+					}
+				}
+				System->ForEachScript([&RecordDataInterface](const UNiagaraScript* Script)
+				{
+					if (!Script)
+					{
+						return;
+					}
+					for (const FNiagaraScriptResolvedDataInterfaceInfo& Info : Script->GetResolvedDataInterfaces())
+					{
+						RecordDataInterface(
+							FString::Printf(TEXT("script_resolved:%s"), *Script->GetPathName()),
+							Info.Name.ToString(),
+							Info.ResolvedDataInterface);
+					}
+				});
+			}
+
+			UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(Component);
+			if (!Primitive || !Primitive->IsRegistered())
+			{
+				continue;
+			}
+			for (int32 MaterialIndex = 0; MaterialIndex < Primitive->GetNumMaterials(); ++MaterialIndex)
+			{
+				UMaterialInterface* MaterialInterface = Primitive->GetMaterial(MaterialIndex);
+				UMaterial* Material = MaterialInterface ? MaterialInterface->GetMaterial() : nullptr;
+				if (!Material)
+				{
+					continue;
+				}
+
+				const auto RecordMaterialInput = [this, Primitive, MaterialInterface, Material, MaterialIndex](
+					const UMaterialExpression* Expression,
+					const TCHAR* Source,
+					const bool bControlled)
+				{
+					if (!IsValid(Expression))
+					{
+						return;
+					}
+					const FString ClassPath = Expression->GetClass()->GetPathName();
+					const FString Entry = FString::Printf(
+						TEXT("%s|slot=%d|interface=%s|material=%s|expression=%s|class=%s|source=%s"),
+						*Primitive->GetPathName(),
+						MaterialIndex,
+						MaterialInterface ? *MaterialInterface->GetPathName() : TEXT("none"),
+						*Material->GetPathName(),
+						*Expression->GetPathName(),
+						*ClassPath,
+						Source);
+					if (bControlled)
+					{
+						SceneControlPreflight.ControlledMaterialInputs.AddUnique(Entry);
+					}
+					else if (MatchesSceneControlClassRule(
+						ClassPath,
+						SceneControlPreflight.AllowedMaterialExpressionClassPaths))
+					{
+						SceneControlPreflight.AllowedMaterialInputs.AddUnique(Entry);
+					}
+					else
+					{
+						SceneControlPreflight.UncontrolledMaterialInputs.AddUnique(Entry);
+					}
+				};
+
+				TArray<UMaterialExpressionTime*> TimeExpressions;
+				Material->GetAllExpressionsInMaterialAndFunctionsOfType(TimeExpressions);
+				for (const UMaterialExpressionTime* Expression : TimeExpressions)
+				{
+					RecordMaterialInput(
+						Expression,
+						Expression->bIgnorePause ? TEXT("real_time") : TEXT("game_time"),
+						ActiveJob.bLockMaterialTimeToLogicalFrame);
+				}
+
+				TArray<UMaterialExpressionPerInstanceRandom*> PerInstanceRandomExpressions;
+				Material->GetAllExpressionsInMaterialAndFunctionsOfType(PerInstanceRandomExpressions);
+				for (const UMaterialExpressionPerInstanceRandom* Expression : PerInstanceRandomExpressions)
+				{
+					RecordMaterialInput(Expression, TEXT("per_instance_random"), false);
+				}
+
+				TArray<UMaterialExpressionParticleRandom*> ParticleRandomExpressions;
+				Material->GetAllExpressionsInMaterialAndFunctionsOfType(ParticleRandomExpressions);
+				const bool bParticleRandomControlled =
+					Niagara != nullptr && ActiveJob.bControlNiagara && ActiveJob.bForceNiagaraDeterminism;
+				for (const UMaterialExpressionParticleRandom* Expression : ParticleRandomExpressions)
+				{
+					RecordMaterialInput(Expression, TEXT("particle_random"), bParticleRandomControlled);
+				}
+			}
+		}
+	}
+
+	const auto SortStrings = [](TArray<FString>& Values)
+	{
+		Values.Sort([](const FString& Left, const FString& Right)
+		{
+			return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+		});
+	};
+	SortStrings(SceneControlPreflight.ControlledTickingActors);
+	SortStrings(SceneControlPreflight.AllowedTickingActors);
+	SortStrings(SceneControlPreflight.UncontrolledTickingActors);
+	SortStrings(SceneControlPreflight.ControlledTickingComponents);
+	SortStrings(SceneControlPreflight.AllowedTickingComponents);
+	SortStrings(SceneControlPreflight.UncontrolledTickingComponents);
+	SortStrings(SceneControlPreflight.NiagaraDataInterfaces);
+	SortStrings(SceneControlPreflight.AllowedNiagaraDataInterfaces);
+	SortStrings(SceneControlPreflight.UncontrolledNiagaraDataInterfaces);
+	SortStrings(SceneControlPreflight.ControlledMaterialInputs);
+	SortStrings(SceneControlPreflight.AllowedMaterialInputs);
+	SortStrings(SceneControlPreflight.UncontrolledMaterialInputs);
+
+	SceneControlPreflight.bPassed =
+		SceneControlPreflight.UncontrolledTickingActors.IsEmpty() &&
+		SceneControlPreflight.UncontrolledTickingComponents.IsEmpty() &&
+		SceneControlPreflight.UncontrolledNiagaraDataInterfaces.IsEmpty() &&
+		SceneControlPreflight.UncontrolledMaterialInputs.IsEmpty();
+
+	TArray<FString> CanonicalLines;
+	CanonicalLines.Add(TEXT("schemaVersion=1"));
+	CanonicalLines.Add(FString::Printf(
+		TEXT("required=%d"),
+		ActiveJob.bRequireSceneControlPreflight ? 1 : 0));
+	const auto AddCanonicalLines = [&CanonicalLines](const TCHAR* Label, const TArray<FString>& Values)
+	{
+		for (const FString& Value : Values)
+		{
+			CanonicalLines.Add(FString::Printf(TEXT("%s|%s"), Label, *Value));
+		}
+	};
+	AddCanonicalLines(TEXT("allowedTickingActorClassPath"), SceneControlPreflight.AllowedTickingActorClassPaths);
+	AddCanonicalLines(TEXT("allowedTickingComponentClassPath"), SceneControlPreflight.AllowedTickingComponentClassPaths);
+	AddCanonicalLines(TEXT("allowedNiagaraDataInterfaceClassPath"), SceneControlPreflight.AllowedNiagaraDataInterfaceClassPaths);
+	AddCanonicalLines(TEXT("allowedMaterialExpressionClassPath"), SceneControlPreflight.AllowedMaterialExpressionClassPaths);
+	AddCanonicalLines(TEXT("controlledTickingActor"), SceneControlPreflight.ControlledTickingActors);
+	AddCanonicalLines(TEXT("allowedTickingActor"), SceneControlPreflight.AllowedTickingActors);
+	AddCanonicalLines(TEXT("uncontrolledTickingActor"), SceneControlPreflight.UncontrolledTickingActors);
+	AddCanonicalLines(TEXT("controlledTickingComponent"), SceneControlPreflight.ControlledTickingComponents);
+	AddCanonicalLines(TEXT("allowedTickingComponent"), SceneControlPreflight.AllowedTickingComponents);
+	AddCanonicalLines(TEXT("uncontrolledTickingComponent"), SceneControlPreflight.UncontrolledTickingComponents);
+	AddCanonicalLines(TEXT("niagaraDataInterface"), SceneControlPreflight.NiagaraDataInterfaces);
+	AddCanonicalLines(TEXT("allowedNiagaraDataInterface"), SceneControlPreflight.AllowedNiagaraDataInterfaces);
+	AddCanonicalLines(TEXT("uncontrolledNiagaraDataInterface"), SceneControlPreflight.UncontrolledNiagaraDataInterfaces);
+	AddCanonicalLines(TEXT("controlledMaterialInput"), SceneControlPreflight.ControlledMaterialInputs);
+	AddCanonicalLines(TEXT("allowedMaterialInput"), SceneControlPreflight.AllowedMaterialInputs);
+	AddCanonicalLines(TEXT("uncontrolledMaterialInput"), SceneControlPreflight.UncontrolledMaterialInputs);
+	SceneControlPreflight.Sha1 = HashString(FString::Join(CanonicalLines, TEXT("\n")));
+
+	if (!WriteSceneControlPreflightReport(OutError))
+	{
+		return false;
+	}
+	if (ActiveJob.bRequireSceneControlPreflight && !SceneControlPreflight.bPassed)
+	{
+		OutError = FString::Printf(
+			TEXT("Scene-control preflight failed: actors=%d components=%d NiagaraDIs=%d materialInputs=%d. Inspect %s."),
+			SceneControlPreflight.UncontrolledTickingActors.Num(),
+			SceneControlPreflight.UncontrolledTickingComponents.Num(),
+			SceneControlPreflight.UncontrolledNiagaraDataInterfaces.Num(),
+			SceneControlPreflight.UncontrolledMaterialInputs.Num(),
+			*FPaths::Combine(ResolvedOutputDirectory, TEXT("scene_control_preflight.json")));
+		return false;
+	}
+	if (!SceneControlPreflight.bPassed)
+	{
+		UE_LOG(
+			LogSRDataset,
+			Warning,
+			TEXT("Scene-control preflight is report-only and found %d Actor, %d component, %d Niagara DI and %d material-input exception(s)."),
+			SceneControlPreflight.UncontrolledTickingActors.Num(),
+			SceneControlPreflight.UncontrolledTickingComponents.Num(),
+			SceneControlPreflight.UncontrolledNiagaraDataInterfaces.Num(),
+			SceneControlPreflight.UncontrolledMaterialInputs.Num());
+	}
+	return true;
+}
+
+bool USRDatasetCaptureSubsystem::WriteSceneControlPreflightReport(FString& OutError) const
+{
+	if (!SceneControlPreflight.bRan)
+	{
+		OutError = TEXT("Cannot write a scene-control preflight report before the scan has run.");
+		return false;
+	}
+
+	const auto ToJsonArray = [](const TArray<FString>& Values)
+	{
+		TArray<TSharedPtr<FJsonValue>> JsonValues;
+		JsonValues.Reserve(Values.Num());
+		for (const FString& Value : Values)
+		{
+			JsonValues.Add(MakeShared<FJsonValueString>(Value));
+		}
+		return JsonValues;
+	};
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("schemaVersion"), 1);
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.9.0"));
+	Root->SetBoolField(TEXT("ran"), SceneControlPreflight.bRan);
+	Root->SetBoolField(TEXT("required"), ActiveJob.bRequireSceneControlPreflight);
+	Root->SetBoolField(TEXT("passed"), SceneControlPreflight.bPassed);
+	Root->SetStringField(TEXT("sha1"), SceneControlPreflight.Sha1);
+	Root->SetStringField(
+		TEXT("hashScope"),
+		TEXT("schema_required_sorted_allowlist_rules_and_classified_tick_niagara_di_material_input_records"));
+
+	TSharedRef<FJsonObject> Allowlists = MakeShared<FJsonObject>();
+	Allowlists->SetArrayField(
+		TEXT("tickingActorClassPaths"),
+		ToJsonArray(SceneControlPreflight.AllowedTickingActorClassPaths));
+	Allowlists->SetArrayField(
+		TEXT("tickingComponentClassPaths"),
+		ToJsonArray(SceneControlPreflight.AllowedTickingComponentClassPaths));
+	Allowlists->SetArrayField(
+		TEXT("niagaraDataInterfaceClassPaths"),
+		ToJsonArray(SceneControlPreflight.AllowedNiagaraDataInterfaceClassPaths));
+	Allowlists->SetArrayField(
+		TEXT("materialExpressionClassPaths"),
+		ToJsonArray(SceneControlPreflight.AllowedMaterialExpressionClassPaths));
+	Root->SetObjectField(TEXT("allowlists"), Allowlists);
+
+	TSharedRef<FJsonObject> Counts = MakeShared<FJsonObject>();
+	Counts->SetNumberField(TEXT("controlledTickingActors"), SceneControlPreflight.ControlledTickingActors.Num());
+	Counts->SetNumberField(TEXT("allowedTickingActors"), SceneControlPreflight.AllowedTickingActors.Num());
+	Counts->SetNumberField(TEXT("uncontrolledTickingActors"), SceneControlPreflight.UncontrolledTickingActors.Num());
+	Counts->SetNumberField(TEXT("controlledTickingComponents"), SceneControlPreflight.ControlledTickingComponents.Num());
+	Counts->SetNumberField(TEXT("allowedTickingComponents"), SceneControlPreflight.AllowedTickingComponents.Num());
+	Counts->SetNumberField(TEXT("uncontrolledTickingComponents"), SceneControlPreflight.UncontrolledTickingComponents.Num());
+	Counts->SetNumberField(TEXT("niagaraDataInterfaces"), SceneControlPreflight.NiagaraDataInterfaces.Num());
+	Counts->SetNumberField(TEXT("allowedNiagaraDataInterfaces"), SceneControlPreflight.AllowedNiagaraDataInterfaces.Num());
+	Counts->SetNumberField(TEXT("uncontrolledNiagaraDataInterfaces"), SceneControlPreflight.UncontrolledNiagaraDataInterfaces.Num());
+	Counts->SetNumberField(TEXT("controlledMaterialInputs"), SceneControlPreflight.ControlledMaterialInputs.Num());
+	Counts->SetNumberField(TEXT("allowedMaterialInputs"), SceneControlPreflight.AllowedMaterialInputs.Num());
+	Counts->SetNumberField(TEXT("uncontrolledMaterialInputs"), SceneControlPreflight.UncontrolledMaterialInputs.Num());
+	Root->SetObjectField(TEXT("counts"), Counts);
+
+	Root->SetArrayField(TEXT("controlledTickingActors"), ToJsonArray(SceneControlPreflight.ControlledTickingActors));
+	Root->SetArrayField(TEXT("allowedTickingActors"), ToJsonArray(SceneControlPreflight.AllowedTickingActors));
+	Root->SetArrayField(TEXT("uncontrolledTickingActors"), ToJsonArray(SceneControlPreflight.UncontrolledTickingActors));
+	Root->SetArrayField(TEXT("controlledTickingComponents"), ToJsonArray(SceneControlPreflight.ControlledTickingComponents));
+	Root->SetArrayField(TEXT("allowedTickingComponents"), ToJsonArray(SceneControlPreflight.AllowedTickingComponents));
+	Root->SetArrayField(TEXT("uncontrolledTickingComponents"), ToJsonArray(SceneControlPreflight.UncontrolledTickingComponents));
+	Root->SetArrayField(TEXT("niagaraDataInterfaces"), ToJsonArray(SceneControlPreflight.NiagaraDataInterfaces));
+	Root->SetArrayField(TEXT("allowedNiagaraDataInterfaces"), ToJsonArray(SceneControlPreflight.AllowedNiagaraDataInterfaces));
+	Root->SetArrayField(TEXT("uncontrolledNiagaraDataInterfaces"), ToJsonArray(SceneControlPreflight.UncontrolledNiagaraDataInterfaces));
+	Root->SetArrayField(TEXT("controlledMaterialInputs"), ToJsonArray(SceneControlPreflight.ControlledMaterialInputs));
+	Root->SetArrayField(TEXT("allowedMaterialInputs"), ToJsonArray(SceneControlPreflight.AllowedMaterialInputs));
+	Root->SetArrayField(TEXT("uncontrolledMaterialInputs"), ToJsonArray(SceneControlPreflight.UncontrolledMaterialInputs));
+
+	FString Json;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Json);
+	if (!FJsonSerializer::Serialize(Root, Writer))
+	{
+		OutError = TEXT("Could not serialize the scene-control preflight report.");
+		return false;
+	}
+	const FString ReportPath = FPaths::Combine(ResolvedOutputDirectory, TEXT("scene_control_preflight.json"));
+	const FString TempPath = ReportPath + TEXT(".part");
+	if (!FFileHelper::SaveStringToFile(Json, *TempPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ||
+		!IFileManager::Get().Move(*ReportPath, *TempPath, true, true, false, true))
+	{
+		OutError = FString::Printf(TEXT("Could not write scene-control preflight report: %s"), *ReportPath);
+		return false;
+	}
+	return true;
+}
+
 void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds)
 {
 	if (World != GetWorld() || !SRDataset::Private::IsRunningState(Status.State))
@@ -2029,7 +2777,6 @@ void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTi
 			return;
 		}
 	}
-	EnforceDeterministicCamera();
 	if (Status.State == ESRDatasetCaptureState::Capturing &&
 		ActiveJob.bSuppressMainViewOnUncapturedFrames)
 	{
@@ -2053,6 +2800,7 @@ void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTi
 			EvaluationFrame = WarmupPoseCacheFrame;
 		}
 	}
+	EnforceDeterministicCamera(EvaluationFrame);
 	ApplyLogicalTemporalJitter(EvaluationFrame);
 	FString Error;
 	if (!EvaluateSequence(EvaluationFrame, Error))
@@ -2170,6 +2918,15 @@ void USRDatasetCaptureSubsystem::HandleWorldTickEnd(UWorld* World, ELevelTick Ti
 	{
 		FString Error;
 		if (!EnsureStreamingReady(Error))
+		{
+			FinishCapture(ESRDatasetCaptureState::Failed, Error);
+			return;
+		}
+	}
+	if (ActiveJob.bAssignStableInstanceIds && !bStableInstanceIdsPrepared)
+	{
+		FString Error;
+		if (!PrepareStableInstanceIds(Error))
 		{
 			FinishCapture(ESRDatasetCaptureState::Failed, Error);
 			return;
@@ -2502,7 +3259,11 @@ bool USRDatasetCaptureSubsystem::UpdateCaptureCamera(
 	bool bFoundCamera = false;
 	if (ActiveJob.bUseDeterministicCameraTransform && DeterministicCameraActor)
 	{
-		EnforceDeterministicCamera();
+		const int32 CameraLogicalFrame =
+			Status.State == ESRDatasetCaptureState::WarmingUp
+				? (WarmupPoseCacheFrame != INDEX_NONE ? WarmupPoseCacheFrame : GetInitialEvaluationFrame())
+				: Status.CurrentFrame;
+		EnforceDeterministicCamera(CameraLogicalFrame);
 		if (UCameraComponent* Camera = DeterministicCameraActor->GetCameraComponent())
 		{
 			Camera->GetCameraView(0.0f, View);
@@ -2560,7 +3321,8 @@ bool USRDatasetCaptureSubsystem::UpdateCaptureCamera(
 			Status.CurrentFrame,
 			ActiveJob.StartFrame,
 			ActiveJob.HRResolution,
-			ActiveJob.bUseLastCapturedEndpointTransforms);
+			ActiveJob.bUseLastCapturedEndpointTransforms,
+			ActiveJob.SemanticMotionScenario);
 	}
 	return true;
 }
@@ -2568,6 +3330,10 @@ bool USRDatasetCaptureSubsystem::UpdateCaptureCamera(
 bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 {
 	if (!UpdateCaptureCamera(true, OutError))
+	{
+		return false;
+	}
+	if (!ValidateStableInstanceIds(OutError))
 	{
 		return false;
 	}
@@ -2600,6 +3366,15 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 			{
 				Hashes.Add(Modality, HashFile(MakeFramePath(Modality, FrameNumber, TEXT("exr"))));
 			}
+		}
+		if (ActiveJob.bCaptureSceneCaptureLRComparison)
+		{
+			Hashes.Add(
+				SRDataset::Private::SceneCaptureLRComparisonModality,
+				HashFile(MakeFramePath(
+					SRDataset::Private::SceneCaptureLRComparisonModality,
+					FrameNumber,
+					TEXT("exr"))));
 		}
 		if (ActiveJob.bCaptureReferenceHR)
 		{
@@ -2941,6 +3716,12 @@ bool USRDatasetCaptureSubsystem::IsFrameAlreadyComplete(const int32 FrameNumber)
 			}
 		}
 	}
+	if (ActiveJob.bCaptureSceneCaptureLRComparison &&
+		!IFileManager::Get().FileExists(*MakeFramePath(
+			SRDataset::Private::SceneCaptureLRComparisonModality, FrameNumber, TEXT("exr"))))
+	{
+		return false;
+	}
 	if (ActiveJob.bCaptureReferenceHR &&
 		!IFileManager::Get().FileExists(*MakeFramePath(
 			SRDataset::Private::ReferenceHRModality, FrameNumber, TEXT("exr"))))
@@ -3053,6 +3834,13 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		IStreamingManager::HasShutdown() ? -1 : IStreamingManager::Get().GetNumWantingResources());
 	const FSceneStateSummary SceneState = ComputeSceneStateSummary();
 	Frame->SetStringField(TEXT("sceneStateSha1"), SceneState.Sha1);
+	Frame->SetBoolField(TEXT("stableInstanceIdsEnabled"), ActiveJob.bAssignStableInstanceIds);
+	Frame->SetStringField(
+		TEXT("stableInstanceIdMappingSha1"),
+		ActiveJob.bAssignStableInstanceIds ? StableInstanceIdMappingSha1 : TEXT("not_used"));
+	Frame->SetNumberField(
+		TEXT("stableInstanceIdCount"),
+		ActiveJob.bAssignStableInstanceIds ? StableInstanceIdRecords.Num() : 0);
 	Frame->SetNumberField(TEXT("sceneActorCount"), SceneState.ActorCount);
 	Frame->SetNumberField(TEXT("sceneComponentCount"), SceneState.ComponentCount);
 	Frame->SetNumberField(TEXT("sceneSkeletalComponentCount"), SceneState.SkeletalComponentCount);
@@ -3363,6 +4151,15 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 			Files->SetStringField(Modality, FString::Printf(TEXT("%s/frame_%06d.exr"), Modality, FrameNumber));
 		}
 	}
+	if (ActiveJob.bCaptureSceneCaptureLRComparison)
+	{
+		Files->SetStringField(
+			SRDataset::Private::SceneCaptureLRComparisonModality,
+			FString::Printf(
+				TEXT("%s/frame_%06d.exr"),
+				SRDataset::Private::SceneCaptureLRComparisonModality,
+				FrameNumber));
+	}
 	if (ActiveJob.bCaptureReferenceHR)
 	{
 		Files->SetStringField(
@@ -3408,7 +4205,22 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		const FSRDatasetValidationFixtureFrame& FixtureFrame = ValidationFixture->GetFrameMetadata();
 		TSharedRef<FJsonObject> Fixture = MakeShared<FJsonObject>();
 		Fixture->SetBoolField(TEXT("enabled"), true);
+		Fixture->SetBoolField(TEXT("analyticProjectionValid"), FixtureFrame.bValid);
 		Fixture->SetBoolField(TEXT("sourceLevelGeometryHidden"), true);
+		Fixture->SetStringField(
+			TEXT("motionScenario"),
+			StaticEnum<ESRDatasetSemanticMotionScenario>()->GetNameStringByValue(
+				static_cast<int64>(FixtureFrame.MotionScenario)));
+		Fixture->SetBoolField(TEXT("worldAnchored"), FixtureFrame.bWorldAnchored);
+		Fixture->SetBoolField(TEXT("objectMotionEnabled"), FixtureFrame.bObjectMotionEnabled);
+		Fixture->SetArrayField(TEXT("currentCameraLocationCm"), {
+			MakeShared<FJsonValueNumber>(FixtureFrame.CurrentCameraLocationCm.X),
+			MakeShared<FJsonValueNumber>(FixtureFrame.CurrentCameraLocationCm.Y),
+			MakeShared<FJsonValueNumber>(FixtureFrame.CurrentCameraLocationCm.Z) });
+		Fixture->SetArrayField(TEXT("previousCameraLocationCm"), {
+			MakeShared<FJsonValueNumber>(FixtureFrame.PreviousCameraLocationCm.X),
+			MakeShared<FJsonValueNumber>(FixtureFrame.PreviousCameraLocationCm.Y),
+			MakeShared<FJsonValueNumber>(FixtureFrame.PreviousCameraLocationCm.Z) });
 		Fixture->SetNumberField(TEXT("logicalFrameId"), FixtureFrame.LogicalFrame);
 		Fixture->SetNumberField(TEXT("movingObjectId"), ASRDatasetValidationFixture::MovingObjectId);
 		Fixture->SetNumberField(TEXT("backgroundObjectId"), ASRDatasetValidationFixture::BackgroundObjectId);
@@ -3420,6 +4232,9 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		Fixture->SetArrayField(TEXT("expectedMovingMotionDisplayPixels"), {
 			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedMovingMotionDisplayPixels.X),
 			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedMovingMotionDisplayPixels.Y) });
+		Fixture->SetArrayField(TEXT("expectedBackgroundMotionDisplayPixels"), {
+			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedBackgroundMotionDisplayPixels.X),
+			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedBackgroundMotionDisplayPixels.Y) });
 		Fixture->SetNumberField(TEXT("skeletalCurrentRightCm"), FixtureFrame.SkeletalCurrentRightCm);
 		Fixture->SetNumberField(TEXT("skeletalPreviousRightCm"), FixtureFrame.SkeletalPreviousRightCm);
 		Fixture->SetArrayField(TEXT("expectedSkeletalMotionDisplayPixels"), {
@@ -3606,13 +4421,29 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				TEXT("one_rejects_previous_history_at_motion_reprojected_pixel"));
 			Temporal->SetStringField(
 				TEXT("historyRejectionSource"),
-				TEXT("custom_stencil_identity_else_static_camera_depth_reprojection_v1"));
+				TEXT("component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"));
 			Temporal->SetBoolField(TEXT("historyRejectionTrainingUsable"), true);
 			Temporal->SetBoolField(TEXT("historyRejectionRequiresValidityMask"), true);
 			Temporal->SetBoolField(TEXT("historyRejectionProductionCertified"), false);
+			Temporal->SetStringField(TEXT("disocclusionMaskAlias"), TEXT("history_rejection_mask"));
+			Temporal->SetStringField(TEXT("disocclusionValidityAlias"), TEXT("history_rejection_valid"));
+			Temporal->SetStringField(TEXT("disocclusionReasonAlias"), TEXT("history_rejection_reason"));
+			TSharedRef<FJsonObject> RejectionReasons = MakeShared<FJsonObject>();
+			RejectionReasons->SetStringField(TEXT("0"), TEXT("accepted_static_or_camera_depth"));
+			RejectionReasons->SetStringField(TEXT("1"), TEXT("history_reset"));
+			RejectionReasons->SetStringField(TEXT("2"), TEXT("invalid_current_inputs"));
+			RejectionReasons->SetStringField(TEXT("3"), TEXT("previous_pixel_out_of_bounds"));
+			RejectionReasons->SetStringField(TEXT("4"), TEXT("instance_identity_mismatch"));
+			RejectionReasons->SetStringField(TEXT("5"), TEXT("static_depth_occlusion"));
+			RejectionReasons->SetStringField(TEXT("6"), TEXT("dynamic_same_instance_uncertain"));
+			RejectionReasons->SetStringField(TEXT("7"), TEXT("unlabeled_dynamic_uncertain"));
+			RejectionReasons->SetStringField(TEXT("8"), TEXT("depth_evidence_unavailable"));
+			Temporal->SetObjectField(TEXT("historyRejectionReasonCodes"), RejectionReasons);
 			Temporal->SetStringField(
 				TEXT("historyRejectionKnownLimit"),
-				TEXT("unlabeled_velocity_covered_geometry_is_invalid;custom_stencil_uint8_is_not_instance_unique_and_same_id_self_occlusion_is_unresolved"));
+				ActiveJob.bAssignStableInstanceIds
+					? TEXT("dynamic_same_component_self_occlusion_is_conservatively_rejected_with_validity_zero;unlabeled_or_non_custom_depth_pixels_may_be_invalid;fixed_topology_uint8_limit_255")
+					: TEXT("dynamic_same_id_and_unlabeled_velocity_covered_geometry_are_conservatively_rejected_with_validity_zero;custom_stencil_uint8_may_not_be_instance_unique"));
 			Temporal->SetNumberField(TEXT("motionPreviousLogicalFrameId"), MotionPreviousFrame);
 			Temporal->SetNumberField(TEXT("motionTimeSpanS"), MotionTimeSpanFrames * ActiveJob.GetFixedDeltaSeconds());
 			Temporal->SetBoolField(TEXT("motionTrainingUsable"), !bIntermediateReplay);
@@ -3621,7 +4452,18 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 			Temporal->SetStringField(TEXT("transparencyMaskSource"), TEXT("one_minus_post_dof_separate_translucency_transmittance"));
 			Temporal->SetStringField(TEXT("reactiveMaskSource"), TEXT("conservative_post_dof_transparency_coverage_v1"));
 			Temporal->SetBoolField(TEXT("reactiveMaskIncludesOpaqueAnimation"), false);
-			Temporal->SetStringField(TEXT("objectIdSource"), TEXT("custom_stencil_uint8_zero_unlabeled"));
+			Temporal->SetStringField(
+				TEXT("objectIdSource"),
+				ActiveJob.bAssignStableInstanceIds
+					? TEXT("stable_component_unique_custom_stencil_uint8_zero_background")
+					: TEXT("custom_stencil_uint8_zero_unlabeled"));
+			Temporal->SetBoolField(TEXT("objectIdInstanceUnique"), ActiveJob.bAssignStableInstanceIds);
+			Temporal->SetStringField(
+				TEXT("objectIdMappingSha1"),
+				ActiveJob.bAssignStableInstanceIds ? StableInstanceIdMappingSha1 : TEXT("not_used"));
+			Temporal->SetNumberField(
+				TEXT("objectIdInstanceCount"),
+				ActiveJob.bAssignStableInstanceIds ? StableInstanceIdRecords.Num() : 0);
 			Frame->SetObjectField(TEXT("temporalDiagnostics"), Temporal);
 
 			const FSRDatasetTemporalFrameMetadata& NativeHR = CaptureRig->GetLastNativeHRMetadata();
@@ -3655,6 +4497,46 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				Native->SetArrayField(TEXT("worldViewOriginHighCurrent"), Vector3Array(NativeHR.WorldViewOriginHighCurrent));
 				Native->SetArrayField(TEXT("worldViewOriginLowCurrent"), Vector3Array(NativeHR.WorldViewOriginLowCurrent));
 				Frame->SetObjectField(TEXT("nativeHRDiagnostics"), Native);
+			}
+
+			const FSRDatasetTemporalFrameMetadata& SceneCaptureLR = CaptureRig->GetLastSceneCaptureLRMetadata();
+			if (ActiveJob.bCaptureSceneCaptureLRComparison && SceneCaptureLR.bValid)
+			{
+				TSharedRef<FJsonObject> Comparison = MakeShared<FJsonObject>();
+				Comparison->SetStringField(TEXT("pipelineStage"), TEXT("after_dof_before_temporal_upscaler"));
+				Comparison->SetStringField(TEXT("colorSpace"), TEXT("linear_scene_rgb"));
+				Comparison->SetBoolField(TEXT("preExposed"), true);
+				Comparison->SetNumberField(TEXT("preExposure"), SceneCaptureLR.PreExposure);
+				Comparison->SetNumberField(TEXT("exposure"), SceneCaptureLR.OneOverPreExposure);
+				Comparison->SetNumberField(TEXT("renderGameTimeS"), SceneCaptureLR.GameTimeSeconds);
+				Comparison->SetNumberField(TEXT("renderDeltaTimeS"), SceneCaptureLR.DeltaTimeSeconds);
+				Comparison->SetNumberField(TEXT("automaticViewMipBias"), SceneCaptureLR.MaterialTextureMipBias);
+				Comparison->SetStringField(TEXT("automaticViewMipBiasPolicy"), TEXT("isolated_native_lr_scene_capture"));
+				Comparison->SetNumberField(TEXT("globalMipMapLODBias"), GlobalMipMapLODBias);
+				Comparison->SetNumberField(
+					TEXT("effectiveMaterialTextureMipBias"),
+					SceneCaptureLR.MaterialTextureMipBias + GlobalMipMapLODBias);
+				Comparison->SetArrayField(TEXT("renderSize"), {
+					MakeShared<FJsonValueNumber>(SceneCaptureLR.ViewSize.X),
+					MakeShared<FJsonValueNumber>(SceneCaptureLR.ViewSize.Y) });
+				Comparison->SetArrayField(TEXT("displaySize"), {
+					MakeShared<FJsonValueNumber>(ActiveJob.HRResolution.X),
+					MakeShared<FJsonValueNumber>(ActiveJob.HRResolution.Y) });
+				Comparison->SetArrayField(TEXT("jitterCurrentNDC"), Vector2Array(SceneCaptureLR.JitterCurrentNDC));
+				Comparison->SetArrayField(TEXT("jitterPreviousNDC"), Vector2Array(SceneCaptureLR.JitterPreviousNDC));
+				Comparison->SetBoolField(TEXT("fixedOutputGrid"), SceneCaptureLR.JitterCurrentNDC.IsNearlyZero());
+				Comparison->SetBoolField(TEXT("historyAdvance"), false);
+				Comparison->SetBoolField(TEXT("simulationAdvance"), false);
+				Comparison->SetStringField(TEXT("viewState"), TEXT("isolated_native_lr_scene_capture"));
+				Comparison->SetStringField(
+					TEXT("pixelAlignment"),
+					TEXT("scene_capture_resampled_to_main_view_using_main_view_current_render_pixel_jitter"));
+				Comparison->SetArrayField(TEXT("viewToClipCurrentJittered"), MatrixArray(SceneCaptureLR.ViewToClipJittered));
+				Comparison->SetArrayField(TEXT("viewToClipCurrentUnjittered"), MatrixArray(SceneCaptureLR.ViewToClipUnjittered));
+				Comparison->SetArrayField(TEXT("translatedWorldToViewCurrent"), MatrixArray(SceneCaptureLR.TranslatedWorldToViewCurrent));
+				Comparison->SetArrayField(TEXT("worldViewOriginHighCurrent"), Vector3Array(SceneCaptureLR.WorldViewOriginHighCurrent));
+				Comparison->SetArrayField(TEXT("worldViewOriginLowCurrent"), Vector3Array(SceneCaptureLR.WorldViewOriginLowCurrent));
+				Frame->SetObjectField(TEXT("sceneCaptureLRComparisonDiagnostics"), Comparison);
 			}
 
 			const FSRDatasetTemporalFrameMetadata& ReferenceHR = CaptureRig->GetLastReferenceHRMetadata();
@@ -3785,7 +4667,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.4.1"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.9.0"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -3803,6 +4685,52 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	TSharedRef<FJsonObject> JobObject = MakeShared<FJsonObject>();
 	FJsonObjectConverter::UStructToJsonObject(FSRDatasetCaptureJob::StaticStruct(), &ActiveJob, JobObject, 0, 0);
 	Root->SetObjectField(TEXT("job"), JobObject);
+
+	TSharedRef<FJsonObject> SceneControl = MakeShared<FJsonObject>();
+	SceneControl->SetBoolField(TEXT("enabled"), ActiveJob.bRunSceneControlPreflight);
+	SceneControl->SetBoolField(TEXT("required"), ActiveJob.bRequireSceneControlPreflight);
+	SceneControl->SetBoolField(TEXT("ran"), SceneControlPreflight.bRan);
+	SceneControl->SetBoolField(TEXT("passed"), SceneControlPreflight.bPassed);
+	SceneControl->SetStringField(
+		TEXT("file"),
+		ActiveJob.bRunSceneControlPreflight ? TEXT("scene_control_preflight.json") : TEXT("not_generated"));
+	SceneControl->SetStringField(TEXT("sha1"), SceneControlPreflight.Sha1);
+	SceneControl->SetStringField(
+		TEXT("hashScope"),
+		TEXT("schema_required_sorted_allowlist_rules_and_classified_tick_niagara_di_material_input_records"));
+	SceneControl->SetNumberField(
+		TEXT("uncontrolledTickingActorCount"),
+		SceneControlPreflight.UncontrolledTickingActors.Num());
+	SceneControl->SetNumberField(
+		TEXT("uncontrolledTickingComponentCount"),
+		SceneControlPreflight.UncontrolledTickingComponents.Num());
+	SceneControl->SetNumberField(
+		TEXT("uncontrolledNiagaraDataInterfaceCount"),
+		SceneControlPreflight.UncontrolledNiagaraDataInterfaces.Num());
+	SceneControl->SetNumberField(
+		TEXT("uncontrolledMaterialInputCount"),
+		SceneControlPreflight.UncontrolledMaterialInputs.Num());
+	Root->SetObjectField(TEXT("sceneControlPreflight"), SceneControl);
+
+	TSharedRef<FJsonObject> StableIds = MakeShared<FJsonObject>();
+	StableIds->SetBoolField(TEXT("enabled"), ActiveJob.bAssignStableInstanceIds);
+	StableIds->SetBoolField(TEXT("preparedAfterWarmupAndStreaming"), bStableInstanceIdsPrepared);
+	StableIds->SetStringField(
+		TEXT("encoding"),
+		ActiveJob.bAssignStableInstanceIds ? TEXT("custom_stencil_uint8") : TEXT("not_used"));
+	StableIds->SetStringField(
+		TEXT("mappingFile"),
+		ActiveJob.bAssignStableInstanceIds ? TEXT("instance_id_map.json") : TEXT("not_used"));
+	StableIds->SetStringField(
+		TEXT("mappingSha1"),
+		ActiveJob.bAssignStableInstanceIds ? StableInstanceIdMappingSha1 : TEXT("not_used"));
+	StableIds->SetNumberField(
+		TEXT("instanceCount"),
+		ActiveJob.bAssignStableInstanceIds ? StableInstanceIdRecords.Num() : 0);
+	StableIds->SetNumberField(TEXT("backgroundId"), 0);
+	StableIds->SetNumberField(TEXT("maximumAssignableId"), 255);
+	StableIds->SetBoolField(TEXT("fixedTopologyRequired"), ActiveJob.bAssignStableInstanceIds);
+	Root->SetObjectField(TEXT("stableInstanceIds"), StableIds);
 
 	TSharedRef<FJsonObject> Provenance = MakeShared<FJsonObject>();
 	Provenance->SetStringField(TEXT("engineVersion"), FEngineVersion::Current().ToString());
@@ -3865,6 +4793,20 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		ActiveJob.bLockMaterialTimeToLogicalFrame
 			? TEXT("scene_view_family_game_time_current_and_signed_previous_from_logical_frame_ids_real_time_frozen")
 			: TEXT("engine_world_and_wall_clock_time"));
+	Contract->SetBoolField(TEXT("sceneControlPreflightEnabled"), ActiveJob.bRunSceneControlPreflight);
+	Contract->SetBoolField(TEXT("sceneControlPreflightRequired"), ActiveJob.bRequireSceneControlPreflight);
+	Contract->SetBoolField(TEXT("sceneControlPreflightPassed"), SceneControlPreflight.bPassed);
+	Contract->SetStringField(
+		TEXT("sceneControlPreflightScope"),
+		TEXT("registered_ticking_actors_and_components_loaded_niagara_data_interfaces_and_material_time_per_instance_random_particle_random_expressions"));
+	Contract->SetStringField(
+		TEXT("objectIdEncoding"),
+		ActiveJob.bAssignStableInstanceIds
+			? TEXT("fixed_topology_component_unique_custom_stencil_uint8_with_hashed_mapping_zero_background")
+			: TEXT("scene_authored_custom_stencil_uint8_zero_unlabeled"));
+	Contract->SetBoolField(TEXT("objectIdInstanceUnique"), ActiveJob.bAssignStableInstanceIds);
+	Contract->SetBoolField(TEXT("objectIdFixedTopologyRequired"), ActiveJob.bAssignStableInstanceIds);
+	Contract->SetNumberField(TEXT("objectIdMaximumInstances"), ActiveJob.bAssignStableInstanceIds ? 255 : 0);
 	Contract->SetStringField(
 		TEXT("worldSpaceWidgetPolicy"),
 		ActiveJob.bRejectVisibleWidgetComponents
@@ -3931,7 +4873,28 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		TEXT("deviceDepth"),
 		ActiveJob.bCaptureTemporalDiagnostics ? TEXT("experimental_raw_reversed_z_from_scene_depth") : TEXT("not_captured"));
 	Contract->SetBoolField(TEXT("temporalDiagnosticsEnabled"), ActiveJob.bCaptureTemporalDiagnostics);
+	Contract->SetBoolField(TEXT("sceneCaptureLRComparisonEnabled"), ActiveJob.bCaptureSceneCaptureLRComparison);
+	Contract->SetBoolField(
+		TEXT("mainViewSceneCapturePixelDomainValidationRequired"),
+		ActiveJob.bValidateMainViewSceneCapturePixelDomain);
+	Contract->SetStringField(
+		TEXT("sceneCaptureLRComparison"),
+		ActiveJob.bCaptureSceneCaptureLRComparison
+			? TEXT("existing_native_lr_scene_capture_after_dof_linear_scene_rgb_paired_without_simulation_advance")
+			: TEXT("not_captured"));
 	Contract->SetBoolField(TEXT("semanticValidationFixtureEnabled"), ActiveJob.bEnableSemanticValidationFixture);
+	Contract->SetStringField(
+		TEXT("semanticMotionScenario"),
+		StaticEnum<ESRDatasetSemanticMotionScenario>()->GetNameStringByValue(
+			static_cast<int64>(ActiveJob.SemanticMotionScenario)));
+	Contract->SetStringField(
+		TEXT("semanticFixtureAnchorPolicy"),
+		ActiveJob.SemanticMotionScenario == ESRDatasetSemanticMotionScenario::LegacyCameraRelative
+			? TEXT("camera_relative_legacy")
+			: TEXT("world_anchored_at_initial_deterministic_camera"));
+	Contract->SetBoolField(
+		TEXT("temporalJitterSignCoverageRequired"),
+		ActiveJob.bValidateTemporalJitterSignCoverage);
 	Contract->SetStringField(
 		TEXT("replayPass"),
 		StaticEnum<ESRDatasetReplayPass>()->GetNameStringByValue(static_cast<int64>(ActiveJob.ReplayPass)));
@@ -3964,7 +4927,10 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		Contract->SetStringField(TEXT("jitterAndMatrices"), TEXT("experimental_captured_from_view_uniforms"));
 		Contract->SetStringField(
 			TEXT("historyRejection"),
-			TEXT("experimental_custom_stencil_identity_else_static_depth_reprojection_with_validity"));
+			TEXT("experimental_component_identity_and_static_depth_reprojection_with_reason_and_conservative_dynamic_validity"));
+		Contract->SetStringField(
+			TEXT("disocclusion"),
+			TEXT("aliases_history_rejection_mask_valid_reason;cross_instance_and_static_depth_exact;dynamic_same_instance_conservative_invalid"));
 		Contract->SetStringField(TEXT("temporalDiagnosticsStatus"), TEXT("experimental_uncertified"));
 		Contract->SetStringField(TEXT("temporalDiagnosticsStage"), TEXT("after_dof_before_temporal_upscaler"));
 		Contract->SetStringField(TEXT("nativeHRColor"), TEXT("isolated_hr_scene_capture_after_dof_linear_scene_rgb_pre_exposed"));
@@ -3992,6 +4958,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		Contract->SetStringField(TEXT("motion"), TEXT("not_captured"));
 		Contract->SetStringField(TEXT("jitterAndMatrices"), TEXT("not_captured"));
 		Contract->SetStringField(TEXT("historyRejection"), TEXT("not_captured"));
+		Contract->SetStringField(TEXT("disocclusion"), TEXT("not_captured"));
 	}
 	Contract->SetStringField(TEXT("pairing"), TEXT("All modalities are captured after the same world tick; LR downsampling never advances the world."));
 	Contract->SetStringField(
@@ -4076,6 +5043,7 @@ void USRDatasetCaptureSubsystem::FinishCapture(const ESRDatasetCaptureState Fina
 		NonFixtureSkeletalValidationActor->Destroy();
 		NonFixtureSkeletalValidationActor = nullptr;
 	}
+	RestoreStableInstanceIds();
 	RestoreProjectAnimatedMaterialValidation();
 	RestoreDeterministicCamera();
 

@@ -27,7 +27,7 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [ ] Complete pixel-domain Main View/native/reference comparison.
 - [x] Prove auxiliary capture-order invariance with actual reversed submissions and a paired-process hard gate.
 - [x] Record the GPU View Uniform Mip bias, fixed LOD/scalability CVar profile, streaming barrier and resident-texture state hash.
-- [x] Export experimental motion-reprojected history rejection plus a per-pixel validity mask, with reset/ID/static-depth semantic tests.
+- [x] Export experimental motion-reprojected history rejection/disocclusion mask, validity and reason codes, with independent reset/ID/static-depth reconstruction and conservative dynamic uncertainty.
 - [ ] Export production disocclusion, instance ID, normals, albedo and material/semantic IDs.
 - [ ] Add Movie Render Graph for temporal/spatial samples, path tracing and tiled ultra-high-resolution output.
 - [ ] Add configurable camera calibration export and pluggable degradation chains.
@@ -50,9 +50,9 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Validate labeled project-skeletal reveal/occlusion evidence in both endpoint directions.
 - [x] Validate Niagara and translucency fixture playback at endpoints and intermediate time.
 - [ ] Validate a project-authored WPO asset with explicit current/previous endpoint motion; the checked project contains no suitable asset.
-- [ ] Generalize production disocclusion/visibility beyond labeled project skeletal probes to arbitrary unlabeled moving, WPO and animated-material geometry.
-- [ ] Add static/camera-only/mixed-motion and four-direction jitter-sign fixtures.
-- [ ] Add a preflight scanner for every tickable actor, Niagara data interface and nondeterministic material input.
+- [ ] Add per-surface/wider dynamic identity so same-component moving, WPO and animated-material disocclusion can be valid rather than conservatively rejected.
+- [x] Add static/camera-only/object-only/mixed-motion and four-quadrant jitter-sign fixtures.
+- [x] Add a hashed strict preflight scanner for every registered ticking Actor/component, loaded Niagara Data Interface and known time/per-instance/particle-random material input.
 - [ ] Add Niagara Sim Cache, Chaos cache and an actor-state recorder for non-Sequencer gameplay.
 
 The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`. Certification stays false until every unchecked mandatory FG item above is implemented and validated.
@@ -137,3 +137,36 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - Real project AnimBP forward/reverse captures passed 385/385 checks in each direction and shared the exact same pose-cache artifact; 17-18 skeletal reveal/occlusion pixels per direction were validity-gated and rejected correctly.
 - Real project animated-material forward/reverse captures passed 1279/1279 checks in each direction; the cross-direction logical-time/color comparison passed 1452/1452 checks.
 - The self-contained assembled pair copied and revalidated all project evidence and passed 186/186 checks. Its sole remaining declared requirement is project-authored WPO endpoint-motion validation, so FG certification remains false.
+
+## Version 0.6.0 motion isolation and scene-control preflight snapshot
+
+- UE 5.7 Development Editor compilation passed after adding the scanner/report schema and validator-v11 contract.
+- Static, Camera-only, Object-only and Mixed analytic motion captures passed 398/398, 398/398, 405/405 and 405/405 validator-v10 checks; the eight-phase jitter capture passed 1538/1538 with both signs on both axes and all four quadrants.
+- Report-only smoke capture passed 56/56 validator-v11 checks and exposed every unclassified project Tick source without blocking migration.
+- Strict First Person fixture captured two frames and passed 408/408 checks with zero unclassified records; its report contains 4 exact audited Actor classes, 5 audited ticking component instances and 8 subsystem-controlled components.
+- The negative strict fixture stopped at zero samples, retained its violation report/failed manifest, and the runner returned exit code 1 based on manifest state.
+- This closes the scanner/evidence gate, not the adapter gap: generalized actor-state recording, Niagara Sim Cache, Chaos cache and project-authored WPO validation remain open.
+
+## Version 0.7.0 Main View / SceneCapture pixel-domain snapshot
+
+- UE 5.7 Development Editor UHT/C++ compilation passed 11/11 actions; the automation job-validation suite passed 1/1.
+- The existing native-LR render now optionally yields `color_lr_scene_capture_hdr`; this adds an RDG readback but no additional render submission or simulation/history advance.
+- A locked Static First Person fixture captured two real frames and passed validator-v12 439/439 required checks.
+- Main View and SceneCapture unjittered projection/View matrices matched exactly. After independent pre-exposure normalization and recorded-jitter alignment, the frames measured 24.24–24.27 dB PSNR and 2.40%–2.54% normalized mean absolute error; both selected alignment signs beat the opposite sign.
+- This closes the Main View/native-LR SceneCapture same-stage gate. Main View/reference-HR equality, generalized production disocclusion, instance-unique IDs and project-authored WPO validation remain open.
+
+## Version 0.8.0 fixed-topology stable instance-ID snapshot
+
+- ID assignment is deferred until renderer warmup and the streaming barrier finish; later component-set or stencil-label drift aborts before the affected frame is committed.
+- The First Person validation map contains 60 component-unique IDs plus background, with ID→component/Actor/class records and independently reconstructed SHA-1 `AC6D1AFC22F85CBC194939683025C0B9C88B5E19`.
+- The single run passed validator-v13 376/376 checks; a second clean process retained the exact mapping hash and passed 599/599 replay checks, including byte-exact `object_id` EXRs.
+- Prior Custom Depth/stencil state is restored on completion or failure. More than 255 instances, dynamic topology and same-component self-occlusion remain explicit hard limits rather than hidden collisions.
+
+## Version 0.9.0 conservative disocclusion-v2 snapshot
+
+- Adds exact `disocclusion_mask`, `disocclusion_valid` and `disocclusion_reason` aliases while preserving established history-rejection names.
+- Nine integer reasons separate reset/input/OOB/identity/static-depth/dynamic-uncertain decisions. Dynamic same-instance and unlabeled motion are reject-invalid, never silently accepted.
+- Validator v14 independently reconstructs all 36,864 non-reset pixels in the stable-ID test with zero differences; the run passed 423/423 checks and its second clean process passed 662/662 exact-replay checks.
+- The moving semantic fixture passed 534/534 checks, including 134/134 newly revealed pixels rejected-valid and 305 dynamic same-instance pixels reject-invalid.
+- The fixture-free strict First Person production example captured two `1920x1080` HR / `960x540` LR frames and passed 466/466 checks with zero uncontrolled preflight records and 60 stable IDs.
+- Production-valid dynamic same-instance self-occlusion, dynamic topology and wider IDs remain open.

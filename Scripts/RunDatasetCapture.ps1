@@ -84,5 +84,50 @@ if ($jobDescriptor.bCaptureMainViewTemporalDiagnostics -eq $true) {
 }
 
 Write-Host "Starting deterministic dataset capture: $resolvedJob"
+$captureStartedUtc = [DateTime]::UtcNow
 & $resolvedEditor @arguments
-exit $LASTEXITCODE
+$editorExitCode = $LASTEXITCODE
+
+$configuredOutput = [string]$jobDescriptor.outputDirectory
+if ([string]::IsNullOrWhiteSpace($configuredOutput)) {
+    Write-Error 'The capture job has no outputDirectory.'
+    exit 1
+}
+$resolvedOutput = if ([IO.Path]::IsPathRooted($configuredOutput)) {
+    [IO.Path]::GetFullPath($configuredOutput)
+}
+else {
+    [IO.Path]::GetFullPath((Join-Path $projectRoot $configuredOutput))
+}
+$manifestPath = Join-Path $resolvedOutput 'manifest.json'
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    Write-Error "Dataset capture produced no manifest: $manifestPath (editor exit code $editorExitCode)"
+    exit 1
+}
+$manifestInfo = Get-Item -LiteralPath $manifestPath
+if ($manifestInfo.LastWriteTimeUtc -lt $captureStartedUtc.AddSeconds(-2)) {
+    Write-Error "Dataset manifest was not updated by this run: $manifestPath"
+    exit 1
+}
+try {
+    $captureManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+}
+catch {
+    Write-Error "Dataset manifest is unreadable: $manifestPath`n$($_.Exception.Message)"
+    exit 1
+}
+
+$captureState = [string]$captureManifest.state
+$capturedSamples = [int]$captureManifest.capturedSamples
+if ($captureState -ne 'Completed') {
+    $captureError = [string]$captureManifest.error
+    Write-Error "Dataset capture state is '$captureState' after $capturedSamples sample(s): $captureError"
+    exit 1
+}
+if ($editorExitCode -ne 0) {
+    Write-Error "Dataset manifest completed, but Unreal Editor returned exit code $editorExitCode."
+    exit $editorExitCode
+}
+
+Write-Host "Dataset capture completed: $capturedSamples sample(s); manifest=$manifestPath"
+exit 0
