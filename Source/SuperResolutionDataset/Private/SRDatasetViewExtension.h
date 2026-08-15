@@ -76,6 +76,10 @@ public:
 	bool RequestTonemappedColorCapture(FIntPoint ExpectedSize, bool bMainViewOnly, FString& OutError);
 	bool WaitAndTakeCapture(FSRDatasetTemporalCaptureResult& OutResult, FString& OutError);
 	void CancelCapture();
+	void SetDeterministicViewTime(double CurrentTimeSeconds, float DeltaTimeSeconds);
+	void ClearDeterministicViewTime();
+
+	virtual void SetupViewFamily(FSceneViewFamily& InViewFamily) override;
 
 	virtual void SubscribeToPostProcessingPass(
 		EPostProcessingPass Pass,
@@ -115,6 +119,9 @@ private:
 	FIntPoint RequestedSize = FIntPoint::ZeroValue;
 	FIntPoint RequestedDisplaySize = FIntPoint::ZeroValue;
 	bool bRequestedMainViewOnly = false;
+	bool bDeterministicViewTimeEnabled = false;
+	double DeterministicCurrentTimeSeconds = 0.0;
+	float DeterministicDeltaTimeSeconds = 0.0f;
 	TUniquePtr<FPendingReadbacks> PendingReadbacks;
 };
 

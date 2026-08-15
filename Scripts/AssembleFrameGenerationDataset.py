@@ -16,6 +16,23 @@ from typing import Any
 ENDPOINT_ROLE = "FrameGenerationEndpoints"
 REVERSE_ENDPOINT_ROLE = "FrameGenerationReverseEndpoints"
 INTERMEDIATE_ROLE = "FrameGenerationIntermediate"
+PROJECT_SKELETAL_EVIDENCE_VERSION = 1
+PROJECT_SKELETAL_EVIDENCE_FILES = {
+    "forwardManifest": "project_skeletal_forward_manifest.json",
+    "forwardValidation": "project_skeletal_forward_validation.json",
+    "reverseManifest": "project_skeletal_reverse_manifest.json",
+    "reverseValidation": "project_skeletal_reverse_validation.json",
+    "reverseComparison": "project_skeletal_reverse_comparison.json",
+    "poseCacheArtifact": "project_skeletal_pose_cache.srcache",
+}
+PROJECT_ANIMATED_MATERIAL_EVIDENCE_VERSION = 1
+PROJECT_ANIMATED_MATERIAL_EVIDENCE_FILES = {
+    "forwardManifest": "project_animated_material_forward_manifest.json",
+    "forwardValidation": "project_animated_material_forward_validation.json",
+    "reverseManifest": "project_animated_material_reverse_manifest.json",
+    "reverseValidation": "project_animated_material_reverse_validation.json",
+    "reverseComparison": "project_animated_material_reverse_comparison.json",
+}
 INTENTIONAL_CVAR_DIFFERENCES = {
     "r.MotionVectorSimulation": {
         "endpoints": "1",
@@ -24,6 +41,16 @@ INTENTIONAL_CVAR_DIFFERENCES = {
         "reason": (
             "Endpoint replay preserves the last captured component transforms so t1 motion spans "
             "the complete t0-to-t1 interval; the isolated intermediate replay must not do so."
+        ),
+    },
+    "r.SkipRedundantTransformUpdate": {
+        "endpoints": "0",
+        "reverseEndpoints": "0",
+        "intermediate": "1",
+        "reason": (
+            "Endpoint replay must submit a simulated previous transform even when the current "
+            "transform equals a renderer-primed intermediate state; isolated midpoint replay "
+            "uses the engine default redundant-update optimization."
         ),
     },
 }
@@ -103,6 +130,327 @@ def require_wpo_fixture_gate(
     return True
 
 
+def has_world_space_widget_rejection_gate(
+    manifest: dict[str, Any], report: dict[str, Any]
+) -> bool:
+    if (
+        manifest.get("job", {}).get("bRejectVisibleWidgetComponents") is not True
+        or int(report.get("validatorVersion", 0)) < 9
+    ):
+        return False
+    checks = passing_check_map(report)
+    frame_checks = {
+        name: passed
+        for name, passed in checks.items()
+        if name.endswith(".world_ui_zero_widget_component_residue")
+    }
+    return bool(
+        checks.get("world_ui.job_and_contract") is True
+        and frame_checks
+        and all(frame_checks.values())
+    )
+
+
+def passing_check_map(report: dict[str, Any]) -> dict[str, bool]:
+    return {
+        str(check.get("name")): bool(check.get("passed", False))
+        for check in report.get("checks", [])
+        if isinstance(check, dict)
+    }
+
+
+def require_report_pass(
+    report: dict[str, Any], label: str, gate: str = "formatAndIntegrityGate"
+) -> dict[str, bool]:
+    passed = int(report.get("checksPassed", -1))
+    total = int(report.get("checksTotal", -2))
+    required_failures = [
+        check
+        for check in report.get("checks", [])
+        if isinstance(check, dict)
+        and check.get("required", True)
+        and not check.get("passed", False)
+    ]
+    if (
+        int(report.get("validatorVersion", 0)) < 7
+        or report.get(gate) != "pass"
+        or total <= 0
+        or passed != total
+        or required_failures
+    ):
+        raise ValueError(
+            f"{label} requires a complete validatorVersion >= 7 passing report"
+        )
+    return passing_check_map(report)
+
+
+def require_named_checks(
+    checks: dict[str, bool], exact: tuple[str, ...], prefixes: tuple[str, ...], label: str
+) -> None:
+    missing_exact = [name for name in exact if checks.get(name) is not True]
+    missing_prefixes = [
+        prefix
+        for prefix in prefixes
+        if not any(name.startswith(prefix) and passed for name, passed in checks.items())
+    ]
+    if missing_exact or missing_prefixes:
+        raise ValueError(
+            f"{label} lacks required proof checks: exact={missing_exact} "
+            f"prefixes={missing_prefixes}"
+        )
+
+
+def resolve_project_relative_artifact(dataset: Path, declared: Any) -> Path:
+    if not isinstance(declared, str) or not declared:
+        raise ValueError("skeletal pose cache artifact path is missing")
+    relative = Path(declared)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("skeletal pose cache artifact must be project-relative")
+    for root in (dataset, *dataset.parents):
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return candidate
+    raise ValueError(f"skeletal pose cache artifact not found: {declared}")
+
+
+def require_project_skeletal_evidence(
+    forward_dir: Path, reverse_dir: Path
+) -> dict[str, Any]:
+    forward_manifest_path = forward_dir / "manifest.json"
+    forward_report_path = forward_dir / "validation_report.json"
+    reverse_manifest_path = reverse_dir / "manifest.json"
+    reverse_report_path = reverse_dir / "validation_report.json"
+    comparison_report_path = forward_dir / "validation_report_skeletal_reverse.json"
+    required_paths = (
+        forward_manifest_path,
+        forward_report_path,
+        reverse_manifest_path,
+        reverse_report_path,
+        comparison_report_path,
+    )
+    missing = [str(path) for path in required_paths if not path.is_file()]
+    if missing:
+        raise ValueError(f"project skeletal evidence files are missing: {missing}")
+
+    forward_manifest = load_json(forward_manifest_path)
+    forward_report = load_json(forward_report_path)
+    reverse_manifest = load_json(reverse_manifest_path)
+    reverse_report = load_json(reverse_report_path)
+    comparison_report = load_json(comparison_report_path)
+    if forward_manifest.get("state") != "Completed" or reverse_manifest.get("state") != "Completed":
+        raise ValueError("project skeletal evidence captures must be complete")
+    if forward_manifest.get("replayPass") != ENDPOINT_ROLE:
+        raise ValueError("project skeletal forward evidence has the wrong replay role")
+    if reverse_manifest.get("replayPass") != REVERSE_ENDPOINT_ROLE:
+        raise ValueError("project skeletal reverse evidence has the wrong replay role")
+
+    standalone_exact = (
+        "skeletal_replay.job_and_contract",
+        "provenance.skeletal_pose_cache_artifact",
+        "skeletal_replay.project_anim_blueprint_pose_changes",
+        "skeletal_replay.project_disocclusion_transition_coverage",
+    )
+    standalone_prefixes = (
+        "frame_000000.project_anim_blueprint_probe",
+        "frame_000000.project_skeletal_probe_visible",
+    )
+    for label, manifest, report in (
+        ("project skeletal forward", forward_manifest, forward_report),
+        ("project skeletal reverse", reverse_manifest, reverse_report),
+    ):
+        job = manifest.get("job", {})
+        if (
+            job.get("bValidateNonFixtureSkeletalAnimation") is not True
+            or job.get("bCacheSkeletalAnimationPosesForReplay") is not True
+            or job.get("bUseDeterministicCameraTransform") is not True
+            or not job.get("nonFixtureSkeletalValidationActorClass")
+        ):
+            raise ValueError(f"{label} is not a deterministic project AnimBP probe")
+        checks = require_report_pass(report, label)
+        require_named_checks(checks, standalone_exact, standalone_prefixes, label)
+        if not any(
+            name.endswith(".project_skeletal_probe_endpoint_motion") and passed
+            for name, passed in checks.items()
+        ):
+            raise ValueError(f"{label} lacks endpoint skeletal motion proof")
+        if not any(
+            name.endswith(".project_skeletal_bidirectional_visibility") and passed
+            for name, passed in checks.items()
+        ):
+            raise ValueError(f"{label} lacks bidirectional visibility proof")
+
+    comparison_checks = require_report_pass(
+        comparison_report, "project skeletal reverse comparison"
+    )
+    if comparison_report.get("skeletalReverseReplayGate") != "pass":
+        raise ValueError("project skeletal reverse comparison gate did not pass")
+    require_named_checks(
+        comparison_checks,
+        (
+            "skeletal_reverse.opposite_endpoint_roles",
+            "skeletal_reverse.jobs_equal_except_identity_output_and_role",
+            "skeletal_reverse.provenance_equal_except_config_hash",
+            "skeletal_reverse.static_grids_compared",
+            "skeletal_replay.project_disocclusion_transition_coverage",
+        ),
+        (
+            "skeletal_reverse.frame_000000.project_pose_and_identity_exact",
+            "skeletal_reverse.frame_000000.camera_exact",
+            "skeletal_reverse.frame_000000.left_independent_motion_evidence",
+            "skeletal_reverse.frame_000000.right_independent_motion_evidence",
+        ),
+        "project skeletal reverse comparison",
+    )
+
+    forward_job = forward_manifest.get("job", {})
+    reverse_job = reverse_manifest.get("job", {})
+    if (
+        forward_job.get("nonFixtureSkeletalValidationActorClass")
+        != reverse_job.get("nonFixtureSkeletalValidationActorClass")
+    ):
+        raise ValueError("project skeletal evidence actor classes differ")
+    forward_frame_ids = sorted(
+        int(frame["logicalFrameId"]) for frame in forward_manifest.get("frames", [])
+    )
+    reverse_frame_ids = sorted(
+        int(frame["logicalFrameId"]) for frame in reverse_manifest.get("frames", [])
+    )
+    if len(forward_frame_ids) < 2 or forward_frame_ids != reverse_frame_ids:
+        raise ValueError("project skeletal evidence logical frame grids differ")
+
+    forward_sha1 = str(
+        forward_manifest.get("provenance", {}).get("skeletalPoseCacheArtifactSha1", "")
+    ).upper()
+    reverse_sha1 = str(
+        reverse_manifest.get("provenance", {}).get("skeletalPoseCacheArtifactSha1", "")
+    ).upper()
+    if len(forward_sha1) != 40 or forward_sha1 != reverse_sha1:
+        raise ValueError("project skeletal evidence pose-cache hashes differ")
+    artifact_declared = forward_job.get("skeletalPoseCacheOutputFile")
+    artifact_path = resolve_project_relative_artifact(forward_dir, artifact_declared)
+    if sha1(artifact_path) != forward_sha1:
+        raise ValueError("project skeletal pose-cache artifact hash does not match provenance")
+
+    return {
+        "paths": {
+            "forwardManifest": forward_manifest_path,
+            "forwardValidation": forward_report_path,
+            "reverseManifest": reverse_manifest_path,
+            "reverseValidation": reverse_report_path,
+            "reverseComparison": comparison_report_path,
+            "poseCacheArtifact": artifact_path,
+        },
+        "artifactSha1": forward_sha1,
+        "actorClass": forward_job["nonFixtureSkeletalValidationActorClass"],
+        "logicalFrameIds": forward_frame_ids,
+        "validatorVersion": int(comparison_report["validatorVersion"]),
+        "checksPassed": int(comparison_report["checksPassed"]),
+        "checksTotal": int(comparison_report["checksTotal"]),
+    }
+
+
+def require_project_animated_material_evidence(
+    forward_dir: Path, reverse_dir: Path
+) -> dict[str, Any]:
+    paths = {
+        "forwardManifest": forward_dir / "manifest.json",
+        "forwardValidation": forward_dir / "validation_report.json",
+        "reverseManifest": reverse_dir / "manifest.json",
+        "reverseValidation": reverse_dir / "validation_report.json",
+        "reverseComparison": forward_dir / "validation_report_material_reverse.json",
+    }
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise ValueError(f"project animated-material evidence files are missing: {missing}")
+    loaded = {key: load_json(path) for key, path in paths.items()}
+    forward_manifest = loaded["forwardManifest"]
+    reverse_manifest = loaded["reverseManifest"]
+    forward_report = loaded["forwardValidation"]
+    reverse_report = loaded["reverseValidation"]
+    comparison_report = loaded["reverseComparison"]
+    if forward_manifest.get("state") != "Completed" or reverse_manifest.get("state") != "Completed":
+        raise ValueError("project animated-material evidence captures must be complete")
+    if forward_manifest.get("replayPass") != ENDPOINT_ROLE:
+        raise ValueError("project animated-material forward evidence has the wrong replay role")
+    if reverse_manifest.get("replayPass") != REVERSE_ENDPOINT_ROLE:
+        raise ValueError("project animated-material reverse evidence has the wrong replay role")
+
+    standalone_exact = (
+        "material_time.logical_frame_contract",
+        "material_replay.project_validation_contract",
+        "material_replay.project_animated_material_changes_with_logical_time",
+    )
+    standalone_prefixes = (
+        "frame_000000.project_animated_material_schema",
+        "frame_000000.project_animated_material_visible",
+    )
+    material_paths: set[str] = set()
+    for label, manifest, report in (
+        ("project animated-material forward", forward_manifest, forward_report),
+        ("project animated-material reverse", reverse_manifest, reverse_report),
+    ):
+        job = manifest.get("job", {})
+        material_path = str(job.get("projectAnimatedMaterialValidationMaterial", ""))
+        material_paths.add(material_path)
+        if (
+            job.get("bValidateProjectAnimatedMaterial") is not True
+            or job.get("bLockMaterialTimeToLogicalFrame") is not True
+            or job.get("bUseDeterministicCameraTransform") is not True
+            or not material_path.startswith("/Game/")
+        ):
+            raise ValueError(f"{label} is not a deterministic project material probe")
+        checks = require_report_pass(report, label)
+        if int(report.get("validatorVersion", 0)) < 8:
+            raise ValueError(f"{label} requires ValidateDataset.py validatorVersion >= 8")
+        require_named_checks(checks, standalone_exact, standalone_prefixes, label)
+
+    if len(material_paths) != 1:
+        raise ValueError("project animated-material evidence material interfaces differ")
+    comparison_checks = require_report_pass(
+        comparison_report, "project animated-material reverse comparison"
+    )
+    if (
+        int(comparison_report.get("validatorVersion", 0)) < 8
+        or comparison_report.get("materialReverseReplayGate") != "pass"
+    ):
+        raise ValueError("project animated-material reverse comparison gate did not pass")
+    require_named_checks(
+        comparison_checks,
+        (
+            "material_reverse.opposite_endpoint_roles",
+            "material_reverse.jobs_equal_except_identity_output_and_role",
+            "material_reverse.provenance_equal_except_config_hash",
+            "material_reverse.static_identity_grids_compared",
+        ),
+        (
+            "material_reverse.frame_000000.gpu_logical_game_time_and_signed_direction",
+            "material_reverse.frame_000000.project_material_identity_exact",
+            "material_reverse.frame_000000.project_material_current_color_exact",
+        ),
+        "project animated-material reverse comparison",
+    )
+    forward_frame_ids = sorted(
+        int(frame["logicalFrameId"]) for frame in forward_manifest.get("frames", [])
+    )
+    reverse_frame_ids = sorted(
+        int(frame["logicalFrameId"]) for frame in reverse_manifest.get("frames", [])
+    )
+    if len(forward_frame_ids) < 2 or forward_frame_ids != reverse_frame_ids:
+        raise ValueError("project animated-material evidence logical frame grids differ")
+    return {
+        "paths": paths,
+        "materialInterface": next(iter(material_paths)),
+        "logicalFrameIds": forward_frame_ids,
+        "validatorVersion": int(comparison_report["validatorVersion"]),
+        "checksPassed": int(comparison_report["checksPassed"]),
+        "checksTotal": int(comparison_report["checksTotal"]),
+    }
+
+
 def compatible(
     endpoint: dict[str, Any],
     reverse_endpoint: dict[str, Any],
@@ -121,7 +469,10 @@ def compatible(
         "bDisableMotionBlur",
         "bLockExposure",
         "bForceSynchronousRendering",
+        "bLockMaterialTimeToLogicalFrame",
+        "bRejectVisibleWidgetComponents",
         "bEnableSemanticValidationFixture",
+        "bCaptureUIColorAlpha",
         "bBlockOnStreamingBeforeCapture",
         "streamingWaitSeconds",
         "bLockTemporalJitterToLogicalFrame",
@@ -328,6 +679,7 @@ def require_matching_endpoint_grid(
         "depth_valid",
         "object_id",
         "motion_valid",
+        "ui_color_alpha",
     ):
         forward_hash = str(forward.get("sha1", {}).get(modality, "")).upper()
         reverse_hash = str(reverse.get("sha1", {}).get(modality, "")).upper()
@@ -352,6 +704,10 @@ def assemble(
     reverse_endpoint_dir: Path,
     intermediate_dir: Path,
     output_dir: Path,
+    project_skeletal_forward_dir: Path | None = None,
+    project_skeletal_reverse_dir: Path | None = None,
+    project_animated_material_forward_dir: Path | None = None,
+    project_animated_material_reverse_dir: Path | None = None,
 ) -> None:
     endpoint, endpoint_report = require_capture(endpoint_dir, ENDPOINT_ROLE)
     reverse_endpoint, reverse_endpoint_report = require_capture(
@@ -369,8 +725,47 @@ def assemble(
             ),
         )
     )
+    world_space_widget_residue_rejected = all(
+        (
+            has_world_space_widget_rejection_gate(endpoint, endpoint_report),
+            has_world_space_widget_rejection_gate(
+                reverse_endpoint, reverse_endpoint_report
+            ),
+            has_world_space_widget_rejection_gate(
+                intermediate, intermediate_report
+            ),
+        )
+    )
     compatibility = compatible(endpoint, reverse_endpoint, intermediate)
     endpoint_job = endpoint["job"]
+    if (project_skeletal_forward_dir is None) != (project_skeletal_reverse_dir is None):
+        raise ValueError(
+            "--project-skeletal-forward and --project-skeletal-reverse must be supplied together"
+        )
+    project_skeletal_evidence = (
+        require_project_skeletal_evidence(
+            project_skeletal_forward_dir, project_skeletal_reverse_dir
+        )
+        if project_skeletal_forward_dir is not None
+        and project_skeletal_reverse_dir is not None
+        else None
+    )
+    if (project_animated_material_forward_dir is None) != (
+        project_animated_material_reverse_dir is None
+    ):
+        raise ValueError(
+            "--project-animated-material-forward and --project-animated-material-reverse "
+            "must be supplied together"
+        )
+    project_animated_material_evidence = (
+        require_project_animated_material_evidence(
+            project_animated_material_forward_dir,
+            project_animated_material_reverse_dir,
+        )
+        if project_animated_material_forward_dir is not None
+        and project_animated_material_reverse_dir is not None
+        else None
+    )
     if output_dir.exists():
         raise ValueError(f"output already exists; choose a new directory: {output_dir}")
 
@@ -391,6 +786,66 @@ def assemble(
     staging.mkdir(parents=True)
     pairs: list[dict[str, Any]] = []
     try:
+        validation_evidence: dict[str, Any] = {}
+        if project_skeletal_evidence is not None:
+            evidence_dir = staging / "validation_evidence" / "project_skeletal"
+            evidence_dir.mkdir(parents=True)
+            evidence_files: dict[str, str] = {}
+            evidence_hashes: dict[str, str] = {}
+            for key, filename in PROJECT_SKELETAL_EVIDENCE_FILES.items():
+                source = project_skeletal_evidence["paths"][key]
+                destination = evidence_dir / filename
+                shutil.copy2(source, destination)
+                relative = destination.relative_to(staging).as_posix()
+                evidence_files[key] = relative
+                evidence_hashes[key] = sha1(destination)
+            validation_evidence["projectSkeletalAnimation"] = {
+                "schemaVersion": PROJECT_SKELETAL_EVIDENCE_VERSION,
+                "proofScope": (
+                    "project_authored_anim_blueprint_shared_pose_cache_exact_forward_reverse_"
+                    "identity_camera_depth_and_bidirectional_disocclusion"
+                ),
+                "actorClass": project_skeletal_evidence["actorClass"],
+                "logicalFrameIds": project_skeletal_evidence["logicalFrameIds"],
+                "poseCacheArtifactSha1": project_skeletal_evidence["artifactSha1"],
+                "validatorVersion": project_skeletal_evidence["validatorVersion"],
+                "checksPassed": project_skeletal_evidence["checksPassed"],
+                "checksTotal": project_skeletal_evidence["checksTotal"],
+                "files": evidence_files,
+                "sha1": evidence_hashes,
+            }
+        if project_animated_material_evidence is not None:
+            evidence_dir = staging / "validation_evidence" / "project_animated_material"
+            evidence_dir.mkdir(parents=True)
+            evidence_files: dict[str, str] = {}
+            evidence_hashes: dict[str, str] = {}
+            for key, filename in PROJECT_ANIMATED_MATERIAL_EVIDENCE_FILES.items():
+                source = project_animated_material_evidence["paths"][key]
+                destination = evidence_dir / filename
+                shutil.copy2(source, destination)
+                evidence_files[key] = destination.relative_to(staging).as_posix()
+                evidence_hashes[key] = sha1(destination)
+            validation_evidence["projectAnimatedMaterial"] = {
+                "schemaVersion": PROJECT_ANIMATED_MATERIAL_EVIDENCE_VERSION,
+                "proofScope": (
+                    "project_authored_surface_material_gpu_logical_game_time_visible_change_"
+                    "and_forward_reverse_current_color_tolerance"
+                ),
+                "materialInterface": project_animated_material_evidence[
+                    "materialInterface"
+                ],
+                "logicalFrameIds": project_animated_material_evidence[
+                    "logicalFrameIds"
+                ],
+                "validatorVersion": project_animated_material_evidence[
+                    "validatorVersion"
+                ],
+                "checksPassed": project_animated_material_evidence["checksPassed"],
+                "checksTotal": project_animated_material_evidence["checksTotal"],
+                "files": evidence_files,
+                "sha1": evidence_hashes,
+            }
+
         for pair_index, (frame0, frame1) in enumerate(zip(endpoint_frames, endpoint_frames[1:])):
             t0 = int(frame0["logicalFrameId"])
             t1 = int(frame1["logicalFrameId"])
@@ -448,6 +903,9 @@ def assemble(
                 ("scene_color_hudless_t0", endpoint_dir, frame0, "color_main_view_hudless_after_tonemap"),
                 ("scene_color_hudless_tau", intermediate_dir, frame_tau, "color_main_view_hudless_after_tonemap"),
                 ("scene_color_hudless_t1", endpoint_dir, frame1, "color_main_view_hudless_after_tonemap"),
+                ("ui_color_alpha_t0", endpoint_dir, frame0, "ui_color_alpha"),
+                ("ui_color_alpha_tau", intermediate_dir, frame_tau, "ui_color_alpha"),
+                ("ui_color_alpha_t1", endpoint_dir, frame1, "ui_color_alpha"),
                 ("depth_t0", endpoint_dir, frame0, "depth_view_linear_meters"),
                 ("depth_tau", intermediate_dir, frame_tau, "depth_view_linear_meters"),
                 ("depth_t1", endpoint_dir, frame1, "depth_view_linear_meters"),
@@ -584,6 +1042,16 @@ def assemble(
                     "t1": frame1["sceneStateSha1"],
                 },
                 "sceneStateHashScope": frame1["sceneStateHashScope"],
+                "uiColorAlphaDiagnostics": {
+                    "t0": frame0["uiColorAlphaDiagnostics"],
+                    "tau": frame_tau["uiColorAlphaDiagnostics"],
+                    "t1": frame1["uiColorAlphaDiagnostics"],
+                },
+                "worldSpaceWidgetPolicy": {
+                    "t0": frame0["worldSpaceWidgetPolicy"],
+                    "tau": frame_tau["worldSpaceWidgetPolicy"],
+                    "t1": frame1["worldSpaceWidgetPolicy"],
+                },
                 "reset": {
                     "t0": bool(frame0.get("reset", False)),
                     "tau": bool(frame_tau.get("reset", False)),
@@ -610,7 +1078,7 @@ def assemble(
                 "numerator": endpoint_job["captureFrameRateNumerator"],
                 "denominator": endpoint_job["captureFrameRateDenominator"],
             },
-            "uiSeparated": False,
+            "uiSeparated": True,
             "motionBlur": "off",
             "bufferSemantics": {
                 "sceneColorHudless": {
@@ -619,6 +1087,14 @@ def assemble(
                     "uiIncluded": False,
                     "hudIncluded": False,
                     "encoding": "tonemapper_output_device_encoded",
+                },
+                "uiColorAlpha": {
+                    "pipelineStage": "independent_slate_game_layer_before_scene_composite",
+                    "resolution": "display",
+                    "encoding": "display_referred_srgb_png_unorm8",
+                    "alphaSemantic": "straight_coverage_zero_is_transparent_one_is_opaque",
+                    "rgbSemantic": "premultiplied_by_coverage_alpha",
+                    "sceneIncluded": False,
                 },
                 "depth": {
                     "encoding": "linear_view_meters",
@@ -685,7 +1161,22 @@ def assemble(
                 "semanticFixtureRigidComponentMotion": True,
                 "semanticFixtureDoubleBufferedSkeletalBoneMotion": True,
                 "semanticFixturePreviousFrameSwitchWPOMotion": wpo_fixture_validated,
+                "semanticFixtureUIColorAlpha": True,
+                "projectAuthoredAnimBlueprintEndpointMotion": project_skeletal_evidence
+                is not None,
+                "projectAuthoredAnimBlueprintExactForwardReverseReplay": project_skeletal_evidence
+                is not None,
+                "projectSkeletalBidirectionalDisocclusion": project_skeletal_evidence
+                is not None,
+                "projectAnimatedMaterialLogicalGameTime": project_animated_material_evidence
+                is not None,
+                "projectAnimatedMaterialVisibleTimeVariation": project_animated_material_evidence
+                is not None,
+                "projectAnimatedMaterialForwardReverseCurrentColor": project_animated_material_evidence
+                is not None,
+                "hudlessWorldSpaceWidgetResidueRejected": world_space_widget_residue_rejected,
             },
+            "validationEvidence": validation_evidence,
             "provenance": {
                 **compatibility,
                 "endpointReplay": endpoint.get("provenance", {}),
@@ -693,11 +1184,25 @@ def assemble(
                 "intermediateReplay": intermediate.get("provenance", {}),
             },
             "missingRequirements": [
-                "ui_color_alpha_t0_tau_t1",
-                "non_fixture_skeletal_animation_endpoint_motion_validation",
-                "non_fixture_wpo_and_animated_material_endpoint_motion_validation",
-                "production_disocclusion_masks",
-                "hudless_in_world_ui_residue_validation",
+                *(
+                    []
+                    if project_skeletal_evidence is not None
+                    else [
+                        "non_fixture_skeletal_animation_endpoint_motion_validation",
+                        "production_disocclusion_masks",
+                    ]
+                ),
+                *(
+                    []
+                    if project_animated_material_evidence is not None
+                    else ["project_animated_material_logical_time_validation"]
+                ),
+                "project_authored_wpo_endpoint_motion_validation",
+                *(
+                    []
+                    if world_space_widget_residue_rejected
+                    else ["hudless_in_world_ui_residue_validation"]
+                ),
             ],
             "pairs": pairs,
         }
@@ -715,6 +1220,32 @@ def main() -> int:
     parser.add_argument("--reverse-endpoints", type=Path, required=True)
     parser.add_argument("--intermediate", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--project-skeletal-forward",
+        type=Path,
+        help=(
+            "Optional validated project-asset AnimBP forward capture. Must be paired with "
+            "--project-skeletal-reverse."
+        ),
+    )
+    parser.add_argument(
+        "--project-skeletal-reverse",
+        type=Path,
+        help="Optional validated project-asset AnimBP reverse capture.",
+    )
+    parser.add_argument(
+        "--project-animated-material-forward",
+        type=Path,
+        help=(
+            "Optional validated project-authored animated-material forward capture. "
+            "Must be paired with --project-animated-material-reverse."
+        ),
+    )
+    parser.add_argument(
+        "--project-animated-material-reverse",
+        type=Path,
+        help="Optional validated project-authored animated-material reverse capture.",
+    )
     args = parser.parse_args()
     try:
         assemble(
@@ -722,6 +1253,18 @@ def main() -> int:
             args.reverse_endpoints.resolve(),
             args.intermediate.resolve(),
             args.output.resolve(),
+            args.project_skeletal_forward.resolve()
+            if args.project_skeletal_forward
+            else None,
+            args.project_skeletal_reverse.resolve()
+            if args.project_skeletal_reverse
+            else None,
+            args.project_animated_material_forward.resolve()
+            if args.project_animated_material_forward
+            else None,
+            args.project_animated_material_reverse.resolve()
+            if args.project_animated_material_reverse
+            else None,
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

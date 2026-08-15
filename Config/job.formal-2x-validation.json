@@ -1,22 +1,20 @@
 {
   "contractVersion": "spatial-sr-data-v1",
-  "jobName": "first_person_fg_reverse_endpoint_validation",
-  "replayPass": "FrameGenerationReverseEndpoints",
+  "jobName": "first_person_formal_2x_validation",
   "expectedMap": "/Game/FirstPerson/Lvl_FirstPerson",
   "startFrame": 0,
-  "endFrame": 2,
-  "frameStep": 2,
-  "captureFrameOffset": 0,
-  "captureFrameRateNumerator": 60,
+  "endFrame": 1,
+  "frameStep": 1,
+  "captureFrameRateNumerator": 30,
   "captureFrameRateDenominator": 1,
   "warmupFrames": 32,
   "hRResolution": {
-    "x": 256,
-    "y": 144
+    "x": 1920,
+    "y": 1080
   },
   "lRResolution": {
-    "x": 128,
-    "y": 72
+    "x": 960,
+    "y": 540
   },
   "lRMode": "NativeRender",
   "resizeFilter": "CubicMitchell",
@@ -24,12 +22,12 @@
   "bCaptureDepth": true,
   "bCaptureTemporalDiagnostics": true,
   "bCaptureMainViewTemporalDiagnostics": true,
-  "bCaptureReferenceHR": true,
+  "bCaptureReferenceHR": false,
   "referenceHRScale": 2,
   "referenceResizeFilter": "Lanczos4",
   "bCaptureMainViewHUDlessColor": true,
   "bCaptureUIColorAlpha": true,
-  "outputDirectory": "Saved/SRDataset/fg_reverse_endpoint_validation",
+  "outputDirectory": "Saved/SRDataset/formal_2x_validation",
   "bResume": false,
   "bWriteManifestEveryFrame": true,
   "randomSeed": 1337,
@@ -39,13 +37,8 @@
   "bDisableMotionBlur": true,
   "bLockExposure": true,
   "bForceSynchronousRendering": true,
-  "bLockTemporalJitterToLogicalFrame": true,
-  "temporalJitterSequenceLength": 8,
-  "temporalJitterPhaseOffset": 0,
   "bBlockOnStreamingBeforeCapture": true,
   "streamingWaitSeconds": 60.0,
-  "bSuppressMainViewOnUncapturedFrames": true,
-  "bUseLastCapturedEndpointTransforms": true,
   "bEnableSemanticValidationFixture": true,
   "bAutoQuit": true
 }

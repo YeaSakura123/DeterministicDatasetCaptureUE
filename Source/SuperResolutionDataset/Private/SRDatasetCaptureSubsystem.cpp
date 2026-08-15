@@ -6,16 +6,26 @@
 #include "SRDatasetViewExtension.h"
 
 #include "Camera/CameraComponent.h"
+#include "Camera/CameraActor.h"
 #include "Camera/PlayerCameraManager.h"
 #include "ContentStreaming.h"
 #include "Dom/JsonObject.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Components/SkinnedMeshComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Components/WidgetComponent.h"
+#include "Animation/AnimInstance.h"
 #include "Engine/Engine.h"
 #include "Engine/Texture2D.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/StaticMeshActor.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "Engine/GameViewportClient.h"
 #include "HAL/IConsoleManager.h"
@@ -33,19 +43,33 @@
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Misc/SecureHash.h"
+#include "Materials/MaterialInterface.h"
 #include "NiagaraCommon.h"
 #include "NiagaraComponent.h"
+#include "NiagaraEmitterInstance.h"
+#include "NiagaraRendererProperties.h"
 #include "NiagaraSystem.h"
+#include "NiagaraSystemInstance.h"
+#include "NiagaraSystemInstanceController.h"
 #include "Particles/ParticleSystemComponent.h"
 #include "Kismet/GameplayStatics.h"
+#include "RenderCore.h"
 #include "Rendering/MotionVectorSimulation.h"
 #include "TextureResource.h"
 #include "DynamicRHI.h"
 #include "RHIGlobals.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "Serialization/BufferArchive.h"
+#include "Serialization/MemoryReader.h"
+#include "Styling/CoreStyle.h"
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectIterator.h"
+#include "Widgets/SLeafWidget.h"
+#include "Rendering/DrawElements.h"
+
+#include <cmath>
+#include <limits>
 
 DEFINE_LOG_CATEGORY_STATIC(LogSRDataset, Log, All);
 
@@ -71,6 +95,53 @@ namespace SRDataset::Private
 	};
 	constexpr const TCHAR* ReferenceHRModality = TEXT("color_hr_reference_scene_hdr");
 	constexpr const TCHAR* HUDlessColorModality = TEXT("color_main_view_hudless_after_tonemap");
+	constexpr const TCHAR* UIColorAlphaModality = TEXT("ui_color_alpha");
+
+	class SValidationUI final : public SLeafWidget
+	{
+	public:
+		SLATE_BEGIN_ARGS(SValidationUI) {}
+		SLATE_END_ARGS()
+
+		void Construct(const FArguments&)
+		{
+			SetVisibility(EVisibility::HitTestInvisible);
+		}
+
+		virtual FVector2D ComputeDesiredSize(float) const override
+		{
+			return FVector2D(256.0f, 144.0f);
+		}
+
+		virtual int32 OnPaint(
+			const FPaintArgs& Args,
+			const FGeometry& AllottedGeometry,
+			const FSlateRect& MyCullingRect,
+			FSlateWindowElementList& OutDrawElements,
+			int32 LayerId,
+			const FWidgetStyle& InWidgetStyle,
+			bool bParentEnabled) const override
+		{
+			const FVector2D Size = AllottedGeometry.GetLocalSize();
+			const FSlateBrush* WhiteBrush = FCoreStyle::Get().GetBrush(TEXT("WhiteBrush"));
+			const auto DrawNormalizedBox = [&](const FVector2D Min, const FVector2D Extent, const FLinearColor Color)
+			{
+				FSlateDrawElement::MakeBox(
+					OutDrawElements,
+					LayerId,
+					AllottedGeometry.ToPaintGeometry(Extent * Size, FSlateLayoutTransform(Min * Size)),
+					WhiteBrush,
+					ESlateDrawEffect::None,
+					Color);
+			};
+			// Known straight-alpha probes: opaque red, 50% green and 75% blue.
+			// The Slate target stores premultiplied RGB plus coverage alpha.
+			DrawNormalizedBox(FVector2D(0.05, 0.08), FVector2D(0.20, 0.14), FLinearColor(1.0, 0.0, 0.0, 1.0));
+			DrawNormalizedBox(FVector2D(0.32, 0.08), FVector2D(0.20, 0.14), FLinearColor(0.0, 1.0, 0.0, 0.5));
+			DrawNormalizedBox(FVector2D(0.59, 0.08), FVector2D(0.20, 0.14), FLinearColor(0.0, 0.0, 1.0, 0.75));
+			return LayerId + 1;
+		}
+	};
 
 	bool IsRunningState(const ESRDatasetCaptureState State)
 	{
@@ -105,6 +176,7 @@ void USRDatasetCaptureSubsystem::Initialize(FSubsystemCollectionBase& Collection
 	Super::Initialize(Collection);
 	PreActorTickHandle = FWorldDelegates::OnWorldPreActorTick.AddUObject(this, &ThisClass::HandleWorldPreActorTick);
 	PostActorTickHandle = FWorldDelegates::OnWorldPostActorTick.AddUObject(this, &ThisClass::HandleWorldPostActorTick);
+	WorldTickEndHandle = FWorldDelegates::OnWorldTickEnd.AddUObject(this, &ThisClass::HandleWorldTickEnd);
 }
 
 void USRDatasetCaptureSubsystem::Deinitialize()
@@ -115,6 +187,7 @@ void USRDatasetCaptureSubsystem::Deinitialize()
 	}
 	FWorldDelegates::OnWorldPreActorTick.Remove(PreActorTickHandle);
 	FWorldDelegates::OnWorldPostActorTick.Remove(PostActorTickHandle);
+	FWorldDelegates::OnWorldTickEnd.Remove(WorldTickEndHandle);
 	Super::Deinitialize();
 }
 
@@ -183,6 +256,11 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 	}
 
 	ActiveJob = Job;
+	// Project-authored validation Actors and their AnimInstances can consume the
+	// global random streams during SpawnActor/BeginPlay, before the normal runtime
+	// determinism profile is installed. Seed before creating any capture Actors.
+	FMath::RandInit(ActiveJob.RandomSeed);
+	FMath::SRandInit(ActiveJob.RandomSeed);
 	Status = FSRDatasetCaptureStatus();
 	Status.CurrentFrame = GetInitialEvaluationFrame();
 	ResolvedOutputDirectory = ResolveOutputDirectory(Job.OutputDirectory);
@@ -199,6 +277,19 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 	StreamingTextureCountAfterBarrier = 0;
 	PendingStreamingTextureCountAfterBarrier = 0;
 	StreamingStateAfterBarrierSha1.Reset();
+	CachedSkeletalPoseFrames.Reset();
+	NonFixtureSkeletalObjectIds.Reset();
+	NonFixtureSkeletalStencilStates.Reset();
+	NonFixtureHiddenActorStates.Reset();
+	NonFixtureHiddenActorStates.Reset();
+	WarmupPoseCacheFrame = INDEX_NONE;
+	AppliedCachedSkeletalPoseComponentCount = 0;
+	AppliedCachedSkeletalPoseBoneCount = 0;
+	SkippedCachedSkeletalPoseComponents.Reset();
+	SkeletalPoseCacheArtifactSha1.Reset();
+	bSkeletalPoseCacheLoadedFromArtifact = false;
+	DeterministicCameraPlayerController.Reset();
+	PreviousPlayerViewTarget.Reset();
 
 	if (!PrepareJob(OutError))
 	{
@@ -245,6 +336,10 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 	if (ActiveJob.bCaptureMainViewHUDlessColor)
 	{
 		OutputDirectories.Add(SRDataset::Private::HUDlessColorModality);
+	}
+	if (ActiveJob.bCaptureUIColorAlpha)
+	{
+		OutputDirectories.Add(SRDataset::Private::UIColorAlphaModality);
 	}
 	for (const TCHAR* Directory : OutputDirectories)
 	{
@@ -294,8 +389,28 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 		}
 		SequencePlayer->Pause();
 	}
+	if (!PrepareDeterministicCamera(OutError))
+	{
+		return false;
+	}
 
 	if (!PrepareSemanticValidationFixture(OutError))
+	{
+		return false;
+	}
+	if (!PrepareNonFixtureSkeletalValidation(OutError))
+	{
+		return false;
+	}
+	if (!PrepareProjectAnimatedMaterialValidation(OutError))
+	{
+		return false;
+	}
+	if (!CheckWidgetComponentPolicy(OutError))
+	{
+		return false;
+	}
+	if (!LoadSkeletalPoseCacheArtifact(OutError))
 	{
 		return false;
 	}
@@ -311,6 +426,10 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 	WarmupFramesRemaining = ActiveJob.WarmupFrames;
 	Status.State = WarmupFramesRemaining > 0 ? ESRDatasetCaptureState::WarmingUp : ESRDatasetCaptureState::Capturing;
 	Status.CurrentFrame = GetInitialEvaluationFrame();
+	if (!UpdateCaptureCamera(true, OutError))
+	{
+		return false;
+	}
 
 	if (!WriteManifest(OutError))
 	{
@@ -393,6 +512,17 @@ bool USRDatasetCaptureSubsystem::PrepareSemanticValidationFixture(FString& OutEr
 		}
 		return false;
 	}
+	if (ActiveJob.bCaptureUIColorAlpha)
+	{
+		UGameViewportClient* ViewportClient = World->GetGameViewport();
+		if (!ViewportClient)
+		{
+			OutError = TEXT("The semantic UI validation fixture requires a game viewport.");
+			return false;
+		}
+		ValidationUIWidget = SNew(SRDataset::Private::SValidationUI);
+		ViewportClient->AddViewportWidgetContent(ValidationUIWidget.ToSharedRef(), 1000000);
+	}
 
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
@@ -414,6 +544,17 @@ bool USRDatasetCaptureSubsystem::PrepareSemanticValidationFixture(FString& OutEr
 
 void USRDatasetCaptureSubsystem::RestoreSemanticValidationFixture()
 {
+	if (ValidationUIWidget)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (UGameViewportClient* ViewportClient = World->GetGameViewport())
+			{
+				ViewportClient->RemoveViewportWidgetContent(ValidationUIWidget.ToSharedRef());
+			}
+		}
+		ValidationUIWidget.Reset();
+	}
 	for (const TPair<TWeakObjectPtr<AActor>, bool>& Pair : ValidationHiddenActorStates)
 	{
 		if (AActor* Actor = Pair.Key.Get())
@@ -422,6 +563,702 @@ void USRDatasetCaptureSubsystem::RestoreSemanticValidationFixture()
 		}
 	}
 	ValidationHiddenActorStates.Reset();
+}
+
+bool USRDatasetCaptureSubsystem::PrepareNonFixtureSkeletalValidation(FString& OutError)
+{
+	NonFixtureSkeletalObjectIds.Reset();
+	NonFixtureSkeletalStencilStates.Reset();
+	if (!ActiveJob.bValidateNonFixtureSkeletalAnimation)
+	{
+		return true;
+	}
+
+	UWorld* World = GetWorld();
+	UClass* ProbeClass = ActiveJob.NonFixtureSkeletalValidationActorClass.TryLoadClass<AActor>();
+	if (!World || !ProbeClass)
+	{
+		OutError = FString::Printf(
+			TEXT("Could not load non-fixture skeletal validation Actor class: %s"),
+			*ActiveJob.NonFixtureSkeletalValidationActorClass.ToString());
+		return false;
+	}
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Name = MakeUniqueObjectName(
+		World,
+		ProbeClass,
+		TEXT("SRDatasetProjectSkeletalProbe"));
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	SpawnParameters.ObjectFlags |= RF_Transient;
+	NonFixtureSkeletalValidationActor = World->SpawnActor<AActor>(
+		ProbeClass,
+		FTransform::Identity,
+		SpawnParameters);
+	if (!NonFixtureSkeletalValidationActor)
+	{
+		OutError = FString::Printf(
+			TEXT("Could not spawn non-fixture skeletal validation Actor: %s"),
+			*ActiveJob.NonFixtureSkeletalValidationActorClass.ToString());
+		return false;
+	}
+	NonFixtureSkeletalValidationActor->SetActorEnableCollision(false);
+	NonFixtureSkeletalValidationActor->Tags.AddUnique(TEXT("SRDatasetProjectAssetProbe"));
+	if (ACharacter* Character = Cast<ACharacter>(NonFixtureSkeletalValidationActor))
+	{
+		if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement())
+		{
+			Movement->DisableMovement();
+		}
+	}
+	TInlineComponentArray<UPrimitiveComponent*> ProbePrimitives;
+	NonFixtureSkeletalValidationActor->GetComponents(ProbePrimitives);
+	for (UPrimitiveComponent* Primitive : ProbePrimitives)
+	{
+		if (!IsValid(Primitive))
+		{
+			continue;
+		}
+		Primitive->SetHiddenInGame(false, true);
+		Primitive->SetVisibility(true, true);
+		Primitive->SetOnlyOwnerSee(false);
+		Primitive->SetOwnerNoSee(false);
+	}
+	PositionNonFixtureSkeletalValidationActor();
+	if (APlayerController* Controller = World->GetFirstPlayerController())
+	{
+		if (APawn* OriginalPlayerPawn = Controller->GetPawn();
+			OriginalPlayerPawn && OriginalPlayerPawn != NonFixtureSkeletalValidationActor)
+		{
+			NonFixtureHiddenActorStates.Add(
+				OriginalPlayerPawn,
+				OriginalPlayerPawn->IsHidden());
+			OriginalPlayerPawn->SetActorHiddenInGame(true);
+		}
+	}
+
+	int32 NextObjectId = 128;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!IsValid(Actor) || Actor == CaptureRig || Actor == ValidationFixture ||
+			NonFixtureHiddenActorStates.Contains(Actor))
+		{
+			continue;
+		}
+		TInlineComponentArray<USkinnedMeshComponent*> Components;
+		Actor->GetComponents(Components);
+		for (USkinnedMeshComponent* Component : Components)
+		{
+			if (!IsValid(Component) || !Component->IsRegistered() || !Component->GetSkinnedAsset())
+			{
+				continue;
+			}
+			if (NextObjectId > 254)
+			{
+				OutError = TEXT("Non-fixture skeletal validation supports at most 127 labeled components per job.");
+				RestoreNonFixtureSkeletalValidation();
+				return false;
+			}
+			FPrimitiveStencilState State;
+			State.bRenderCustomDepth = Component->bRenderCustomDepth;
+			State.CustomDepthStencilValue = static_cast<uint8>(Component->CustomDepthStencilValue);
+			State.CustomDepthStencilWriteMask = static_cast<uint8>(Component->CustomDepthStencilWriteMask);
+			NonFixtureSkeletalStencilStates.Add(Component, State);
+			NonFixtureSkeletalObjectIds.Add(Component, NextObjectId);
+			Component->SetRenderCustomDepth(true);
+			Component->SetCustomDepthStencilWriteMask(ERendererStencilMask::ERSM_Default);
+			Component->SetCustomDepthStencilValue(NextObjectId++);
+		}
+	}
+	if (NonFixtureSkeletalObjectIds.IsEmpty())
+	{
+		OutError = TEXT("Non-fixture skeletal validation found no registered project skeletal components.");
+		return false;
+	}
+	return true;
+}
+
+void USRDatasetCaptureSubsystem::RestoreNonFixtureSkeletalValidation()
+{
+	for (const TPair<TWeakObjectPtr<UPrimitiveComponent>, FPrimitiveStencilState>& Pair :
+		NonFixtureSkeletalStencilStates)
+	{
+		if (UPrimitiveComponent* Component = Pair.Key.Get())
+		{
+			Component->SetRenderCustomDepth(Pair.Value.bRenderCustomDepth);
+			Component->SetCustomDepthStencilWriteMask(
+				static_cast<ERendererStencilMask>(Pair.Value.CustomDepthStencilWriteMask));
+			Component->SetCustomDepthStencilValue(Pair.Value.CustomDepthStencilValue);
+		}
+	}
+	NonFixtureSkeletalStencilStates.Reset();
+	NonFixtureSkeletalObjectIds.Reset();
+	for (const TPair<TWeakObjectPtr<AActor>, bool>& Pair : NonFixtureHiddenActorStates)
+	{
+		if (AActor* Actor = Pair.Key.Get())
+		{
+			Actor->SetActorHiddenInGame(Pair.Value);
+		}
+	}
+	NonFixtureHiddenActorStates.Reset();
+}
+
+void USRDatasetCaptureSubsystem::PositionNonFixtureSkeletalValidationActor()
+{
+	if (!NonFixtureSkeletalValidationActor || !CaptureRig)
+	{
+		return;
+	}
+	const FMinimalViewInfo& View = CaptureRig->GetLastCameraView();
+	const FVector Forward = View.Rotation.Vector();
+	const FVector Up = FRotationMatrix(View.Rotation).GetScaledAxis(EAxis::Z);
+	const FVector Location = View.Location + Forward * 500.0f - Up * 90.0f;
+	const FRotator Rotation(0.0f, View.Rotation.Yaw + 180.0f, 0.0f);
+	NonFixtureSkeletalValidationActor->SetActorLocationAndRotation(
+		Location,
+		Rotation,
+		false,
+		nullptr,
+		ETeleportType::TeleportPhysics);
+}
+
+bool USRDatasetCaptureSubsystem::PrepareProjectAnimatedMaterialValidation(FString& OutError)
+{
+	ProjectAnimatedMaterialValidationBasePath.Reset();
+	if (!ActiveJob.bValidateProjectAnimatedMaterial)
+	{
+		return true;
+	}
+
+	UWorld* World = GetWorld();
+	ProjectAnimatedMaterialValidationInterface = Cast<UMaterialInterface>(
+		ActiveJob.ProjectAnimatedMaterialValidationMaterial.TryLoad());
+	UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(
+		nullptr,
+		TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (!World || !ProjectAnimatedMaterialValidationInterface || !CubeMesh)
+	{
+		OutError = FString::Printf(
+			TEXT("Could not load project animated-material validation assets: %s"),
+			*ActiveJob.ProjectAnimatedMaterialValidationMaterial.ToString());
+		return false;
+	}
+	if (const UMaterial* BaseMaterial = ProjectAnimatedMaterialValidationInterface->GetMaterial())
+	{
+		ProjectAnimatedMaterialValidationBasePath = BaseMaterial->GetPathName();
+	}
+	if (!ProjectAnimatedMaterialValidationBasePath.StartsWith(TEXT("/Game/")))
+	{
+		OutError = TEXT("Project animated-material validation resolved to a non-project base material.");
+		return false;
+	}
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Name = MakeUniqueObjectName(
+		World,
+		AStaticMeshActor::StaticClass(),
+		TEXT("SRDatasetProjectAnimatedMaterialReceiver"));
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	SpawnParameters.ObjectFlags |= RF_Transient;
+	AStaticMeshActor* Receiver = World->SpawnActor<AStaticMeshActor>(
+		AStaticMeshActor::StaticClass(),
+		FTransform::Identity,
+		SpawnParameters);
+	if (!Receiver)
+	{
+		OutError = TEXT("Could not spawn the project animated-material validation receiver.");
+		return false;
+	}
+	ProjectAnimatedMaterialValidationReceiver = Receiver;
+	ProjectAnimatedMaterialValidationComponent = Receiver->GetStaticMeshComponent();
+	if (!ProjectAnimatedMaterialValidationComponent)
+	{
+		OutError = TEXT("The project animated-material validation receiver has no static-mesh component.");
+		RestoreProjectAnimatedMaterialValidation();
+		return false;
+	}
+	Receiver->Tags.AddUnique(TEXT("SRDatasetProjectAnimatedMaterialProbe"));
+	Receiver->SetActorEnableCollision(false);
+	Receiver->SetActorTickEnabled(false);
+	ProjectAnimatedMaterialValidationComponent->SetMobility(EComponentMobility::Movable);
+	ProjectAnimatedMaterialValidationComponent->SetStaticMesh(CubeMesh);
+	ProjectAnimatedMaterialValidationComponent->SetMaterial(
+		0,
+		ProjectAnimatedMaterialValidationInterface);
+	// The project flashlight material reads Custom Primitive Data supplied by
+	// its Blueprint carrier. Populate a deterministic neutral/white payload on
+	// this isolated receiver so the material network is visible without running
+	// the Blueprint's stateful random Tick graph.
+	for (int32 DataIndex = 0; DataIndex < 8; ++DataIndex)
+	{
+		ProjectAnimatedMaterialValidationComponent->SetCustomPrimitiveDataFloat(
+			DataIndex,
+			1.0f);
+	}
+	ProjectAnimatedMaterialValidationComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	ProjectAnimatedMaterialValidationComponent->SetCastShadow(false);
+	ProjectAnimatedMaterialValidationComponent->SetHiddenInGame(false, true);
+	ProjectAnimatedMaterialValidationComponent->SetVisibility(true, true);
+	ProjectAnimatedMaterialValidationComponent->SetRenderCustomDepth(true);
+	ProjectAnimatedMaterialValidationComponent->SetCustomDepthStencilWriteMask(
+		ERendererStencilMask::ERSM_Default);
+	ProjectAnimatedMaterialValidationComponent->SetCustomDepthStencilValue(150);
+	ProjectAnimatedMaterialValidationComponent->bEvaluateWorldPositionOffset = true;
+	ProjectAnimatedMaterialValidationComponent->bWorldPositionOffsetWritesVelocity = true;
+	PositionProjectAnimatedMaterialValidationReceiver();
+	return true;
+}
+
+void USRDatasetCaptureSubsystem::PositionProjectAnimatedMaterialValidationReceiver()
+{
+	if (!ProjectAnimatedMaterialValidationReceiver || !CaptureRig)
+	{
+		return;
+	}
+	const FMinimalViewInfo& View = CaptureRig->GetLastCameraView();
+	const FVector Forward = View.Rotation.Vector();
+	const FVector Up = FRotationMatrix(View.Rotation).GetScaledAxis(EAxis::Z);
+	ProjectAnimatedMaterialValidationReceiver->SetActorLocationAndRotation(
+		View.Location + Forward * 500.0f + Up * 15.0f,
+		View.Rotation,
+		false,
+		nullptr,
+		ETeleportType::TeleportPhysics);
+	ProjectAnimatedMaterialValidationReceiver->SetActorScale3D(FVector(0.15f, 2.5f, 1.5f));
+}
+
+void USRDatasetCaptureSubsystem::RestoreProjectAnimatedMaterialValidation()
+{
+	ProjectAnimatedMaterialValidationComponent = nullptr;
+	ProjectAnimatedMaterialValidationInterface = nullptr;
+	ProjectAnimatedMaterialValidationBasePath.Reset();
+	if (ProjectAnimatedMaterialValidationReceiver)
+	{
+		ProjectAnimatedMaterialValidationReceiver->Destroy();
+		ProjectAnimatedMaterialValidationReceiver = nullptr;
+	}
+}
+
+bool USRDatasetCaptureSubsystem::PrepareDeterministicCamera(FString& OutError)
+{
+	if (!ActiveJob.bUseDeterministicCameraTransform)
+	{
+		return true;
+	}
+	UWorld* World = GetWorld();
+	APlayerController* Controller = World ? World->GetFirstPlayerController() : nullptr;
+	if (!World || !Controller)
+	{
+		OutError = TEXT("Deterministic camera override requires player controller 0.");
+		return false;
+	}
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Name = MakeUniqueObjectName(
+		World,
+		ACameraActor::StaticClass(),
+		TEXT("SRDatasetDeterministicCamera"));
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	SpawnParameters.ObjectFlags |= RF_Transient;
+	DeterministicCameraActor = World->SpawnActor<ACameraActor>(
+		ACameraActor::StaticClass(),
+		FTransform(
+			ActiveJob.DeterministicCameraRotationDegrees,
+			ActiveJob.DeterministicCameraLocationCm),
+		SpawnParameters);
+	if (!DeterministicCameraActor)
+	{
+		OutError = TEXT("Could not spawn the deterministic dataset camera.");
+		return false;
+	}
+	if (UCameraComponent* Camera = DeterministicCameraActor->GetCameraComponent())
+	{
+		Camera->SetProjectionMode(ECameraProjectionMode::Perspective);
+		Camera->SetFieldOfView(ActiveJob.DeterministicCameraFOVDegrees);
+		Camera->SetAspectRatio(
+			static_cast<float>(ActiveJob.HRResolution.X) /
+			static_cast<float>(ActiveJob.HRResolution.Y));
+	}
+	DeterministicCameraPlayerController = Controller;
+	PreviousPlayerViewTarget = Controller->GetViewTarget();
+	EnforceDeterministicCamera();
+	return true;
+}
+
+void USRDatasetCaptureSubsystem::EnforceDeterministicCamera()
+{
+	if (!ActiveJob.bUseDeterministicCameraTransform || !DeterministicCameraActor)
+	{
+		return;
+	}
+	DeterministicCameraActor->SetActorLocationAndRotation(
+		ActiveJob.DeterministicCameraLocationCm,
+		ActiveJob.DeterministicCameraRotationDegrees,
+		false,
+		nullptr,
+		ETeleportType::TeleportPhysics);
+	if (APlayerController* Controller = DeterministicCameraPlayerController.Get())
+	{
+		if (Controller->GetViewTarget() != DeterministicCameraActor)
+		{
+			Controller->SetViewTarget(DeterministicCameraActor);
+		}
+	}
+}
+
+void USRDatasetCaptureSubsystem::RestoreDeterministicCamera()
+{
+	if (APlayerController* Controller = DeterministicCameraPlayerController.Get())
+	{
+		if (AActor* PreviousTarget = PreviousPlayerViewTarget.Get())
+		{
+			Controller->SetViewTarget(PreviousTarget);
+		}
+	}
+	if (DeterministicCameraActor)
+	{
+		DeterministicCameraActor->Destroy();
+		DeterministicCameraActor = nullptr;
+	}
+	DeterministicCameraPlayerController.Reset();
+	PreviousPlayerViewTarget.Reset();
+}
+
+void USRDatasetCaptureSubsystem::CacheSkeletalPosesForLogicalFrame(const int32 FrameNumber)
+{
+	if (!ActiveJob.bCacheSkeletalAnimationPosesForReplay || !GetWorld())
+	{
+		return;
+	}
+	TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState>& FrameCache =
+		CachedSkeletalPoseFrames.FindOrAdd(FrameNumber);
+	FrameCache.Reset();
+	for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+	{
+		TInlineComponentArray<USkinnedMeshComponent*> Components;
+		It->GetComponents(Components);
+		for (USkinnedMeshComponent* Component : Components)
+		{
+			if (!IsValid(Component) || !Component->IsRegistered() || !Component->GetSkinnedAsset())
+			{
+				continue;
+			}
+			const TArray<FTransform>& CurrentBones = Component->GetComponentSpaceTransforms();
+			if (CurrentBones.IsEmpty())
+			{
+				continue;
+			}
+			FSkeletalEndpointState State;
+			State.ComponentPath = Component->GetPathName();
+			State.SkinnedAssetPath = Component->GetSkinnedAsset()->GetPathName();
+			State.ComponentSpaceTransforms = CurrentBones;
+			State.BoneVisibilityStates = Component->GetBoneVisibilityStates();
+			FrameCache.Add(Component, MoveTemp(State));
+		}
+	}
+}
+
+void USRDatasetCaptureSubsystem::ApplyCachedSkeletalPoses(const int32 FrameNumber)
+{
+	AppliedCachedSkeletalPoseComponentCount = 0;
+	AppliedCachedSkeletalPoseBoneCount = 0;
+	SkippedCachedSkeletalPoseComponents.Reset();
+	if (!ActiveJob.bCacheSkeletalAnimationPosesForReplay)
+	{
+		return;
+	}
+	const TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState>* FrameCache =
+		CachedSkeletalPoseFrames.Find(FrameNumber);
+	if (!FrameCache)
+	{
+		SkippedCachedSkeletalPoseComponents.Add(
+			FString::Printf(TEXT("logical_frame_%d|cache_missing"), FrameNumber));
+		return;
+	}
+	for (const TPair<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState>& Pair : *FrameCache)
+	{
+		USkinnedMeshComponent* Component = Pair.Key.Get();
+		const FSkeletalEndpointState& State = Pair.Value;
+		if (!IsValid(Component) || !Component->IsRegistered() || !Component->GetSkinnedAsset() ||
+			Component->GetSkinnedAsset()->GetPathName() != State.SkinnedAssetPath)
+		{
+			SkippedCachedSkeletalPoseComponents.Add(State.ComponentPath + TEXT("|unavailable_or_asset_changed"));
+			continue;
+		}
+		// Animation FinalizeBoneTransform has already flipped the double buffer for
+		// this world tick. At this point the public editable array is deliberately
+		// the *previous* buffer (used separately by endpoint motion below), while
+		// GetComponentSpaceTransforms is the current render pose. The component is
+		// non-const, so update that current read buffer explicitly.
+		TArray<FTransform>& CurrentTransforms = const_cast<TArray<FTransform>&>(
+			Component->GetComponentSpaceTransforms());
+		if (CurrentTransforms.Num() != State.ComponentSpaceTransforms.Num())
+		{
+			SkippedCachedSkeletalPoseComponents.Add(State.ComponentPath + TEXT("|bone_count_changed"));
+			continue;
+		}
+		CurrentTransforms = State.ComponentSpaceTransforms;
+		TArray<uint8>& CurrentVisibility = const_cast<TArray<uint8>&>(
+			Component->GetBoneVisibilityStates());
+		if (CurrentVisibility.Num() == State.BoneVisibilityStates.Num())
+		{
+			CurrentVisibility = State.BoneVisibilityStates;
+		}
+		else if (!State.BoneVisibilityStates.IsEmpty())
+		{
+			SkippedCachedSkeletalPoseComponents.Add(State.ComponentPath + TEXT("|visibility_count_changed"));
+			continue;
+		}
+		Component->UpdateBounds();
+		Component->MarkRenderTransformDirty();
+		Component->MarkRenderDynamicDataDirty();
+		++AppliedCachedSkeletalPoseComponentCount;
+		AppliedCachedSkeletalPoseBoneCount += State.ComponentSpaceTransforms.Num();
+	}
+	SkippedCachedSkeletalPoseComponents.Sort();
+}
+
+FString USRDatasetCaptureSubsystem::ResolveProjectFile(const FString& InPath) const
+{
+	FString FullPath = FPaths::IsRelative(InPath)
+		? FPaths::ConvertRelativePathToFull(FPaths::ProjectDir(), InPath)
+		: FPaths::ConvertRelativePathToFull(InPath);
+	FPaths::CollapseRelativeDirectories(FullPath);
+	return FullPath;
+}
+
+bool USRDatasetCaptureSubsystem::SaveSkeletalPoseCacheArtifact(FString& OutError)
+{
+	if (ActiveJob.SkeletalPoseCacheOutputFile.IsEmpty())
+	{
+		return true;
+	}
+	const int32 ExpectedFrameCount = ActiveJob.EndFrame - ActiveJob.StartFrame + 1;
+	if (CachedSkeletalPoseFrames.Num() != ExpectedFrameCount)
+	{
+		OutError = FString::Printf(
+			TEXT("Skeletal pose-cache bake produced %d frames; expected %d."),
+			CachedSkeletalPoseFrames.Num(),
+			ExpectedFrameCount);
+		return false;
+	}
+
+	FBufferArchive Archive;
+	uint32 Magic = 0x53525043; // 'SRPC'
+	int32 Version = 1;
+	FString EngineVersion = FEngineVersion::Current().ToString();
+	FString WorldPackage = GetWorld() ? GetWorld()->GetOutermost()->GetName() : FString();
+	FString ValidationActorClass = ActiveJob.NonFixtureSkeletalValidationActorClass.ToString();
+	int32 StartFrame = ActiveJob.StartFrame;
+	int32 EndFrame = ActiveJob.EndFrame;
+	int32 FrameRateNumerator = ActiveJob.CaptureFrameRateNumerator;
+	int32 FrameRateDenominator = ActiveJob.CaptureFrameRateDenominator;
+	int32 RandomSeed = ActiveJob.RandomSeed;
+	Archive << Magic << Version << EngineVersion << WorldPackage << ValidationActorClass;
+	Archive << StartFrame << EndFrame << FrameRateNumerator << FrameRateDenominator << RandomSeed;
+	int32 FrameCount = CachedSkeletalPoseFrames.Num();
+	Archive << FrameCount;
+
+	TArray<int32> FrameNumbers;
+	CachedSkeletalPoseFrames.GetKeys(FrameNumbers);
+	FrameNumbers.Sort();
+	for (int32 FrameNumber : FrameNumbers)
+	{
+		Archive << FrameNumber;
+		TArray<FSkeletalEndpointState> States;
+		CachedSkeletalPoseFrames.FindChecked(FrameNumber).GenerateValueArray(States);
+		States.Sort([](const FSkeletalEndpointState& Left, const FSkeletalEndpointState& Right)
+		{
+			return Left.ComponentPath.Compare(Right.ComponentPath, ESearchCase::CaseSensitive) < 0;
+		});
+		int32 ComponentCount = States.Num();
+		Archive << ComponentCount;
+		for (FSkeletalEndpointState& State : States)
+		{
+			Archive << State.ComponentPath << State.SkinnedAssetPath;
+			int32 BoneCount = State.ComponentSpaceTransforms.Num();
+			Archive << BoneCount;
+			for (FTransform& Transform : State.ComponentSpaceTransforms)
+			{
+				Archive << Transform;
+			}
+			int32 VisibilityCount = State.BoneVisibilityStates.Num();
+			Archive << VisibilityCount;
+			for (uint8& Visibility : State.BoneVisibilityStates)
+			{
+				Archive << Visibility;
+			}
+		}
+	}
+
+	const FString ArtifactPath = ResolveProjectFile(ActiveJob.SkeletalPoseCacheOutputFile);
+	const FString ParentDirectory = FPaths::GetPath(ArtifactPath);
+	if ((!IFileManager::Get().MakeDirectory(*ParentDirectory, true) &&
+		 !IFileManager::Get().DirectoryExists(*ParentDirectory)))
+	{
+		OutError = FString::Printf(TEXT("Could not create skeletal pose-cache directory: %s"), *ParentDirectory);
+		return false;
+	}
+	const FString TempPath = ArtifactPath + TEXT(".part");
+	if (!FFileHelper::SaveArrayToFile(Archive, *TempPath) ||
+		!IFileManager::Get().Move(*ArtifactPath, *TempPath, true, true, false, true))
+	{
+		OutError = FString::Printf(TEXT("Could not write skeletal pose-cache artifact: %s"), *ArtifactPath);
+		return false;
+	}
+	SkeletalPoseCacheArtifactSha1 = HashFile(ArtifactPath);
+	if (SkeletalPoseCacheArtifactSha1.IsEmpty())
+	{
+		OutError = FString::Printf(TEXT("Could not hash skeletal pose-cache artifact: %s"), *ArtifactPath);
+		return false;
+	}
+	bSkeletalPoseCacheLoadedFromArtifact = false;
+	return true;
+}
+
+bool USRDatasetCaptureSubsystem::LoadSkeletalPoseCacheArtifact(FString& OutError)
+{
+	if (ActiveJob.SkeletalPoseCacheInputFile.IsEmpty())
+	{
+		return true;
+	}
+	const FString ArtifactPath = ResolveProjectFile(ActiveJob.SkeletalPoseCacheInputFile);
+	TArray<uint8> Data;
+	if (!FFileHelper::LoadFileToArray(Data, *ArtifactPath))
+	{
+		OutError = FString::Printf(TEXT("Could not read skeletal pose-cache artifact: %s"), *ArtifactPath);
+		return false;
+	}
+	FMemoryReader Reader(Data, true);
+	uint32 Magic = 0;
+	int32 Version = 0;
+	FString EngineVersion;
+	FString WorldPackage;
+	FString ValidationActorClass;
+	int32 StartFrame = INDEX_NONE;
+	int32 EndFrame = INDEX_NONE;
+	int32 FrameRateNumerator = 0;
+	int32 FrameRateDenominator = 0;
+	int32 RandomSeed = 0;
+	Reader << Magic << Version << EngineVersion << WorldPackage << ValidationActorClass;
+	Reader << StartFrame << EndFrame << FrameRateNumerator << FrameRateDenominator << RandomSeed;
+	const FString ExpectedWorld = GetWorld() ? GetWorld()->GetOutermost()->GetName() : FString();
+	if (Reader.IsError() || Magic != 0x53525043 || Version != 1 ||
+		EngineVersion != FEngineVersion::Current().ToString() ||
+		WorldPackage != ExpectedWorld ||
+		ValidationActorClass != ActiveJob.NonFixtureSkeletalValidationActorClass.ToString() ||
+		StartFrame != ActiveJob.StartFrame || EndFrame != ActiveJob.EndFrame ||
+		FrameRateNumerator != ActiveJob.CaptureFrameRateNumerator ||
+		FrameRateDenominator != ActiveJob.CaptureFrameRateDenominator ||
+		RandomSeed != ActiveJob.RandomSeed)
+	{
+		OutError = TEXT("Skeletal pose-cache artifact header does not match this engine, map, frame range, rate, seed, or validation Actor class.");
+		return false;
+	}
+
+	TMap<FString, USkinnedMeshComponent*> ComponentsByPath;
+	for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+	{
+		TInlineComponentArray<USkinnedMeshComponent*> Components;
+		It->GetComponents(Components);
+		for (USkinnedMeshComponent* Component : Components)
+		{
+			if (IsValid(Component) && Component->IsRegistered() && Component->GetSkinnedAsset())
+			{
+				ComponentsByPath.Add(Component->GetPathName(), Component);
+			}
+		}
+	}
+
+	int32 FrameCount = 0;
+	Reader << FrameCount;
+	const int32 ExpectedFrameCount = ActiveJob.EndFrame - ActiveJob.StartFrame + 1;
+	if (Reader.IsError() || FrameCount != ExpectedFrameCount)
+	{
+		OutError = FString::Printf(
+			TEXT("Skeletal pose-cache artifact contains %d frames; expected %d."),
+			FrameCount,
+			ExpectedFrameCount);
+		return false;
+	}
+	CachedSkeletalPoseFrames.Reset();
+	for (int32 FrameIndex = 0; FrameIndex < FrameCount; ++FrameIndex)
+	{
+		int32 FrameNumber = INDEX_NONE;
+		int32 ComponentCount = 0;
+		Reader << FrameNumber << ComponentCount;
+		if (Reader.IsError() || FrameNumber < ActiveJob.StartFrame || FrameNumber > ActiveJob.EndFrame ||
+			CachedSkeletalPoseFrames.Contains(FrameNumber) || ComponentCount <= 0 || ComponentCount > 100000)
+		{
+			OutError = TEXT("Skeletal pose-cache artifact contains an invalid or duplicate frame/component count.");
+			CachedSkeletalPoseFrames.Reset();
+			return false;
+		}
+		TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState>& FrameCache =
+			CachedSkeletalPoseFrames.Add(FrameNumber);
+		TSet<FString> SeenComponentPaths;
+		for (int32 ComponentIndex = 0; ComponentIndex < ComponentCount; ++ComponentIndex)
+		{
+			FSkeletalEndpointState State;
+			Reader << State.ComponentPath << State.SkinnedAssetPath;
+			int32 BoneCount = 0;
+			Reader << BoneCount;
+			if (Reader.IsError() || BoneCount <= 0 || BoneCount > 100000 ||
+				SeenComponentPaths.Contains(State.ComponentPath))
+			{
+				OutError = TEXT("Skeletal pose-cache artifact contains invalid bone data or duplicate component paths.");
+				CachedSkeletalPoseFrames.Reset();
+				return false;
+			}
+			SeenComponentPaths.Add(State.ComponentPath);
+			State.ComponentSpaceTransforms.SetNum(BoneCount);
+			for (FTransform& Transform : State.ComponentSpaceTransforms)
+			{
+				Reader << Transform;
+			}
+			int32 VisibilityCount = 0;
+			Reader << VisibilityCount;
+			if (Reader.IsError() || VisibilityCount < 0 || VisibilityCount > 100000)
+			{
+				OutError = TEXT("Skeletal pose-cache artifact contains an invalid visibility-state count.");
+				CachedSkeletalPoseFrames.Reset();
+				return false;
+			}
+			State.BoneVisibilityStates.SetNum(VisibilityCount);
+			for (uint8& Visibility : State.BoneVisibilityStates)
+			{
+				Reader << Visibility;
+			}
+			USkinnedMeshComponent* const* ComponentPtr = ComponentsByPath.Find(State.ComponentPath);
+			USkinnedMeshComponent* Component = ComponentPtr ? *ComponentPtr : nullptr;
+			if (Reader.IsError() || !IsValid(Component) || !Component->GetSkinnedAsset() ||
+				Component->GetSkinnedAsset()->GetPathName() != State.SkinnedAssetPath ||
+				(!Component->GetComponentSpaceTransforms().IsEmpty() &&
+				 Component->GetComponentSpaceTransforms().Num() != BoneCount))
+			{
+				OutError = FString::Printf(
+					TEXT("Skeletal pose-cache component is unavailable or incompatible: %s"),
+					*State.ComponentPath);
+				CachedSkeletalPoseFrames.Reset();
+				return false;
+			}
+			FrameCache.Add(Component, MoveTemp(State));
+		}
+	}
+	if (Reader.IsError() || !Reader.AtEnd() || CachedSkeletalPoseFrames.Num() != ExpectedFrameCount)
+	{
+		OutError = TEXT("Skeletal pose-cache artifact ended unexpectedly or contains trailing data.");
+		CachedSkeletalPoseFrames.Reset();
+		return false;
+	}
+	SkeletalPoseCacheArtifactSha1 = HashFile(ArtifactPath);
+	if (SkeletalPoseCacheArtifactSha1.IsEmpty())
+	{
+		OutError = FString::Printf(TEXT("Could not hash skeletal pose-cache artifact: %s"), *ArtifactPath);
+		CachedSkeletalPoseFrames.Reset();
+		return false;
+	}
+	bSkeletalPoseCacheLoadedFromArtifact = true;
+	return true;
 }
 
 void USRDatasetCaptureSubsystem::ApplyDeterministicRuntimeState()
@@ -484,7 +1321,7 @@ void USRDatasetCaptureSubsystem::ApplyDeterministicRuntimeState()
 			bOverrodeEyeAdaptation = true;
 		}
 	}
-	if (ActiveJob.bEnableSemanticValidationFixture)
+	if (ActiveJob.bCaptureTemporalDiagnostics)
 	{
 		if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(TEXT("r.CustomDepth")))
 		{
@@ -501,6 +1338,9 @@ void USRDatasetCaptureSubsystem::ApplyDeterministicRuntimeState()
 			Variable->Set(1, ECVF_SetByCode);
 			bOverrodeMotionVectorSimulation = true;
 		}
+		// A simulated previous transform must still reach FScene when the current
+		// endpoint happens to equal a recently primed intermediate transform.
+		ApplyTrackedCVarOverride(TEXT("r.SkipRedundantTransformUpdate"), TEXT("0"));
 	}
 	if (ActiveJob.bLockTemporalJitterToLogicalFrame)
 	{
@@ -645,6 +1485,109 @@ void USRDatasetCaptureSubsystem::ApplyLogicalTemporalJitter(const int32 FrameNum
 	}
 }
 
+void USRDatasetCaptureSubsystem::ApplyLogicalMaterialTime(const int32 FrameNumber)
+{
+	if (!ActiveJob.bLockMaterialTimeToLogicalFrame)
+	{
+		return;
+	}
+
+	// Keep a non-zero signed view delta even for warmup/reset frames so the
+	// renderer advances temporal view state. Reset metadata makes that history
+	// unusable for training, while the explicit material previous frame remains
+	// auditable and independent of wall-clock time.
+	int32 PreviousFrameNumber = FrameNumber - GetEvaluationDirection();
+	if (Status.State == ESRDatasetCaptureState::Capturing && ShouldCaptureFrame(FrameNumber))
+	{
+		const bool bFirstCapturedFrame = FrameNumber == GetFirstCapturedFrame();
+		if (ActiveJob.ReplayPass == ESRDatasetReplayPass::FrameGenerationIntermediate)
+		{
+			PreviousFrameNumber = FrameNumber - 1;
+		}
+		else if (!bFirstCapturedFrame)
+		{
+			PreviousFrameNumber = GetPreviouslyCapturedFrame(FrameNumber);
+		}
+	}
+
+	const double FixedDeltaSeconds = ActiveJob.GetFixedDeltaSeconds();
+	const double CurrentTimeSeconds = static_cast<double>(FrameNumber) * FixedDeltaSeconds;
+	const float MaterialDeltaSeconds = static_cast<float>(
+		static_cast<double>(FrameNumber - PreviousFrameNumber) * FixedDeltaSeconds);
+	if (const TSharedPtr<FSRDatasetViewExtension, ESPMode::ThreadSafe> ViewExtension =
+		GetSRDatasetViewExtension())
+	{
+		ViewExtension->SetDeterministicViewTime(CurrentTimeSeconds, MaterialDeltaSeconds);
+	}
+	if (const TSharedPtr<FSRDatasetViewExtension, ESPMode::ThreadSafe> TonemapExtension =
+		GetSRDatasetTonemapViewExtension())
+	{
+		TonemapExtension->SetDeterministicViewTime(CurrentTimeSeconds, MaterialDeltaSeconds);
+	}
+}
+
+void USRDatasetCaptureSubsystem::ClearLogicalMaterialTime()
+{
+	if (const TSharedPtr<FSRDatasetViewExtension, ESPMode::ThreadSafe> ViewExtension =
+		GetSRDatasetViewExtension())
+	{
+		ViewExtension->ClearDeterministicViewTime();
+	}
+	if (const TSharedPtr<FSRDatasetViewExtension, ESPMode::ThreadSafe> TonemapExtension =
+		GetSRDatasetTonemapViewExtension())
+	{
+		TonemapExtension->ClearDeterministicViewTime();
+	}
+}
+
+TArray<FString> USRDatasetCaptureSubsystem::GetActiveWidgetComponentPaths() const
+{
+	TArray<FString> Paths;
+	if (!GetWorld())
+	{
+		return Paths;
+	}
+	for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+	{
+		const AActor* Actor = *It;
+		if (!IsValid(Actor) || Actor->IsHidden())
+		{
+			continue;
+		}
+		TInlineComponentArray<UWidgetComponent*> Components;
+		Actor->GetComponents(Components);
+		for (const UWidgetComponent* Component : Components)
+		{
+			if (IsValid(Component) && Component->IsRegistered() && Component->IsVisible())
+			{
+				Paths.Add(Component->GetPathName());
+			}
+		}
+	}
+	Paths.Sort([](const FString& Left, const FString& Right)
+	{
+		return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+	});
+	return Paths;
+}
+
+bool USRDatasetCaptureSubsystem::CheckWidgetComponentPolicy(FString& OutError) const
+{
+	if (!ActiveJob.bRejectVisibleWidgetComponents)
+	{
+		return true;
+	}
+	const TArray<FString> Paths = GetActiveWidgetComponentPaths();
+	if (!Paths.IsEmpty())
+	{
+		OutError = FString::Printf(
+			TEXT("HUD-less capture rejects visible UWidgetComponent scene residue. Hide/remove or explicitly classify: %s"),
+			*FString::Join(Paths, TEXT(", ")));
+		return false;
+	}
+	return true;
+}
+
 void USRDatasetCaptureSubsystem::SnapshotProvenance()
 {
 	TSharedRef<FJsonObject> JobObject = MakeShared<FJsonObject>();
@@ -683,6 +1626,7 @@ void USRDatasetCaptureSubsystem::SnapshotProvenance()
 		TEXT("r.RDG.ParallelExecute"),
 		TEXT("r.SceneCulling.Async.Query"),
 		TEXT("r.SceneCulling.Async.Update"),
+		TEXT("r.SkipRedundantTransformUpdate"),
 		TEXT("r.ScreenPercentage"),
 		TEXT("r.StaticMeshLODDistanceScale"),
 		TEXT("r.SkeletalMeshLODBias"),
@@ -935,8 +1879,79 @@ USRDatasetCaptureSubsystem::FSceneStateSummary USRDatasetCaptureSubsystem::Compu
 			{
 				++Summary.FXComponentCount;
 				++Summary.NiagaraComponentCount;
+				FSceneStateSummary::FNiagaraSummary NiagaraSummary;
+				NiagaraSummary.ComponentPath = Niagara->GetPathName();
+				NiagaraSummary.AssetPath = Niagara->GetAsset() ? Niagara->GetAsset()->GetPathName() : TEXT("none");
+				NiagaraSummary.DesiredAgeSeconds = Niagara->GetDesiredAge();
+				NiagaraSummary.ComponentLocationCm = Niagara->GetComponentLocation();
+				NiagaraSummary.ComponentBoundsOriginCm = Niagara->Bounds.Origin;
+				NiagaraSummary.ComponentBoundsExtentCm = Niagara->Bounds.BoxExtent;
+				for (int32 MaterialIndex = 0; MaterialIndex < Niagara->GetNumMaterials(); ++MaterialIndex)
+				{
+					const UMaterialInterface* Material = Niagara->GetMaterial(MaterialIndex);
+					NiagaraSummary.MaterialPaths.Add(Material ? Material->GetPathName() : TEXT("none"));
+				}
+				if (const UNiagaraSystem* System = Niagara->GetAsset())
+				{
+					NiagaraSummary.bSystemDeterminism = System->NeedsDeterminism();
+					NiagaraSummary.bSystemFixedTick = System->HasFixedTickDelta();
+					NiagaraSummary.SystemFixedTickSeconds = System->GetFixedTickDeltaTime();
+				}
+				if (FNiagaraSystemInstanceControllerConstPtr Controller = Niagara->GetSystemInstanceController())
+				{
+					NiagaraSummary.SimulationAgeSeconds = Controller->GetAge();
+					if (const FNiagaraSystemInstance* Instance = Controller->GetSoloSystemInstance())
+					{
+						NiagaraSummary.bSoloInstanceObservable = true;
+						for (const FNiagaraEmitterInstanceRef& EmitterRef : Instance->GetEmitters())
+						{
+							const FNiagaraEmitterInstance& Emitter = EmitterRef.Get();
+							const int32 ParticleCount = Emitter.GetNumParticles();
+							++NiagaraSummary.EmitterCount;
+							NiagaraSummary.EmitterParticleCounts.Add(ParticleCount);
+							NiagaraSummary.EmitterDeterminism.Add(Emitter.IsDeterministic());
+							const FVersionedNiagaraEmitterData* EmitterData =
+								Emitter.GetEmitterHandle().GetEmitterData();
+							NiagaraSummary.EmitterRandomSeeds.Add(
+								EmitterData ? EmitterData->RandomSeed : 0);
+							NiagaraSummary.ParticleCount += ParticleCount;
+							NiagaraSummary.TotalSpawnedParticleCount += Emitter.GetTotalSpawnedParticles();
+							Emitter.GetEmitterHandle().ForEachEnabledRendererWithIndex(
+								[&NiagaraSummary](const UNiagaraRendererProperties*, int32)
+								{
+									++NiagaraSummary.RendererCount;
+								});
+							if (Emitter.GetSimTarget() == ENiagaraSimTarget::GPUComputeSim)
+							{
+								++NiagaraSummary.GPUEmitterCount;
+							}
+							else
+							{
+								++NiagaraSummary.CPUEmitterCount;
+							}
+							const FBox EmitterBounds = Emitter.GetBounds();
+							StateLines.Add(FString::Printf(
+								TEXT("niagaraEmitter|%s|name=%s|simTarget=%d|deterministic=%d|randomSeed=%d|particles=%d|totalSpawned=%d|boundsMin=(%.9g,%.9g,%.9g)|boundsMax=(%.9g,%.9g,%.9g)"),
+								*Niagara->GetPathName(),
+								*Emitter.GetEmitterHandle().GetUniqueInstanceName(),
+								static_cast<int32>(Emitter.GetSimTarget()),
+								Emitter.IsDeterministic() ? 1 : 0,
+								EmitterData ? EmitterData->RandomSeed : 0,
+								ParticleCount,
+								Emitter.GetTotalSpawnedParticles(),
+								EmitterBounds.Min.X, EmitterBounds.Min.Y, EmitterBounds.Min.Z,
+								EmitterBounds.Max.X, EmitterBounds.Max.Y, EmitterBounds.Max.Z));
+						}
+					}
+				}
+				Summary.NiagaraEmitterCount += NiagaraSummary.EmitterCount;
+				Summary.NiagaraCPUEmitterCount += NiagaraSummary.CPUEmitterCount;
+				Summary.NiagaraGPUEmitterCount += NiagaraSummary.GPUEmitterCount;
+				Summary.NiagaraParticleCount += NiagaraSummary.ParticleCount;
+				Summary.NiagaraTotalSpawnedParticleCount += NiagaraSummary.TotalSpawnedParticleCount;
+				Summary.NiagaraComponents.Add(MoveTemp(NiagaraSummary));
 				StateLines.Add(FString::Printf(
-					TEXT("niagara|%s|asset=%s|active=%d|ageMode=%d|desiredAge=%.9g|seedOffset=%d|forceSolo=%d|seekDelta=%.9g|maxSimTime=%.9g"),
+					TEXT("niagara|%s|asset=%s|active=%d|ageMode=%d|desiredAge=%.9g|seedOffset=%d|forceSolo=%d|seekDelta=%.9g|maxSimTime=%.9g|systemDeterminism=%d|systemFixedTick=%d|systemFixedTickSeconds=%.9g|simulationAgeSeconds=%.9g|emitters=%d|renderers=%d|particles=%d|totalSpawned=%d|location=(%.9g,%.9g,%.9g)|boundsOrigin=(%.9g,%.9g,%.9g)|boundsExtent=(%.9g,%.9g,%.9g)|materials=%s"),
 					*Niagara->GetPathName(),
 					Niagara->GetAsset() ? *Niagara->GetAsset()->GetPathName() : TEXT("none"),
 					Niagara->IsActive() ? 1 : 0,
@@ -945,7 +1960,25 @@ USRDatasetCaptureSubsystem::FSceneStateSummary USRDatasetCaptureSubsystem::Compu
 					Niagara->GetRandomSeedOffset(),
 					Niagara->GetForceSolo() ? 1 : 0,
 					Niagara->GetSeekDelta(),
-					Niagara->GetMaxSimTime()));
+					Niagara->GetMaxSimTime(),
+					Summary.NiagaraComponents.Last().bSystemDeterminism ? 1 : 0,
+					Summary.NiagaraComponents.Last().bSystemFixedTick ? 1 : 0,
+					Summary.NiagaraComponents.Last().SystemFixedTickSeconds,
+					Summary.NiagaraComponents.Last().SimulationAgeSeconds,
+					Summary.NiagaraComponents.Last().EmitterCount,
+					Summary.NiagaraComponents.Last().RendererCount,
+					Summary.NiagaraComponents.Last().ParticleCount,
+					Summary.NiagaraComponents.Last().TotalSpawnedParticleCount,
+					Summary.NiagaraComponents.Last().ComponentLocationCm.X,
+					Summary.NiagaraComponents.Last().ComponentLocationCm.Y,
+					Summary.NiagaraComponents.Last().ComponentLocationCm.Z,
+					Summary.NiagaraComponents.Last().ComponentBoundsOriginCm.X,
+					Summary.NiagaraComponents.Last().ComponentBoundsOriginCm.Y,
+					Summary.NiagaraComponents.Last().ComponentBoundsOriginCm.Z,
+					Summary.NiagaraComponents.Last().ComponentBoundsExtentCm.X,
+					Summary.NiagaraComponents.Last().ComponentBoundsExtentCm.Y,
+					Summary.NiagaraComponents.Last().ComponentBoundsExtentCm.Z,
+					*FString::Join(Summary.NiagaraComponents.Last().MaterialPaths, TEXT(","))));
 			}
 			else if (const UParticleSystemComponent* Cascade = Cast<UParticleSystemComponent>(Component))
 			{
@@ -965,6 +1998,12 @@ USRDatasetCaptureSubsystem::FSceneStateSummary USRDatasetCaptureSubsystem::Compu
 	});
 	Summary.ControllableActors.Sort();
 	Summary.UncontrolledTickingActors.Sort();
+	Summary.NiagaraComponents.Sort([](
+		const FSceneStateSummary::FNiagaraSummary& Left,
+		const FSceneStateSummary::FNiagaraSummary& Right)
+	{
+		return Left.ComponentPath.Compare(Right.ComponentPath, ESearchCase::CaseSensitive) < 0;
+	});
 	Summary.Sha1 = HashString(FString::Join(StateLines, TEXT("\n")));
 	return Summary;
 }
@@ -990,15 +2029,30 @@ void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTi
 			return;
 		}
 	}
+	EnforceDeterministicCamera();
 	if (Status.State == ESRDatasetCaptureState::Capturing &&
 		ActiveJob.bSuppressMainViewOnUncapturedFrames)
 	{
 		UGameplayStatics::SetEnableWorldRendering(this, ShouldCaptureFrame(Status.CurrentFrame));
 	}
 
-	const int32 EvaluationFrame = Status.State == ESRDatasetCaptureState::WarmingUp
+	int32 EvaluationFrame = Status.State == ESRDatasetCaptureState::WarmingUp
 		? GetInitialEvaluationFrame()
 		: Status.CurrentFrame;
+	WarmupPoseCacheFrame = INDEX_NONE;
+	if (Status.State == ESRDatasetCaptureState::WarmingUp &&
+		ActiveJob.bCacheSkeletalAnimationPosesForReplay)
+	{
+		const int32 PoseFrameCount = ActiveJob.EndFrame - ActiveJob.StartFrame + 1;
+		const int32 CompletedWarmupFrames = ActiveJob.WarmupFrames - WarmupFramesRemaining;
+		const int32 FirstPoseCacheWarmupIndex = ActiveJob.WarmupFrames - PoseFrameCount;
+		if (CompletedWarmupFrames >= FirstPoseCacheWarmupIndex)
+		{
+			WarmupPoseCacheFrame = ActiveJob.StartFrame +
+				(CompletedWarmupFrames - FirstPoseCacheWarmupIndex);
+			EvaluationFrame = WarmupPoseCacheFrame;
+		}
+	}
 	ApplyLogicalTemporalJitter(EvaluationFrame);
 	FString Error;
 	if (!EvaluateSequence(EvaluationFrame, Error))
@@ -1006,9 +2060,30 @@ void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTi
 		FinishCapture(ESRDatasetCaptureState::Failed, Error);
 		return;
 	}
-
-	const float TimeSeconds = static_cast<float>(EvaluationFrame * ActiveJob.GetFixedDeltaSeconds());
-	DiscoverAndControlNiagara(TimeSeconds);
+	// Match Niagara's float fixed-tick lattice exactly. Casting the double product
+	// (for example 15 / 30) to 0.5 and dividing by float(1 / 30) floors to 14
+	// ticks in UNiagaraComponent::TickComponent due to representation error.
+	const float FixedDeltaSeconds = static_cast<float>(ActiveJob.GetFixedDeltaSeconds());
+	const float TimeSeconds = static_cast<float>(EvaluationFrame) * FixedDeltaSeconds;
+	ApplyLogicalMaterialTime(EvaluationFrame);
+	float NiagaraTimeSeconds = TimeSeconds;
+	if (Status.State == ESRDatasetCaptureState::WarmingUp && ActiveJob.WarmupFrames > 0)
+	{
+		// A non-zero initial logical frame can require many absolute Niagara
+		// steps before the first sample. Spread those steps across the existing
+		// render warmup so renderer resources observe progressive finalized states
+		// instead of receiving their first populated payload after one large jump.
+		const int32 FinalTargetTicks = FMath::Max(
+			0,
+			FMath::RoundToInt(TimeSeconds / FixedDeltaSeconds));
+		const int32 CompletedWarmupFrames =
+			FMath::Clamp(ActiveJob.WarmupFrames - WarmupFramesRemaining + 1, 1, ActiveJob.WarmupFrames);
+		const int32 WarmupTargetTicks = static_cast<int32>(
+			(static_cast<int64>(FinalTargetTicks) * CompletedWarmupFrames + ActiveJob.WarmupFrames - 1) /
+			ActiveJob.WarmupFrames);
+		NiagaraTimeSeconds = static_cast<float>(WarmupTargetTicks) * FixedDeltaSeconds;
+	}
+	DiscoverAndControlNiagara(NiagaraTimeSeconds);
 	NotifyControllablesEvaluate(EvaluationFrame, TimeSeconds);
 }
 
@@ -1018,19 +2093,73 @@ void USRDatasetCaptureSubsystem::HandleWorldPostActorTick(UWorld* World, ELevelT
 	{
 		return;
 	}
+	PositionNonFixtureSkeletalValidationActor();
+	PositionProjectAnimatedMaterialValidationReceiver();
+	FString WidgetPolicyError;
+	if (!CheckWidgetComponentPolicy(WidgetPolicyError))
+	{
+		FinishCapture(ESRDatasetCaptureState::Failed, WidgetPolicyError);
+		return;
+	}
+	if (Status.State == ESRDatasetCaptureState::WarmingUp)
+	{
+		if (WarmupPoseCacheFrame != INDEX_NONE && ActiveJob.SkeletalPoseCacheInputFile.IsEmpty())
+		{
+			CacheSkeletalPosesForLogicalFrame(WarmupPoseCacheFrame);
+		}
+		return;
+	}
+	if (!ShouldCaptureFrame(Status.CurrentFrame))
+	{
+		return;
+	}
+
+	// Endpoint previous transforms must be installed after actor/animation ticks
+	// but before UWorld's end-of-frame render-data batch. Installing them at
+	// capture time is too late once an intermediate maintenance view has caused
+	// GPU Scene and skeletal buffers to consume the current transform.
+	ApplyCachedSkeletalPoses(Status.CurrentFrame);
+	ApplyLastCapturedEndpointTransforms();
+}
+
+void USRDatasetCaptureSubsystem::HandleWorldTickEnd(UWorld* World, ELevelTick TickType, float DeltaSeconds)
+{
+	if (World != GetWorld() || !SRDataset::Private::IsRunningState(Status.State))
+	{
+		return;
+	}
+	FinalizeNiagaraForCapture();
 
 	if (Status.State == ESRDatasetCaptureState::WarmingUp)
 	{
 		FString Error;
-		if (!UpdateCaptureCamera(Error))
+		if (!UpdateCaptureCamera(true, Error))
 		{
 			FinishCapture(ESRDatasetCaptureState::Failed, Error);
 			return;
 		}
 		CaptureRig->WarmupRenderState(ActiveJob);
+		TArray<UPrimitiveComponent*> RendererPrimeComponents;
+		RendererPrimeComponents.Reserve(NiagaraComponentStates.Num());
+		for (const TPair<TWeakObjectPtr<UNiagaraComponent>, FNiagaraComponentState>& Pair : NiagaraComponentStates)
+		{
+			if (UNiagaraComponent* Component = Pair.Key.Get())
+			{
+				RendererPrimeComponents.Add(Component);
+			}
+		}
+		if (!RendererPrimeComponents.IsEmpty())
+		{
+			CaptureRig->PrimeRendererState(RendererPrimeComponents);
+		}
 		--WarmupFramesRemaining;
 		if (WarmupFramesRemaining <= 0)
 		{
+			if (!SaveSkeletalPoseCacheArtifact(Error))
+			{
+				FinishCapture(ESRDatasetCaptureState::Failed, Error);
+				return;
+			}
 			Status.State = ESRDatasetCaptureState::Capturing;
 			Status.CurrentFrame = GetInitialEvaluationFrame();
 		}
@@ -1054,6 +2183,24 @@ void USRDatasetCaptureSubsystem::HandleWorldPostActorTick(UWorld* World, ELevelT
 		{
 			FinishCapture(ESRDatasetCaptureState::Failed, Error);
 			return;
+		}
+	}
+	else if (ActiveJob.bSuppressMainViewOnUncapturedFrames)
+	{
+		// Keep renderer-side resources (notably newly populated Niagara renderer
+		// payloads) alive without advancing the player Main View's temporal history.
+		TArray<UPrimitiveComponent*> RendererPrimeComponents;
+		RendererPrimeComponents.Reserve(NiagaraComponentStates.Num());
+		for (const TPair<TWeakObjectPtr<UNiagaraComponent>, FNiagaraComponentState>& Pair : NiagaraComponentStates)
+		{
+			if (UNiagaraComponent* Component = Pair.Key.Get())
+			{
+				RendererPrimeComponents.Add(Component);
+			}
+		}
+		if (!RendererPrimeComponents.IsEmpty())
+		{
+			CaptureRig->PrimeRendererState(RendererPrimeComponents);
 		}
 	}
 
@@ -1095,7 +2242,8 @@ void USRDatasetCaptureSubsystem::DiscoverAndControlNiagara(const float TimeSecon
 			continue;
 		}
 
-		if (!NiagaraComponentStates.Contains(Component))
+		const bool bNewlyControlled = !NiagaraComponentStates.Contains(Component);
+		if (bNewlyControlled)
 		{
 			FNiagaraComponentState State;
 			State.AgeUpdateMode = static_cast<uint8>(Component->GetAgeUpdateMode());
@@ -1104,6 +2252,8 @@ void USRDatasetCaptureSubsystem::DiscoverAndControlNiagara(const float TimeSecon
 			State.MaxSimTime = Component->GetMaxSimTime();
 			State.bForceSolo = Component->GetForceSolo();
 			State.bLockSeekDelta = Component->GetLockDesiredAgeDeltaTimeToSeekDelta();
+			SRDataset::Private::ReadReflectedValue<FBoolProperty>(
+				Component, TEXT("bCanRenderWhileSeeking"), State.bCanRenderWhileSeeking);
 			NiagaraComponentStates.Add(Component, State);
 
 			if (UNiagaraSystem* System = Component->GetAsset())
@@ -1115,6 +2265,17 @@ void USRDatasetCaptureSubsystem::DiscoverAndControlNiagara(const float TimeSecon
 					SRDataset::Private::ReadReflectedValue<FBoolProperty>(System, TEXT("bFixedTickDelta"), SystemState.bFixedTickDelta);
 					SRDataset::Private::ReadReflectedValue<FIntProperty>(System, TEXT("RandomSeed"), SystemState.RandomSeed);
 					SRDataset::Private::ReadReflectedValue<FFloatProperty>(System, TEXT("FixedTickDeltaTime"), SystemState.FixedTickDeltaTime);
+					for (const FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+					{
+						if (const FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+						{
+							FNiagaraSystemState::FEmitterState EmitterState;
+							EmitterState.HandleId = EmitterHandle.GetId();
+							EmitterState.bDeterminism = EmitterData->bDeterminism;
+							EmitterState.RandomSeed = EmitterData->RandomSeed;
+							SystemState.Emitters.Add(EmitterState);
+						}
+					}
 					NiagaraSystemStates.Add(System, SystemState);
 				}
 				if (ActiveJob.bForceNiagaraDeterminism)
@@ -1123,6 +2284,16 @@ void USRDatasetCaptureSubsystem::DiscoverAndControlNiagara(const float TimeSecon
 					SRDataset::Private::WriteReflectedValue<FBoolProperty>(System, TEXT("bFixedTickDelta"), true);
 					SRDataset::Private::WriteReflectedValue<FIntProperty>(System, TEXT("RandomSeed"), ActiveJob.RandomSeed);
 					SRDataset::Private::WriteReflectedValue<FFloatProperty>(System, TEXT("FixedTickDeltaTime"), static_cast<float>(ActiveJob.GetFixedDeltaSeconds()));
+					for (FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+					{
+						if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+						{
+							EmitterData->bDeterminism = true;
+							EmitterData->RandomSeed = static_cast<int32>(HashCombineFast(
+								static_cast<uint32>(ActiveJob.RandomSeed),
+								GetTypeHash(EmitterHandle.GetId())));
+						}
+					}
 				}
 			}
 
@@ -1131,20 +2302,99 @@ void USRDatasetCaptureSubsystem::DiscoverAndControlNiagara(const float TimeSecon
 			Component->SetRandomSeedOffset(ActiveJob.RandomSeed ^ static_cast<int32>(GetTypeHash(Component->GetPathName())));
 			Component->SetSeekDelta(static_cast<float>(ActiveJob.GetFixedDeltaSeconds()));
 			Component->SetLockDesiredAgeDeltaTimeToSeekDelta(true);
+			Component->SetCanRenderWhileSeeking(true);
 			Component->SetMaxSimTime(60.0f);
-			Component->ResetSystem();
-			Component->SeekToDesiredAge(TimeSeconds);
+			// Emitter determinism is cached into FNiagaraEmitterInstance at
+			// construction time. ResetSystem only re-activates the existing
+			// instance, so rebuild it after applying asset/component controls.
+			Component->ReinitializeSystem();
 		}
-		else if (IsReverseEndpointReplay())
+
+		const float FixedDeltaSeconds = static_cast<float>(ActiveJob.GetFixedDeltaSeconds());
+		const int32 TargetTickCount = FMath::Max(
+			0,
+			FMath::RoundToInt(TimeSeconds / FixedDeltaSeconds));
+		FNiagaraSystemInstanceControllerPtr Controller = Component->GetSystemInstanceController();
+		if (!Controller.IsValid())
 		{
-			// DesiredAge must explicitly seek when logical time decreases; merely
-			// assigning a smaller age can leave a GPU/system simulation at t1.
-			Component->SeekToDesiredAge(TimeSeconds);
+			continue;
 		}
-		else
+
+		int32 CurrentTickCount = FMath::Max(
+			0,
+			FMath::RoundToInt(Controller->GetAge() / FixedDeltaSeconds));
+		if (!bNewlyControlled && CurrentTickCount > TargetTickCount)
 		{
-			Component->SetDesiredAge(TimeSeconds);
+			// An absolute rewind must start from the deterministic initial state;
+			// merely setting DesiredAge to zero leaves the existing particle data
+			// alive because Niagara does not execute a simulation tick at age zero.
+			Component->ReinitializeSystem();
+			Controller = Component->GetSystemInstanceController();
+			CurrentTickCount = 0;
 		}
+		const int32 TicksToAdvance = TargetTickCount - CurrentTickCount;
+		const bool bUseNormalWarmupTick =
+			Status.State == ESRDatasetCaptureState::WarmingUp && TicksToAdvance == 1;
+		if (Controller.IsValid() && TicksToAdvance > 0 && !bUseNormalWarmupTick)
+		{
+			// Do not use DesiredAge's MultiTick catch-up for dataset replay. In UE
+			// 5.7 MultiTick exposes the entire seek duration as Engine.DeltaTime to
+			// every internal substep, so systems that read Engine.DeltaTime do not
+			// match ordinary fixed-step playback. AdvanceSimulation executes the
+			// same one-tick path repeatedly and therefore preserves per-step inputs.
+			Component->AdvanceSimulation(TicksToAdvance, FixedDeltaSeconds);
+			// ManualTick can still leave emitter work awaiting its GT finalize path.
+			// Complete it before the component's regular DesiredAge tick observes the
+			// new age later in this world tick.
+			Controller->WaitForConcurrentTickAndFinalize(true);
+		}
+		const float TargetAgeSeconds = static_cast<float>(TargetTickCount) * FixedDeltaSeconds;
+		Component->SetDesiredAge(
+			bUseNormalWarmupTick
+				? std::nextafter(TargetAgeSeconds, std::numeric_limits<float>::infinity())
+				: TargetAgeSeconds);
+	}
+}
+
+void USRDatasetCaptureSubsystem::FinalizeNiagaraForCapture()
+{
+	if (!ActiveJob.bControlNiagara)
+	{
+		return;
+	}
+	// UWorld starts its normal end-of-frame component updates before
+	// OnWorldPostActorTick. Complete that batch first: it can contain Niagara's
+	// concurrent simulation finalization and dynamic-render-data submission.
+	GetWorld()->FinishAsyncSendAllEndOfFrameUpdates();
+
+	bool bFinalizedNiagara = false;
+	for (const TPair<TWeakObjectPtr<UNiagaraComponent>, FNiagaraComponentState>& Pair : NiagaraComponentStates)
+	{
+		if (UNiagaraComponent* Component = Pair.Key.Get())
+		{
+			if (FNiagaraSystemInstanceControllerPtr Controller = Component->GetSystemInstanceController())
+			{
+				Controller->WaitForConcurrentTickAndFinalize(true);
+				// Suppressed player views do not refresh primitive visibility timestamps.
+				// Keep controlled FX renderer-resident without rendering an intermediate
+				// scene, which would consume opaque/skeletal endpoint motion history.
+				const float WorldTimeSeconds = static_cast<float>(GetWorld()->GetTimeSeconds());
+				Component->SetLastRenderTime(WorldTimeSeconds);
+				Controller->SetLastRenderTime(WorldTimeSeconds);
+				Component->MarkRenderDynamicDataDirty();
+				Component->DoDeferredRenderUpdates_Concurrent();
+				bFinalizedNiagara = true;
+			}
+		}
+	}
+	if (bFinalizedNiagara)
+	{
+		// Niagara dynamic data uses its own render-command pipe in UE 5.7. A
+		// SceneCapture enqueued immediately afterwards is therefore not ordered
+		// against that pipe unless we establish an explicit barrier. This flush
+		// publishes the finalized particle payload and bounds without advancing
+		// world time, simulation age, or temporal history.
+		FlushRenderingCommands();
 	}
 }
 
@@ -1160,6 +2410,22 @@ void USRDatasetCaptureSubsystem::RestoreNiagara()
 			SRDataset::Private::WriteReflectedValue<FBoolProperty>(System, TEXT("bFixedTickDelta"), State.bFixedTickDelta);
 			SRDataset::Private::WriteReflectedValue<FIntProperty>(System, TEXT("RandomSeed"), State.RandomSeed);
 			SRDataset::Private::WriteReflectedValue<FFloatProperty>(System, TEXT("FixedTickDeltaTime"), State.FixedTickDeltaTime);
+			for (FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+			{
+				const FNiagaraSystemState::FEmitterState* EmitterState = State.Emitters.FindByPredicate(
+					[&EmitterHandle](const FNiagaraSystemState::FEmitterState& Candidate)
+					{
+						return Candidate.HandleId == EmitterHandle.GetId();
+					});
+				if (EmitterState)
+				{
+					if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+					{
+						EmitterData->bDeterminism = EmitterState->bDeterminism;
+						EmitterData->RandomSeed = EmitterState->RandomSeed;
+					}
+				}
+			}
 		}
 	}
 
@@ -1173,8 +2439,9 @@ void USRDatasetCaptureSubsystem::RestoreNiagara()
 			Component->SetSeekDelta(State.SeekDelta);
 			Component->SetMaxSimTime(State.MaxSimTime);
 			Component->SetLockDesiredAgeDeltaTimeToSeekDelta(State.bLockSeekDelta);
+			Component->SetCanRenderWhileSeeking(State.bCanRenderWhileSeeking);
 			Component->SetForceSolo(State.bForceSolo);
-			Component->ResetSystem();
+			Component->ReinitializeSystem();
 		}
 	}
 
@@ -1227,11 +2494,22 @@ void USRDatasetCaptureSubsystem::NotifyControllablesRestore()
 	PreparedControllables.Reset();
 }
 
-bool USRDatasetCaptureSubsystem::UpdateCaptureCamera(FString& OutError)
+bool USRDatasetCaptureSubsystem::UpdateCaptureCamera(
+	const bool bEvaluateValidationFixture,
+	FString& OutError)
 {
 	FMinimalViewInfo View;
 	bool bFoundCamera = false;
-	if (SequencePlayer)
+	if (ActiveJob.bUseDeterministicCameraTransform && DeterministicCameraActor)
+	{
+		EnforceDeterministicCamera();
+		if (UCameraComponent* Camera = DeterministicCameraActor->GetCameraComponent())
+		{
+			Camera->GetCameraView(0.0f, View);
+			bFoundCamera = true;
+		}
+	}
+	if (!bFoundCamera && SequencePlayer)
 	{
 		if (UCameraComponent* Camera = SequencePlayer->GetActiveCameraComponent())
 		{
@@ -1275,7 +2553,7 @@ bool USRDatasetCaptureSubsystem::UpdateCaptureCamera(FString& OutError)
 	}
 
 	CaptureRig->ApplyCameraView(View, ActiveJob.bDisableMotionBlur, ActiveJob.bLockExposure);
-	if (ValidationFixture)
+	if (bEvaluateValidationFixture && ValidationFixture)
 	{
 		ValidationFixture->Evaluate(
 			View,
@@ -1289,7 +2567,7 @@ bool USRDatasetCaptureSubsystem::UpdateCaptureCamera(FString& OutError)
 
 bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 {
-	if (!UpdateCaptureCamera(OutError))
+	if (!UpdateCaptureCamera(true, OutError))
 	{
 		return false;
 	}
@@ -1301,6 +2579,9 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 		ActiveJob.ReplayPass == ESRDatasetReplayPass::FrameGenerationIntermediate
 			? FrameNumber - 1
 			: (bHistoryReset ? FrameNumber : GetPreviouslyCapturedFrame(FrameNumber));
+	// Re-apply after the world's normal deferred component batch. This second
+	// application is required by double-buffered skeletal meshes; SceneCapture's
+	// flush then selects the explicitly restored previous bone buffer.
 	ApplyLastCapturedEndpointTransforms();
 	const double TimeSeconds = FrameNumber * ActiveJob.GetFixedDeltaSeconds();
 	TMap<FString, FString> Hashes;
@@ -1331,6 +2612,12 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 			Hashes.Add(
 				SRDataset::Private::HUDlessColorModality,
 				HashFile(MakeFramePath(SRDataset::Private::HUDlessColorModality, FrameNumber, TEXT("exr"))));
+		}
+		if (ActiveJob.bCaptureUIColorAlpha)
+		{
+			Hashes.Add(
+				SRDataset::Private::UIColorAlphaModality,
+				HashFile(MakeFramePath(SRDataset::Private::UIColorAlphaModality, FrameNumber, TEXT("png"))));
 		}
 		++Status.SkippedSamples;
 		AppendFrameManifest(FrameNumber, TimeSeconds, Hashes, RenderSubmissions, true);
@@ -1378,6 +2665,18 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 			OutError))
 		{
 			return false;
+		}
+		if (ActiveJob.bCaptureUIColorAlpha)
+		{
+			RenderSubmissions.Add(TEXT("ui_layer"), NextRenderSubmissionId++);
+			if (!CaptureRig->CaptureUIColorAlpha(
+				ActiveJob,
+				MakeFramePath(SRDataset::Private::UIColorAlphaModality, FrameNumber, TEXT("png")),
+				Hashes,
+				OutError))
+			{
+				return false;
+			}
 		}
 
 		if (ActiveJob.bCaptureMainViewTemporalDiagnostics)
@@ -1446,6 +2745,7 @@ void USRDatasetCaptureSubsystem::ApplyLastCapturedEndpointTransforms()
 		if (USceneComponent* Component = Pair.Key.Get())
 		{
 			FMotionVectorSimulation::Get().SetPreviousTransform(Component, Pair.Value);
+			Component->MarkRenderTransformDirty();
 		}
 	}
 
@@ -1653,6 +2953,12 @@ bool USRDatasetCaptureSubsystem::IsFrameAlreadyComplete(const int32 FrameNumber)
 	{
 		return false;
 	}
+	if (ActiveJob.bCaptureUIColorAlpha &&
+		!IFileManager::Get().FileExists(*MakeFramePath(
+			SRDataset::Private::UIColorAlphaModality, FrameNumber, TEXT("png"))))
+	{
+		return false;
+	}
 	return true;
 }
 
@@ -1674,6 +2980,9 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	const int32 MotionTimeSpanFrames = bFirstCapturedFrame && !bIntermediateReplay
 		? 0
 		: FMath::Abs(FrameNumber - MotionPreviousFrame);
+	const int32 MaterialPreviousFrame = bFirstCapturedFrame && !bIntermediateReplay
+		? FrameNumber - GetEvaluationDirection()
+		: MotionPreviousFrame;
 	Frame->SetNumberField(TEXT("frame"), FrameNumber);
 	Frame->SetStringField(
 		TEXT("replayPass"),
@@ -1686,6 +2995,19 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		TEXT("motionTimeSpanS"),
 		MotionTimeSpanFrames * ActiveJob.GetFixedDeltaSeconds());
 	Frame->SetBoolField(TEXT("motionTrainingUsable"), !bIntermediateReplay);
+	Frame->SetBoolField(
+		TEXT("materialTimeLogicalFrameLocked"),
+		ActiveJob.bLockMaterialTimeToLogicalFrame);
+	Frame->SetNumberField(TEXT("materialTimeSeconds"), TimeSeconds);
+	Frame->SetNumberField(
+		TEXT("materialPreviousLogicalFrameId"),
+		MaterialPreviousFrame);
+	Frame->SetNumberField(
+		TEXT("materialPreviousTimeSeconds"),
+		static_cast<double>(MaterialPreviousFrame) * ActiveJob.GetFixedDeltaSeconds());
+	Frame->SetNumberField(
+		TEXT("materialDeltaTimeSeconds"),
+		static_cast<double>(FrameNumber - MaterialPreviousFrame) * ActiveJob.GetFixedDeltaSeconds());
 	Frame->SetBoolField(TEXT("endpointPreviousTransformOverride"), ActiveJob.bUseLastCapturedEndpointTransforms);
 	Frame->SetBoolField(
 		TEXT("endpointPreviousSkeletalBoneOverride"),
@@ -1737,6 +3059,13 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	Frame->SetNumberField(TEXT("sceneBoneCount"), SceneState.BoneCount);
 	Frame->SetNumberField(TEXT("sceneFXComponentCount"), SceneState.FXComponentCount);
 	Frame->SetNumberField(TEXT("sceneNiagaraComponentCount"), SceneState.NiagaraComponentCount);
+	Frame->SetNumberField(TEXT("sceneNiagaraEmitterCount"), SceneState.NiagaraEmitterCount);
+	Frame->SetNumberField(TEXT("sceneNiagaraCPUEmitterCount"), SceneState.NiagaraCPUEmitterCount);
+	Frame->SetNumberField(TEXT("sceneNiagaraGPUEmitterCount"), SceneState.NiagaraGPUEmitterCount);
+	Frame->SetNumberField(TEXT("sceneNiagaraParticleCount"), SceneState.NiagaraParticleCount);
+	Frame->SetNumberField(
+		TEXT("sceneNiagaraTotalSpawnedParticleCount"),
+		SceneState.NiagaraTotalSpawnedParticleCount);
 	Frame->SetNumberField(TEXT("sceneControllableActorCount"), SceneState.ControllableActorCount);
 	Frame->SetNumberField(
 		TEXT("sceneUncontrolledTickingActorCount"),
@@ -1755,9 +3084,246 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	Frame->SetArrayField(
 		TEXT("sceneUncontrolledTickingActors"),
 		StringArray(SceneState.UncontrolledTickingActors));
+	TArray<TSharedPtr<FJsonValue>> NiagaraStateJson;
+	NiagaraStateJson.Reserve(SceneState.NiagaraComponents.Num());
+	for (const FSceneStateSummary::FNiagaraSummary& Niagara : SceneState.NiagaraComponents)
+	{
+		TSharedRef<FJsonObject> State = MakeShared<FJsonObject>();
+		State->SetStringField(TEXT("componentPath"), Niagara.ComponentPath);
+		State->SetStringField(TEXT("assetPath"), Niagara.AssetPath);
+		State->SetNumberField(TEXT("desiredAgeS"), Niagara.DesiredAgeSeconds);
+		State->SetNumberField(TEXT("simulationAgeS"), Niagara.SimulationAgeSeconds);
+		State->SetNumberField(TEXT("emitterCount"), Niagara.EmitterCount);
+		State->SetNumberField(TEXT("cpuEmitterCount"), Niagara.CPUEmitterCount);
+		State->SetNumberField(TEXT("gpuEmitterCount"), Niagara.GPUEmitterCount);
+		State->SetNumberField(TEXT("particleCount"), Niagara.ParticleCount);
+		State->SetNumberField(TEXT("totalSpawnedParticleCount"), Niagara.TotalSpawnedParticleCount);
+		State->SetNumberField(TEXT("rendererCount"), Niagara.RendererCount);
+		State->SetBoolField(TEXT("soloInstanceObservable"), Niagara.bSoloInstanceObservable);
+		State->SetBoolField(TEXT("systemDeterminism"), Niagara.bSystemDeterminism);
+		State->SetBoolField(TEXT("systemFixedTick"), Niagara.bSystemFixedTick);
+		State->SetNumberField(TEXT("systemFixedTickS"), Niagara.SystemFixedTickSeconds);
+		const auto VectorArray = [](const FVector& Value)
+		{
+			return TArray<TSharedPtr<FJsonValue>> {
+				MakeShared<FJsonValueNumber>(Value.X),
+				MakeShared<FJsonValueNumber>(Value.Y),
+				MakeShared<FJsonValueNumber>(Value.Z) };
+		};
+		State->SetArrayField(TEXT("componentLocationCm"), VectorArray(Niagara.ComponentLocationCm));
+		State->SetArrayField(TEXT("componentBoundsOriginCm"), VectorArray(Niagara.ComponentBoundsOriginCm));
+		State->SetArrayField(TEXT("componentBoundsExtentCm"), VectorArray(Niagara.ComponentBoundsExtentCm));
+		State->SetArrayField(TEXT("materialPaths"), StringArray(Niagara.MaterialPaths));
+		TArray<TSharedPtr<FJsonValue>> EmitterCounts;
+		EmitterCounts.Reserve(Niagara.EmitterParticleCounts.Num());
+		for (const int32 Count : Niagara.EmitterParticleCounts)
+		{
+			EmitterCounts.Add(MakeShared<FJsonValueNumber>(Count));
+		}
+		State->SetArrayField(TEXT("emitterParticleCounts"), EmitterCounts);
+		TArray<TSharedPtr<FJsonValue>> EmitterDeterminism;
+		EmitterDeterminism.Reserve(Niagara.EmitterDeterminism.Num());
+		for (const bool bDeterministic : Niagara.EmitterDeterminism)
+		{
+			EmitterDeterminism.Add(MakeShared<FJsonValueBoolean>(bDeterministic));
+		}
+		State->SetArrayField(TEXT("emitterDeterminism"), EmitterDeterminism);
+		TArray<TSharedPtr<FJsonValue>> EmitterRandomSeeds;
+		EmitterRandomSeeds.Reserve(Niagara.EmitterRandomSeeds.Num());
+		for (const int32 RandomSeed : Niagara.EmitterRandomSeeds)
+		{
+			EmitterRandomSeeds.Add(MakeShared<FJsonValueNumber>(RandomSeed));
+		}
+		State->SetArrayField(TEXT("emitterRandomSeeds"), EmitterRandomSeeds);
+		NiagaraStateJson.Add(MakeShared<FJsonValueObject>(State));
+	}
+	Frame->SetArrayField(TEXT("niagaraFrameStates"), NiagaraStateJson);
 	Frame->SetStringField(
 		TEXT("sceneStateHashScope"),
-		TEXT("sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_state_cascade_component_state_not_particle_payload"));
+		TEXT("sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back"));
+	Frame->SetBoolField(
+		TEXT("skeletalPoseCacheReplayEnabled"),
+		ActiveJob.bCacheSkeletalAnimationPosesForReplay);
+	Frame->SetBoolField(
+		TEXT("skeletalPoseCacheApplied"),
+		ActiveJob.bCacheSkeletalAnimationPosesForReplay &&
+		AppliedCachedSkeletalPoseComponentCount > 0 &&
+		SkippedCachedSkeletalPoseComponents.IsEmpty());
+	Frame->SetNumberField(
+		TEXT("skeletalPoseCacheAppliedComponentCount"),
+		AppliedCachedSkeletalPoseComponentCount);
+	Frame->SetNumberField(TEXT("skeletalPoseCacheAppliedBoneCount"), AppliedCachedSkeletalPoseBoneCount);
+	Frame->SetArrayField(
+		TEXT("skeletalPoseCacheSkippedComponents"),
+		StringArray(SkippedCachedSkeletalPoseComponents));
+	Frame->SetStringField(
+		TEXT("skeletalPoseCacheSource"),
+		bSkeletalPoseCacheLoadedFromArtifact
+			? TEXT("shared_artifact")
+			: (ActiveJob.bCacheSkeletalAnimationPosesForReplay
+				? TEXT("forward_warmup_bake")
+				: TEXT("none")));
+	Frame->SetStringField(TEXT("skeletalPoseCacheArtifactSha1"), SkeletalPoseCacheArtifactSha1);
+	TArray<TSharedPtr<FJsonValue>> NonFixtureSkeletalStates;
+	const auto PoseSha1 = [](const TArray<FTransform>& Transforms)
+	{
+		TArray<FString> PoseLines;
+		PoseLines.Reserve(Transforms.Num());
+		for (int32 BoneIndex = 0; BoneIndex < Transforms.Num(); ++BoneIndex)
+		{
+			const FMatrix Matrix = Transforms[BoneIndex].ToMatrixWithScale();
+			FString MatrixString;
+			for (int32 Row = 0; Row < 4; ++Row)
+			{
+				for (int32 Column = 0; Column < 4; ++Column)
+				{
+					if (!MatrixString.IsEmpty())
+					{
+						MatrixString += TEXT(",");
+					}
+					MatrixString += FString::Printf(TEXT("%.17g"), Matrix.M[Row][Column]);
+				}
+			}
+			PoseLines.Add(FString::Printf(TEXT("%d|%s"), BoneIndex, *MatrixString));
+		}
+		return HashString(FString::Join(PoseLines, TEXT("\n")));
+	};
+	const TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState>* CachedFrame =
+		CachedSkeletalPoseFrames.Find(FrameNumber);
+	for (const TPair<TWeakObjectPtr<USkinnedMeshComponent>, int32>& Pair : NonFixtureSkeletalObjectIds)
+	{
+		USkinnedMeshComponent* Component = Pair.Key.Get();
+		if (!IsValid(Component) || !Component->GetSkinnedAsset())
+		{
+			continue;
+		}
+		const TArray<FTransform>& BoneTransforms = Component->GetComponentSpaceTransforms();
+		const FSkeletalEndpointState* CachedState = CachedFrame ? CachedFrame->Find(Pair.Key) : nullptr;
+		double CurrentToCachedMaxMatrixAbs = -1.0;
+		if (CachedState && CachedState->ComponentSpaceTransforms.Num() == BoneTransforms.Num())
+		{
+			CurrentToCachedMaxMatrixAbs = 0.0;
+			for (int32 BoneIndex = 0; BoneIndex < BoneTransforms.Num(); ++BoneIndex)
+			{
+				const FMatrix CurrentMatrix = BoneTransforms[BoneIndex].ToMatrixWithScale();
+				const FMatrix CachedMatrix = CachedState->ComponentSpaceTransforms[BoneIndex].ToMatrixWithScale();
+				for (int32 Row = 0; Row < 4; ++Row)
+				{
+					for (int32 Column = 0; Column < 4; ++Column)
+					{
+						CurrentToCachedMaxMatrixAbs = FMath::Max(
+							CurrentToCachedMaxMatrixAbs,
+							FMath::Abs(static_cast<double>(
+								CurrentMatrix.M[Row][Column] - CachedMatrix.M[Row][Column])));
+					}
+				}
+			}
+		}
+		TSharedRef<FJsonObject> State = MakeShared<FJsonObject>();
+		State->SetStringField(TEXT("componentPath"), Component->GetPathName());
+		State->SetStringField(
+			TEXT("ownerPath"), Component->GetOwner() ? Component->GetOwner()->GetPathName() : TEXT("none"));
+		State->SetStringField(
+			TEXT("ownerClass"), Component->GetOwner() ? Component->GetOwner()->GetClass()->GetPathName() : TEXT("none"));
+		State->SetStringField(TEXT("skinnedAssetPath"), Component->GetSkinnedAsset()->GetPathName());
+		State->SetBoolField(TEXT("projectAsset"), Component->GetSkinnedAsset()->GetPathName().StartsWith(TEXT("/Game/")));
+		State->SetBoolField(
+			TEXT("isProjectValidationProbe"),
+			Component->GetOwner() == NonFixtureSkeletalValidationActor);
+		State->SetNumberField(TEXT("objectId"), Pair.Value);
+		State->SetNumberField(TEXT("boneCount"), BoneTransforms.Num());
+		State->SetStringField(TEXT("poseSha1"), PoseSha1(BoneTransforms));
+		State->SetStringField(
+			TEXT("cachedPoseSha1"),
+			CachedState ? PoseSha1(CachedState->ComponentSpaceTransforms) : TEXT("none"));
+		State->SetNumberField(TEXT("currentToCachedPoseMaxMatrixAbs"), CurrentToCachedMaxMatrixAbs);
+		State->SetBoolField(TEXT("registered"), Component->IsRegistered());
+		State->SetBoolField(TEXT("visible"), Component->IsVisible());
+		State->SetArrayField(TEXT("boundsOriginCm"), {
+			MakeShared<FJsonValueNumber>(Component->Bounds.Origin.X),
+			MakeShared<FJsonValueNumber>(Component->Bounds.Origin.Y),
+			MakeShared<FJsonValueNumber>(Component->Bounds.Origin.Z) });
+		State->SetArrayField(TEXT("boundsExtentCm"), {
+			MakeShared<FJsonValueNumber>(Component->Bounds.BoxExtent.X),
+			MakeShared<FJsonValueNumber>(Component->Bounds.BoxExtent.Y),
+			MakeShared<FJsonValueNumber>(Component->Bounds.BoxExtent.Z) });
+		if (const USkeletalMeshComponent* Skeletal = Cast<USkeletalMeshComponent>(Component))
+		{
+			State->SetStringField(
+				TEXT("animationMode"),
+				StaticEnum<EAnimationMode::Type>()->GetNameStringByValue(
+					static_cast<int64>(Skeletal->GetAnimationMode())));
+			State->SetStringField(
+				TEXT("animationInstanceClass"),
+				Skeletal->GetAnimInstance() ? Skeletal->GetAnimInstance()->GetClass()->GetPathName() : TEXT("none"));
+		}
+		else
+		{
+			State->SetStringField(TEXT("animationMode"), TEXT("non_skeletal_skinned_component"));
+			State->SetStringField(TEXT("animationInstanceClass"), TEXT("none"));
+		}
+		NonFixtureSkeletalStates.Add(MakeShared<FJsonValueObject>(State));
+	}
+	NonFixtureSkeletalStates.Sort([](const TSharedPtr<FJsonValue>& Left, const TSharedPtr<FJsonValue>& Right)
+	{
+		return Left->AsObject()->GetStringField(TEXT("componentPath")).Compare(
+			Right->AsObject()->GetStringField(TEXT("componentPath")), ESearchCase::CaseSensitive) < 0;
+	});
+	Frame->SetArrayField(TEXT("nonFixtureSkeletalComponents"), NonFixtureSkeletalStates);
+	TSharedRef<FJsonObject> AnimatedMaterial = MakeShared<FJsonObject>();
+	AnimatedMaterial->SetBoolField(
+		TEXT("enabled"),
+		ActiveJob.bValidateProjectAnimatedMaterial);
+	AnimatedMaterial->SetNumberField(TEXT("receiverObjectId"), 150);
+	AnimatedMaterial->SetStringField(
+		TEXT("materialInterfacePath"),
+		ProjectAnimatedMaterialValidationInterface
+			? ProjectAnimatedMaterialValidationInterface->GetPathName()
+			: TEXT("none"));
+	AnimatedMaterial->SetStringField(
+		TEXT("baseMaterialPath"),
+		ProjectAnimatedMaterialValidationBasePath.IsEmpty()
+			? TEXT("none")
+			: ProjectAnimatedMaterialValidationBasePath);
+	AnimatedMaterial->SetStringField(
+		TEXT("receiverComponentPath"),
+		ProjectAnimatedMaterialValidationComponent
+			? ProjectAnimatedMaterialValidationComponent->GetPathName()
+			: TEXT("none"));
+	AnimatedMaterial->SetBoolField(
+		TEXT("registered"),
+		ProjectAnimatedMaterialValidationComponent &&
+		ProjectAnimatedMaterialValidationComponent->IsRegistered());
+	AnimatedMaterial->SetBoolField(
+		TEXT("visible"),
+		ProjectAnimatedMaterialValidationComponent &&
+		ProjectAnimatedMaterialValidationComponent->IsVisible());
+	AnimatedMaterial->SetBoolField(
+		TEXT("projectAuthoredInterface"),
+		ProjectAnimatedMaterialValidationInterface &&
+		ProjectAnimatedMaterialValidationInterface->GetPathName().StartsWith(TEXT("/Game/")));
+	AnimatedMaterial->SetBoolField(
+		TEXT("projectAuthoredBaseMaterial"),
+		ProjectAnimatedMaterialValidationBasePath.StartsWith(TEXT("/Game/")));
+	AnimatedMaterial->SetNumberField(TEXT("logicalGameTimeSeconds"), TimeSeconds);
+	AnimatedMaterial->SetNumberField(
+		TEXT("previousLogicalGameTimeSeconds"),
+		static_cast<double>(MaterialPreviousFrame) * ActiveJob.GetFixedDeltaSeconds());
+	Frame->SetObjectField(TEXT("projectAnimatedMaterialValidation"), AnimatedMaterial);
+	TSharedRef<FJsonObject> WidgetPolicy = MakeShared<FJsonObject>();
+	const TArray<FString> ActiveWidgetComponents = GetActiveWidgetComponentPaths();
+	WidgetPolicy->SetStringField(
+		TEXT("policy"),
+		ActiveJob.bRejectVisibleWidgetComponents
+			? TEXT("reject_visible_registered_widget_components")
+			: TEXT("allow_as_scene_content"));
+	WidgetPolicy->SetNumberField(
+		TEXT("activeVisibleRegisteredComponentCount"),
+		ActiveWidgetComponents.Num());
+	WidgetPolicy->SetArrayField(
+		TEXT("activeVisibleRegisteredComponentPaths"),
+		StringArray(ActiveWidgetComponents));
+	Frame->SetObjectField(TEXT("worldSpaceWidgetPolicy"), WidgetPolicy);
 
 	TArray<TSharedPtr<FJsonValue>> SubmissionArray;
 	TArray<FString> SubmissionModalities;
@@ -1776,7 +3342,9 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 			TEXT("viewState"),
 			Modality == TEXT("main_view_temporal")
 				? TEXT("player_main_view")
-				: Modality + TEXT("_scene_capture"));
+				: (Modality == TEXT("ui_layer")
+					? TEXT("independent_slate_game_layer")
+					: Modality + TEXT("_scene_capture")));
 		SubmissionArray.Add(MakeShared<FJsonValueObject>(Submission));
 	}
 	Frame->SetArrayField(TEXT("renderSubmissions"), SubmissionArray);
@@ -1806,6 +3374,12 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		Files->SetStringField(
 			SRDataset::Private::HUDlessColorModality,
 			FString::Printf(TEXT("%s/frame_%06d.exr"), SRDataset::Private::HUDlessColorModality, FrameNumber));
+	}
+	if (ActiveJob.bCaptureUIColorAlpha)
+	{
+		Files->SetStringField(
+			SRDataset::Private::UIColorAlphaModality,
+			FString::Printf(TEXT("%s/frame_%06d.png"), SRDataset::Private::UIColorAlphaModality, FrameNumber));
 	}
 	Frame->SetObjectField(TEXT("files"), Files);
 
@@ -1856,6 +3430,18 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		Fixture->SetArrayField(TEXT("expectedWPOMotionDisplayPixels"), {
 			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedWPOMotionDisplayPixels.X),
 			MakeShared<FJsonValueNumber>(FixtureFrame.ExpectedWPOMotionDisplayPixels.Y) });
+		Fixture->SetArrayField(TEXT("niagaraAnchorDisplayPixels"), {
+			MakeShared<FJsonValueNumber>(FixtureFrame.NiagaraAnchorDisplayPixels.X),
+			MakeShared<FJsonValueNumber>(FixtureFrame.NiagaraAnchorDisplayPixels.Y) });
+		Fixture->SetNumberField(
+			TEXT("niagaraValidationRadiusDisplayPixels"),
+			FixtureFrame.NiagaraValidationRadiusDisplayPixels);
+		Fixture->SetBoolField(
+			TEXT("niagaraVisibleProbeExpected"),
+			FixtureFrame.bNiagaraVisibleProbeExpected);
+		Fixture->SetStringField(
+			TEXT("niagaraFixtureAsset"),
+			TEXT("/SuperResolutionDataset/Validation/NS_SRDatasetVFXFixture.NS_SRDatasetVFXFixture"));
 		TSharedRef<FJsonObject> ExpectedDepth = MakeShared<FJsonObject>();
 		for (const TPair<int32, float>& Pair : FixtureFrame.ExpectedFrontDepthMeters)
 		{
@@ -2047,6 +3633,8 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				Native->SetBoolField(TEXT("preExposed"), true);
 				Native->SetNumberField(TEXT("preExposure"), NativeHR.PreExposure);
 				Native->SetNumberField(TEXT("exposure"), NativeHR.OneOverPreExposure);
+				Native->SetNumberField(TEXT("renderGameTimeS"), NativeHR.GameTimeSeconds);
+				Native->SetNumberField(TEXT("renderDeltaTimeS"), NativeHR.DeltaTimeSeconds);
 				Native->SetNumberField(TEXT("automaticViewMipBias"), NativeHR.MaterialTextureMipBias);
 				Native->SetStringField(TEXT("automaticViewMipBiasPolicy"), TEXT("isolated_full_resolution_scene_capture"));
 				Native->SetNumberField(TEXT("globalMipMapLODBias"), GlobalMipMapLODBias);
@@ -2078,6 +3666,8 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				Reference->SetBoolField(TEXT("preExposed"), true);
 				Reference->SetNumberField(TEXT("preExposure"), ReferenceHR.PreExposure);
 				Reference->SetNumberField(TEXT("exposure"), ReferenceHR.OneOverPreExposure);
+				Reference->SetNumberField(TEXT("renderGameTimeS"), ReferenceHR.GameTimeSeconds);
+				Reference->SetNumberField(TEXT("renderDeltaTimeS"), ReferenceHR.DeltaTimeSeconds);
 				Reference->SetNumberField(TEXT("automaticViewMipBias"), ReferenceHR.MaterialTextureMipBias);
 				Reference->SetStringField(TEXT("automaticViewMipBiasPolicy"), TEXT("isolated_full_resolution_scene_capture"));
 				Reference->SetNumberField(TEXT("globalMipMapLODBias"), GlobalMipMapLODBias);
@@ -2123,6 +3713,8 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 					MakeShared<FJsonValueNumber>(HUDlessSize.X),
 					MakeShared<FJsonValueNumber>(HUDlessSize.Y) });
 				HUDlessDiagnostics->SetNumberField(TEXT("preExposureBeforeTonemap"), HUDless.PreExposure);
+				HUDlessDiagnostics->SetNumberField(TEXT("renderGameTimeS"), HUDless.GameTimeSeconds);
+				HUDlessDiagnostics->SetNumberField(TEXT("renderDeltaTimeS"), HUDless.DeltaTimeSeconds);
 				HUDlessDiagnostics->SetNumberField(TEXT("automaticViewMipBias"), HUDless.MaterialTextureMipBias);
 				HUDlessDiagnostics->SetStringField(TEXT("automaticViewMipBiasPolicy"), TEXT("engine_main_view_spatial_upscale"));
 				HUDlessDiagnostics->SetNumberField(TEXT("globalMipMapLODBias"), GlobalMipMapLODBias);
@@ -2141,6 +3733,48 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 					CaptureCVarProfile.FindRef(TEXT("r.HDR.EnableHDROutput")) == TEXT("1"));
 				Frame->SetObjectField(TEXT("hudlessColorDiagnostics"), HUDlessDiagnostics);
 			}
+		}
+		if (ActiveJob.bCaptureUIColorAlpha)
+		{
+			const FIntPoint UISize = CaptureRig->GetLastUIColorAlphaSize();
+			TSharedRef<FJsonObject> UI = MakeShared<FJsonObject>();
+			UI->SetStringField(TEXT("pipelineStage"), TEXT("independent_slate_game_layer_before_scene_composite"));
+			UI->SetStringField(TEXT("colorEncoding"), TEXT("display_referred_srgb_png_unorm8"));
+			UI->SetStringField(TEXT("alphaSemantic"), TEXT("straight_coverage_zero_is_transparent_one_is_opaque"));
+			UI->SetStringField(TEXT("rgbSemantic"), TEXT("premultiplied_by_coverage_alpha"));
+			UI->SetStringField(TEXT("source"), TEXT("SGameLayerManager_without_enclosing_SViewport_scene_backbuffer"));
+			UI->SetBoolField(TEXT("sceneIncluded"), false);
+			UI->SetBoolField(TEXT("screenSpaceGameLayersIncluded"), true);
+			UI->SetBoolField(TEXT("displayResolution"), true);
+			UI->SetArrayField(TEXT("size"), {
+				MakeShared<FJsonValueNumber>(UISize.X), MakeShared<FJsonValueNumber>(UISize.Y) });
+			UI->SetNumberField(TEXT("nonzeroAlphaPixelCount"), CaptureRig->GetLastUINonzeroAlphaPixelCount());
+			UI->SetNumberField(TEXT("fractionalAlphaPixelCount"), CaptureRig->GetLastUIFractionalAlphaPixelCount());
+			UI->SetNumberField(TEXT("minAlpha"), CaptureRig->GetLastUIMinAlpha());
+			UI->SetNumberField(TEXT("maxAlpha"), CaptureRig->GetLastUIMaxAlpha());
+			UI->SetBoolField(TEXT("semanticValidationFixture"), ValidationUIWidget.IsValid());
+			if (ValidationUIWidget)
+			{
+				TArray<TSharedPtr<FJsonValue>> Probes;
+				const auto AddProbe = [&Probes](const TCHAR* Name, const FVector2D Min, const FVector2D Extent, const FLinearColor Color)
+				{
+					TSharedRef<FJsonObject> Probe = MakeShared<FJsonObject>();
+					Probe->SetStringField(TEXT("name"), Name);
+					Probe->SetArrayField(TEXT("normalizedMin"), {
+						MakeShared<FJsonValueNumber>(Min.X), MakeShared<FJsonValueNumber>(Min.Y) });
+					Probe->SetArrayField(TEXT("normalizedExtent"), {
+						MakeShared<FJsonValueNumber>(Extent.X), MakeShared<FJsonValueNumber>(Extent.Y) });
+					Probe->SetArrayField(TEXT("straightRGBA"), {
+						MakeShared<FJsonValueNumber>(Color.R), MakeShared<FJsonValueNumber>(Color.G),
+						MakeShared<FJsonValueNumber>(Color.B), MakeShared<FJsonValueNumber>(Color.A) });
+					Probes.Add(MakeShared<FJsonValueObject>(Probe));
+				};
+				AddProbe(TEXT("opaque_red"), FVector2D(0.05, 0.08), FVector2D(0.20, 0.14), FLinearColor(1.0, 0.0, 0.0, 1.0));
+				AddProbe(TEXT("half_green"), FVector2D(0.32, 0.08), FVector2D(0.20, 0.14), FLinearColor(0.0, 1.0, 0.0, 0.5));
+				AddProbe(TEXT("three_quarter_blue"), FVector2D(0.59, 0.08), FVector2D(0.20, 0.14), FLinearColor(0.0, 0.0, 1.0, 0.75));
+				UI->SetArrayField(TEXT("validationProbes"), Probes);
+			}
+			Frame->SetObjectField(TEXT("uiColorAlphaDiagnostics"), UI);
 		}
 	}
 
@@ -2196,6 +3830,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		TEXT("pendingStreamingTextureCountAfterBarrier"),
 		PendingStreamingTextureCountAfterBarrier);
 	Provenance->SetStringField(TEXT("streamingStateAfterBarrierSha1"), StreamingStateAfterBarrierSha1);
+	Provenance->SetStringField(TEXT("skeletalPoseCacheArtifactSha1"), SkeletalPoseCacheArtifactSha1);
 	Provenance->SetStringField(
 		TEXT("streamingStateHashScope"),
 		TEXT("sorted_loaded_UTexture2D_path_size_asset_mips_resident_mips_streamable_pending"));
@@ -2225,9 +3860,68 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Contract->SetStringField(TEXT("alphaSemantic"), TEXT("opaque_png_alpha"));
 	Contract->SetNumberField(TEXT("fixedDeltaSeconds"), ActiveJob.GetFixedDeltaSeconds());
 	Contract->SetBoolField(TEXT("fixedEngineTimeStep"), true);
+	Contract->SetStringField(
+		TEXT("materialTimeEvaluation"),
+		ActiveJob.bLockMaterialTimeToLogicalFrame
+			? TEXT("scene_view_family_game_time_current_and_signed_previous_from_logical_frame_ids_real_time_frozen")
+			: TEXT("engine_world_and_wall_clock_time"));
+	Contract->SetStringField(
+		TEXT("worldSpaceWidgetPolicy"),
+		ActiveJob.bRejectVisibleWidgetComponents
+			? TEXT("reject_any_visible_registered_UWidgetComponent_before_and_during_capture")
+			: TEXT("visible_UWidgetComponent_is_scene_content"));
+	Contract->SetStringField(
+		TEXT("cameraEvaluation"),
+		ActiveJob.bUseDeterministicCameraTransform
+			? TEXT("explicit_transient_player_view_target_locked_each_tick")
+			: TEXT("sequencer_then_tag_then_player_camera"));
 	Contract->SetBoolField(TEXT("chaosDeterminism"), ActiveJob.bEnableChaosDeterminism);
 	Contract->SetBoolField(TEXT("niagaraAbsoluteAge"), ActiveJob.bControlNiagara);
 	Contract->SetBoolField(TEXT("niagaraForcedDeterminism"), ActiveJob.bControlNiagara && ActiveJob.bForceNiagaraDeterminism);
+	Contract->SetStringField(
+		TEXT("niagaraAgeEvaluation"),
+		ActiveJob.bControlNiagara
+			? TEXT("solo_absolute_fixed_step_advance_wait_for_concurrent_tick_and_finalize_before_capture")
+			: TEXT("uncontrolled"));
+	Contract->SetStringField(
+		TEXT("niagaraInitialAgeWarmup"),
+		ActiveJob.bControlNiagara
+			? TEXT("progressive_fixed_age_ramp_normal_single_tick_plus_one_ulp_when_initial_age_nonzero")
+			: TEXT("uncontrolled"));
+	Contract->SetStringField(
+		TEXT("skeletalAnimationReplay"),
+		ActiveJob.bCacheSkeletalAnimationPosesForReplay
+			? TEXT("shared_or_forward_baked_component_space_pose_cache_by_logical_frame")
+			: TEXT("engine_live_evaluation"));
+	Contract->SetStringField(
+		TEXT("skeletalPoseCacheArtifact"),
+		ActiveJob.bCacheSkeletalAnimationPosesForReplay
+			? TEXT("engine_versioned_binary_component_path_asset_bones_visibility_sha1")
+			: TEXT("not_used"));
+	Contract->SetBoolField(
+		TEXT("nonFixtureSkeletalValidationEnabled"),
+		ActiveJob.bValidateNonFixtureSkeletalAnimation);
+	Contract->SetStringField(
+		TEXT("nonFixtureSkeletalValidationActorClass"),
+		ActiveJob.bValidateNonFixtureSkeletalAnimation
+			? ActiveJob.NonFixtureSkeletalValidationActorClass.ToString()
+			: TEXT("none"));
+	Contract->SetBoolField(
+		TEXT("projectAnimatedMaterialValidationEnabled"),
+		ActiveJob.bValidateProjectAnimatedMaterial);
+	Contract->SetStringField(
+		TEXT("projectAnimatedMaterialValidationInterface"),
+		ActiveJob.bValidateProjectAnimatedMaterial
+			? ActiveJob.ProjectAnimatedMaterialValidationMaterial.ToString()
+			: TEXT("none"));
+	Contract->SetStringField(
+		TEXT("projectAnimatedMaterialValidationCarrier"),
+		ActiveJob.bValidateProjectAnimatedMaterial
+			? TEXT("transient_labeled_engine_cube_with_project_material_interface")
+			: TEXT("not_used"));
+	Contract->SetStringField(
+		TEXT("niagaraPayloadEvidence"),
+		TEXT("cpu_emitter_particle_counts_and_visible_semantic_fixture_pixels_gpu_payload_not_read_back"));
 	Contract->SetStringField(TEXT("exposureControl"), ActiveJob.bLockExposure ? TEXT("eye_adaptation_disabled") : TEXT("scene_authored_dynamic"));
 	Contract->SetStringField(TEXT("renderScheduling"), ActiveJob.bForceSynchronousRendering ? TEXT("offline_synchronous_profile") : TEXT("project_default"));
 	Contract->SetStringField(TEXT("depthEncoding"), TEXT("scene_capture_linear_distance_cm"));
@@ -2255,6 +3949,11 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 			: TEXT("engine_view_state_submission_order"));
 	Contract->SetBoolField(TEXT("uncapturedMainViewSuppressed"), ActiveJob.bSuppressMainViewOnUncapturedFrames);
 	Contract->SetStringField(
+		TEXT("uncapturedRendererPrime"),
+		ActiveJob.bSuppressMainViewOnUncapturedFrames
+			? TEXT("offscreen_scene_capture_64_pixel_long_edge_without_player_main_view_history")
+			: TEXT("not_required"));
+	Contract->SetStringField(
 		TEXT("endpointPreviousTransformScope"),
 		ActiveJob.bUseLastCapturedEndpointTransforms
 			? TEXT("scene_component_transforms_plus_double_buffered_skinned_component_space_bones_plus_explicit_previous_frame_switch_wpo_fixture_non_fixture_wpo_uncertified")
@@ -2278,6 +3977,11 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 			TEXT("hudlessDisplayColor"),
 			ActiveJob.bCaptureMainViewHUDlessColor
 				? TEXT("player_main_view_after_tonemap_before_slate_ui")
+				: TEXT("not_captured"));
+		Contract->SetStringField(
+			TEXT("uiColorAlpha"),
+			ActiveJob.bCaptureUIColorAlpha
+				? TEXT("independent_slate_game_layer_display_resolution_premultiplied_rgb_straight_coverage_alpha_png")
 				: TEXT("not_captured"));
 		Contract->SetStringField(
 			TEXT("temporalDiagnosticsView"),
@@ -2364,7 +4068,16 @@ void USRDatasetCaptureSubsystem::FinishCapture(const ESRDatasetCaptureState Fina
 		RestoreNiagara();
 		RestoreDeterministicRuntimeState();
 	}
+	ClearLogicalMaterialTime();
 	RestoreSemanticValidationFixture();
+	RestoreNonFixtureSkeletalValidation();
+	if (NonFixtureSkeletalValidationActor)
+	{
+		NonFixtureSkeletalValidationActor->Destroy();
+		NonFixtureSkeletalValidationActor = nullptr;
+	}
+	RestoreProjectAnimatedMaterialValidation();
+	RestoreDeterministicCamera();
 
 	FString ManifestError;
 	if (!ResolvedOutputDirectory.IsEmpty() && IFileManager::Get().DirectoryExists(*ResolvedOutputDirectory) && !WriteManifest(ManifestError))

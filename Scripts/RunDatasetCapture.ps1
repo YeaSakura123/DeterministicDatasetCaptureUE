@@ -8,7 +8,11 @@ param(
 
     [string]$Project = (Join-Path $PSScriptRoot '..\..\..\UnrealCodeDemo.uproject'),
 
-    [string]$Editor = ''
+    [string]$Editor = '',
+
+    [switch]$UseMemoryDDC,
+
+    [switch]$UseWorkspaceLocalDDC
 )
 
 $resolvedProject = (Resolve-Path -LiteralPath $Project -ErrorAction Stop).Path
@@ -43,6 +47,12 @@ if ([string]::IsNullOrWhiteSpace($Editor)) {
 }
 
 $resolvedEditor = (Resolve-Path -LiteralPath $Editor -ErrorAction Stop).Path
+$projectRoot = Split-Path -Parent $resolvedProject
+$shaderWorkingDirectory = Join-Path $projectRoot 'Saved\ShaderWorkingDirectory'
+New-Item -ItemType Directory -Path $shaderWorkingDirectory -Force | Out-Null
+if ($UseMemoryDDC -and $UseWorkspaceLocalDDC) {
+    throw 'UseMemoryDDC and UseWorkspaceLocalDDC are mutually exclusive.'
+}
 
 $arguments = @(
     $resolvedProject
@@ -51,10 +61,21 @@ $arguments = @(
     '-RenderOffscreen'
     '-unattended'
     '-NoSound'
+    "-ShaderWorkingDir=$shaderWorkingDirectory"
     "-SRDatasetJob=$resolvedJob"
     '-SRDatasetAutoQuit'
     '-log'
 )
+
+if ($UseMemoryDDC) {
+    $arguments += '-DDC-ForceMemoryCache'
+}
+elseif ($UseWorkspaceLocalDDC) {
+    $workspaceDDC = Join-Path $projectRoot 'Saved\DerivedDataCache'
+    New-Item -ItemType Directory -Path $workspaceDDC -Force | Out-Null
+    Set-Item -Path 'Env:UE-LocalDataCachePath' -Value $workspaceDDC
+    $arguments += '-ddc=InstalledNoZenLocalFallback'
+}
 
 if ($jobDescriptor.bCaptureMainViewTemporalDiagnostics -eq $true) {
     $arguments += "-ResX=$($jobDescriptor.hRResolution.x)"

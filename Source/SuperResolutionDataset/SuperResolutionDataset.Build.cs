@@ -24,7 +24,20 @@ public class SuperResolutionDataset : ModuleRules
 			"Projects",
 			"RenderCore",
 			"Renderer",
-			"RHI"
+			"RHI",
+			"Slate",
+			"SlateCore",
+			"UMG"
 		});
+
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.AddRange(new[]
+			{
+				"AssetRegistry",
+				"NiagaraEditor",
+				"UnrealEd"
+			});
+		}
 	}
 }
