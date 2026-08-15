@@ -7,6 +7,8 @@
 
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
+class UNiagaraComponent;
+class UNiagaraSystem;
 class UPoseableMeshComponent;
 class UPrimitiveComponent;
 class UStaticMeshComponent;
@@ -24,6 +26,9 @@ struct FSRDatasetValidationFixtureFrame
 	float WPOCurrentRightCm = 0.0f;
 	float WPOPreviousRightCm = 0.0f;
 	FVector2f ExpectedWPOMotionDisplayPixels = FVector2f::ZeroVector;
+	FVector2f NiagaraAnchorDisplayPixels = FVector2f::ZeroVector;
+	float NiagaraValidationRadiusDisplayPixels = 0.0f;
+	bool bNiagaraVisibleProbeExpected = false;
 	TMap<int32, float> ExpectedFrontDepthMeters;
 };
 
@@ -92,6 +97,9 @@ private:
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<UStaticMeshComponent> WPOCube;
 
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UNiagaraComponent> NiagaraFixture;
+
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> OpaqueMaterial;
 
@@ -102,7 +110,13 @@ private:
 	TObjectPtr<UMaterialInterface> WPOBaseMaterial;
 
 	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> VFXSpriteMaterial;
+
+	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> WPOMaterial;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UNiagaraSystem> NiagaraSystem;
 
 	FSRDatasetValidationFixtureFrame FrameMetadata;
 	int32 LastEvaluatedFrame = INDEX_NONE;

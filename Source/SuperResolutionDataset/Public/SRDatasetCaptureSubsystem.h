@@ -7,7 +7,9 @@
 
 class ASRDatasetCaptureRig;
 class ASRDatasetValidationFixture;
+class ACameraActor;
 class AActor;
+class APlayerController;
 class ALevelSequenceActor;
 class FJsonValue;
 class ULevelSequencePlayer;
@@ -15,6 +17,7 @@ class UNiagaraComponent;
 class UNiagaraSystem;
 class USceneComponent;
 class USkinnedMeshComponent;
+class SWidget;
 
 UCLASS()
 class SUPERRESOLUTIONDATASET_API USRDatasetCaptureSubsystem : public UWorldSubsystem
@@ -43,6 +46,31 @@ protected:
 private:
 	struct FSceneStateSummary
 	{
+		struct FNiagaraSummary
+		{
+			FString ComponentPath;
+			FString AssetPath;
+			double DesiredAgeSeconds = 0.0;
+			double SimulationAgeSeconds = 0.0;
+			int32 EmitterCount = 0;
+			int32 CPUEmitterCount = 0;
+			int32 GPUEmitterCount = 0;
+			int32 ParticleCount = 0;
+			int32 TotalSpawnedParticleCount = 0;
+			int32 RendererCount = 0;
+			bool bSoloInstanceObservable = false;
+			bool bSystemDeterminism = false;
+			bool bSystemFixedTick = false;
+			double SystemFixedTickSeconds = 0.0;
+			FVector ComponentLocationCm = FVector::ZeroVector;
+			FVector ComponentBoundsOriginCm = FVector::ZeroVector;
+			FVector ComponentBoundsExtentCm = FVector::ZeroVector;
+			TArray<int32> EmitterParticleCounts;
+			TArray<bool> EmitterDeterminism;
+			TArray<int32> EmitterRandomSeeds;
+			TArray<FString> MaterialPaths;
+		};
+
 		FString Sha1;
 		int32 ActorCount = 0;
 		int32 ComponentCount = 0;
@@ -50,10 +78,16 @@ private:
 		int32 BoneCount = 0;
 		int32 FXComponentCount = 0;
 		int32 NiagaraComponentCount = 0;
+		int32 NiagaraEmitterCount = 0;
+		int32 NiagaraCPUEmitterCount = 0;
+		int32 NiagaraGPUEmitterCount = 0;
+		int32 NiagaraParticleCount = 0;
+		int32 NiagaraTotalSpawnedParticleCount = 0;
 		int32 ControllableActorCount = 0;
 		int32 UncontrolledTickingActorCount = 0;
 		TArray<FString> ControllableActors;
 		TArray<FString> UncontrolledTickingActors;
+		TArray<FNiagaraSummary> NiagaraComponents;
 	};
 
 	struct FNiagaraComponentState
@@ -64,14 +98,23 @@ private:
 		float MaxSimTime = 0.0f;
 		bool bForceSolo = false;
 		bool bLockSeekDelta = false;
+		bool bCanRenderWhileSeeking = true;
 	};
 
 	struct FNiagaraSystemState
 	{
+		struct FEmitterState
+		{
+			FGuid HandleId;
+			bool bDeterminism = false;
+			int32 RandomSeed = 0;
+		};
+
 		bool bDeterminism = false;
 		bool bFixedTickDelta = false;
 		int32 RandomSeed = 0;
 		float FixedTickDeltaTime = 0.0f;
+		TArray<FEmitterState> Emitters;
 	};
 
 	struct FSkeletalEndpointState
@@ -82,8 +125,16 @@ private:
 		TArray<uint8> BoneVisibilityStates;
 	};
 
+	struct FPrimitiveStencilState
+	{
+		bool bRenderCustomDepth = false;
+		uint8 CustomDepthStencilValue = 0;
+		uint8 CustomDepthStencilWriteMask = 0;
+	};
+
 	void HandleWorldPreActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	void HandleWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
+	void HandleWorldTickEnd(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	bool PrepareJob(FString& OutError);
 	bool PrepareSemanticValidationFixture(FString& OutError);
 	void RestoreSemanticValidationFixture();
@@ -97,20 +148,39 @@ private:
 	bool ShouldCaptureFrame(int32 FrameNumber) const;
 	void ApplyLastCapturedEndpointTransforms();
 	void SnapshotCapturedEndpointTransforms();
+	bool PrepareNonFixtureSkeletalValidation(FString& OutError);
+	void RestoreNonFixtureSkeletalValidation();
+	void CacheSkeletalPosesForLogicalFrame(int32 FrameNumber);
+	void ApplyCachedSkeletalPoses(int32 FrameNumber);
+	bool LoadSkeletalPoseCacheArtifact(FString& OutError);
+	bool SaveSkeletalPoseCacheArtifact(FString& OutError);
+	FString ResolveProjectFile(const FString& InPath) const;
+	void PositionNonFixtureSkeletalValidationActor();
+	bool PrepareProjectAnimatedMaterialValidation(FString& OutError);
+	void PositionProjectAnimatedMaterialValidationReceiver();
+	void RestoreProjectAnimatedMaterialValidation();
+	bool PrepareDeterministicCamera(FString& OutError);
+	void EnforceDeterministicCamera();
+	void RestoreDeterministicCamera();
 	void ApplyDeterministicRuntimeState();
 	void ApplyLogicalTemporalJitter(int32 FrameNumber);
+	void ApplyLogicalMaterialTime(int32 FrameNumber);
+	void ClearLogicalMaterialTime();
+	TArray<FString> GetActiveWidgetComponentPaths() const;
+	bool CheckWidgetComponentPolicy(FString& OutError) const;
 	void RestoreDeterministicRuntimeState();
 	void SnapshotProvenance();
 	bool EnsureStreamingReady(FString& OutError);
 	FString ComputeStreamingStateSha1(int32& OutTextureCount, int32& OutPendingTextureCount) const;
 	FSceneStateSummary ComputeSceneStateSummary() const;
 	void DiscoverAndControlNiagara(float TimeSeconds);
+	void FinalizeNiagaraForCapture();
 	void RestoreNiagara();
 	void NotifyControllablesPrepare();
 	void NotifyControllablesEvaluate(int32 FrameNumber, float TimeSeconds);
 	void NotifyControllablesRestore();
 	bool EvaluateSequence(int32 FrameNumber, FString& OutError);
-	bool UpdateCaptureCamera(FString& OutError);
+	bool UpdateCaptureCamera(bool bEvaluateValidationFixture, FString& OutError);
 	bool CaptureCurrentFrame(FString& OutError);
 	bool FinalizePendingMainViewCapture(FString& OutError);
 	bool IsFrameAlreadyComplete(int32 FrameNumber) const;
@@ -162,8 +232,11 @@ private:
 	int32 StreamingTextureCountAfterBarrier = 0;
 	int32 PendingStreamingTextureCountAfterBarrier = 0;
 	FString StreamingStateAfterBarrierSha1;
+	FString SkeletalPoseCacheArtifactSha1;
+	bool bSkeletalPoseCacheLoadedFromArtifact = false;
 	FDelegateHandle PreActorTickHandle;
 	FDelegateHandle PostActorTickHandle;
+	FDelegateHandle WorldTickEndHandle;
 
 	UPROPERTY(Transient)
 	TObjectPtr<ASRDatasetCaptureRig> CaptureRig;
@@ -177,12 +250,43 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<ALevelSequenceActor> SequenceActor;
 
+	UPROPERTY(Transient)
+	TObjectPtr<AActor> NonFixtureSkeletalValidationActor;
+
+	UPROPERTY(Transient)
+	TObjectPtr<AActor> ProjectAnimatedMaterialValidationReceiver;
+
+	UPROPERTY(Transient)
+	TObjectPtr<class UStaticMeshComponent> ProjectAnimatedMaterialValidationComponent;
+
+	UPROPERTY(Transient)
+	TObjectPtr<class UMaterialInterface> ProjectAnimatedMaterialValidationInterface;
+
+	FString ProjectAnimatedMaterialValidationBasePath;
+
+	UPROPERTY(Transient)
+	TObjectPtr<ACameraActor> DeterministicCameraActor;
+
+	TWeakObjectPtr<APlayerController> DeterministicCameraPlayerController;
+	TWeakObjectPtr<AActor> PreviousPlayerViewTarget;
+
+	/** Non-UObject Slate fixture; installed only for the semantic UI gate. */
+	TSharedPtr<SWidget> ValidationUIWidget;
+
 	TMap<TWeakObjectPtr<UNiagaraComponent>, FNiagaraComponentState> NiagaraComponentStates;
 	TMap<TWeakObjectPtr<UNiagaraSystem>, FNiagaraSystemState> NiagaraSystemStates;
 	TSet<TWeakObjectPtr<AActor>> PreparedControllables;
 	TMap<TWeakObjectPtr<AActor>, bool> ValidationHiddenActorStates;
 	TMap<TWeakObjectPtr<USceneComponent>, FTransform> LastCapturedEndpointTransforms;
 	TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState> LastCapturedEndpointBoneStates;
+	TMap<int32, TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState>> CachedSkeletalPoseFrames;
+	TMap<TWeakObjectPtr<USkinnedMeshComponent>, int32> NonFixtureSkeletalObjectIds;
+	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FPrimitiveStencilState> NonFixtureSkeletalStencilStates;
+	TMap<TWeakObjectPtr<AActor>, bool> NonFixtureHiddenActorStates;
+	int32 WarmupPoseCacheFrame = INDEX_NONE;
+	int32 AppliedCachedSkeletalPoseComponentCount = 0;
+	int32 AppliedCachedSkeletalPoseBoneCount = 0;
+	TArray<FString> SkippedCachedSkeletalPoseComponents;
 	int32 AppliedEndpointBoneComponentCount = 0;
 	int32 AppliedEndpointBoneCount = 0;
 	TArray<FString> SkippedEndpointBoneComponents;

@@ -82,6 +82,41 @@ FSRDatasetViewExtension::FSRDatasetViewExtension(
 {
 }
 
+void FSRDatasetViewExtension::SetDeterministicViewTime(
+	const double CurrentTimeSeconds,
+	const float DeltaTimeSeconds)
+{
+	FScopeLock Lock(&StateMutex);
+	bDeterministicViewTimeEnabled = true;
+	DeterministicCurrentTimeSeconds = CurrentTimeSeconds;
+	DeterministicDeltaTimeSeconds = DeltaTimeSeconds;
+}
+
+void FSRDatasetViewExtension::ClearDeterministicViewTime()
+{
+	FScopeLock Lock(&StateMutex);
+	bDeterministicViewTimeEnabled = false;
+	DeterministicCurrentTimeSeconds = 0.0;
+	DeterministicDeltaTimeSeconds = 0.0f;
+}
+
+void FSRDatasetViewExtension::SetupViewFamily(FSceneViewFamily& InViewFamily)
+{
+	FScopeLock Lock(&StateMutex);
+	if (bDeterministicViewTimeEnabled)
+	{
+		// Renderer view-state reset detection uses real time, while material Game
+		// Time needs to follow logical frame direction. A stable non-zero origin
+		// preserves view history and freezes Ignore-Pause/Real-Time expressions.
+		constexpr double DeterministicRealTimeOriginSeconds = 86400.0;
+		InViewFamily.Time = FGameTime::CreateDilated(
+			DeterministicRealTimeOriginSeconds,
+			0.0f,
+			DeterministicCurrentTimeSeconds,
+			DeterministicDeltaTimeSeconds);
+	}
+}
+
 bool FSRDatasetViewExtension::RequestCapture(
 	const FIntPoint ExpectedSize,
 	const FIntPoint DisplaySize,

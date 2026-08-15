@@ -27,6 +27,7 @@
   "referenceHRScale": 2,
   "referenceResizeFilter": "Lanczos4",
   "bCaptureMainViewHUDlessColor": true,
+  "bCaptureUIColorAlpha": true,
   "outputDirectory": "Saved/SRDataset/fg_intermediate_validation",
   "bResume": false,
   "bWriteManifestEveryFrame": true,

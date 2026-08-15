@@ -39,6 +39,16 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("WarmupFrames cannot be negative.");
 		return false;
 	}
+	if (bUseDeterministicCameraTransform &&
+		(DeterministicCameraLocationCm.ContainsNaN() ||
+		 DeterministicCameraRotationDegrees.ContainsNaN() ||
+		 !FMath::IsFinite(DeterministicCameraFOVDegrees) ||
+		 DeterministicCameraFOVDegrees < 5.0f ||
+		 DeterministicCameraFOVDegrees > 170.0f))
+	{
+		OutError = TEXT("Deterministic camera transform must be finite and its FOV must be in [5, 170] degrees.");
+		return false;
+	}
 	if (bLockTemporalJitterToLogicalFrame &&
 		(TemporalJitterSequenceLength < 1 || TemporalJitterSequenceLength > 8))
 	{
@@ -85,6 +95,11 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 	if (bCaptureMainViewHUDlessColor && !bCaptureMainViewTemporalDiagnostics)
 	{
 		OutError = TEXT("bCaptureMainViewHUDlessColor requires real Main View temporal diagnostics.");
+		return false;
+	}
+	if (bCaptureUIColorAlpha && !bCaptureMainViewHUDlessColor)
+	{
+		OutError = TEXT("bCaptureUIColorAlpha requires bCaptureMainViewHUDlessColor=true so scene color and UI are available as separate layers.");
 		return false;
 	}
 	if (bSuppressMainViewOnUncapturedFrames &&
@@ -137,6 +152,56 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 	if (bEnableSemanticValidationFixture && !bCaptureMainViewTemporalDiagnostics)
 	{
 		OutError = TEXT("bEnableSemanticValidationFixture requires real Main View temporal diagnostics.");
+		return false;
+	}
+	const int32 PoseCacheFrameCount = EndFrame - StartFrame + 1;
+	if ((!SkeletalPoseCacheInputFile.IsEmpty() || !SkeletalPoseCacheOutputFile.IsEmpty()) &&
+		!bCacheSkeletalAnimationPosesForReplay)
+	{
+		OutError = TEXT("Skeletal pose-cache input/output files require bCacheSkeletalAnimationPosesForReplay=true.");
+		return false;
+	}
+	if (!SkeletalPoseCacheInputFile.IsEmpty() && !SkeletalPoseCacheOutputFile.IsEmpty())
+	{
+		OutError = TEXT("A capture job may load or write a skeletal pose-cache artifact, but not both.");
+		return false;
+	}
+	if (bCacheSkeletalAnimationPosesForReplay && WarmupFrames < PoseCacheFrameCount)
+	{
+		OutError = FString::Printf(
+			TEXT("Skeletal pose-cache replay requires at least %d warmup frames for the inclusive logical range."),
+			PoseCacheFrameCount);
+		return false;
+	}
+	if (bValidateNonFixtureSkeletalAnimation &&
+		(!bCacheSkeletalAnimationPosesForReplay || !bCaptureMainViewTemporalDiagnostics ||
+		 !bUseLastCapturedEndpointTransforms || bEnableSemanticValidationFixture ||
+		 (ReplayPass != ESRDatasetReplayPass::FrameGenerationEndpoints &&
+		  ReplayPass != ESRDatasetReplayPass::FrameGenerationReverseEndpoints)))
+	{
+		OutError = TEXT("Non-fixture skeletal validation requires pose-cache replay, Main View diagnostics, endpoint previous-state overrides, no semantic fixture, and a forward or reverse endpoint replay role.");
+		return false;
+	}
+	if (bValidateNonFixtureSkeletalAnimation && !NonFixtureSkeletalValidationActorClass.IsValid())
+	{
+		OutError = TEXT("Non-fixture skeletal validation requires a project-authored NonFixtureSkeletalValidationActorClass.");
+		return false;
+	}
+	if (bValidateProjectAnimatedMaterial &&
+		(!bLockMaterialTimeToLogicalFrame || !bCaptureMainViewTemporalDiagnostics ||
+		 !bCaptureMainViewHUDlessColor || !bUseDeterministicCameraTransform ||
+		 bEnableSemanticValidationFixture ||
+		 (ReplayPass != ESRDatasetReplayPass::FrameGenerationEndpoints &&
+		  ReplayPass != ESRDatasetReplayPass::FrameGenerationReverseEndpoints)))
+	{
+		OutError = TEXT("Project animated-material validation requires logical material time, deterministic camera, HUD-less Main View temporal diagnostics, no semantic fixture, and a forward or reverse endpoint role.");
+		return false;
+	}
+	if (bValidateProjectAnimatedMaterial &&
+		(!ProjectAnimatedMaterialValidationMaterial.IsValid() ||
+		 !ProjectAnimatedMaterialValidationMaterial.ToString().StartsWith(TEXT("/Game/"))))
+	{
+		OutError = TEXT("Project animated-material validation requires a /Game ProjectAnimatedMaterialValidationMaterial.");
 		return false;
 	}
 	const int32 FirstCapturedFrame = StartFrame + CaptureFrameOffset;

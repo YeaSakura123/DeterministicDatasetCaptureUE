@@ -14,6 +14,7 @@ from typing import Any
 try:
     import numpy as np
     import OpenEXR
+    from PIL import Image
 except ImportError as exc:
     raise SystemExit(
         "Validation dependencies are missing. Run: "
@@ -25,6 +26,9 @@ REQUIRED_MODALITIES = {
     "scene_color_hudless_t0",
     "scene_color_hudless_tau",
     "scene_color_hudless_t1",
+    "ui_color_alpha_t0",
+    "ui_color_alpha_tau",
+    "ui_color_alpha_t1",
     "depth_t0",
     "depth_tau",
     "depth_t1",
@@ -51,7 +55,12 @@ DISPLAY_MODALITIES = {
     "scene_color_hudless_t0",
     "scene_color_hudless_tau",
     "scene_color_hudless_t1",
+    "ui_color_alpha_t0",
+    "ui_color_alpha_tau",
+    "ui_color_alpha_t1",
 }
+
+UI_MODALITIES = {"ui_color_alpha_t0", "ui_color_alpha_tau", "ui_color_alpha_t1"}
 
 MASK_MODALITIES = {
     "motion_valid_1_to_0",
@@ -79,12 +88,37 @@ BINARY_MASK_MODALITIES = {
 
 OBJECT_ID_MODALITIES = {"object_id_t0", "object_id_tau", "object_id_t1"}
 
-REQUIRED_UNCERTIFIED_GAPS = {
-    "ui_color_alpha_t0_tau_t1",
+BASE_REQUIRED_UNCERTIFIED_GAPS: set[str] = set()
+WORLD_SPACE_WIDGET_GAP = "hudless_in_world_ui_residue_validation"
+
+LEGACY_WPO_AND_MATERIAL_GAP = (
+    "non_fixture_wpo_and_animated_material_endpoint_motion_validation"
+)
+PROJECT_ANIMATED_MATERIAL_GAP = "project_animated_material_logical_time_validation"
+PROJECT_WPO_GAP = "project_authored_wpo_endpoint_motion_validation"
+
+PROJECT_SKELETAL_GAPS = {
     "non_fixture_skeletal_animation_endpoint_motion_validation",
-    "non_fixture_wpo_and_animated_material_endpoint_motion_validation",
     "production_disocclusion_masks",
-    "hudless_in_world_ui_residue_validation",
+}
+
+PROJECT_SKELETAL_EVIDENCE_VERSION = 1
+PROJECT_SKELETAL_EVIDENCE_FILE_KEYS = {
+    "forwardManifest",
+    "forwardValidation",
+    "reverseManifest",
+    "reverseValidation",
+    "reverseComparison",
+    "poseCacheArtifact",
+}
+
+PROJECT_ANIMATED_MATERIAL_EVIDENCE_VERSION = 1
+PROJECT_ANIMATED_MATERIAL_EVIDENCE_FILE_KEYS = {
+    "forwardManifest",
+    "forwardValidation",
+    "reverseManifest",
+    "reverseValidation",
+    "reverseComparison",
 }
 
 EXPECTED_ENDPOINT_SCOPE = (
@@ -97,8 +131,18 @@ INTENTIONAL_CVAR_VALUES = {
         "endpoints": "1",
         "reverseEndpoints": "1",
         "intermediate": "0",
-    }
+    },
+    "r.SkipRedundantTransformUpdate": {
+        "endpoints": "0",
+        "reverseEndpoints": "0",
+        "intermediate": "1",
+    },
 }
+
+EXPECTED_SCENE_STATE_HASH_SCOPE = (
+    "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_"
+    "niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back"
+)
 
 
 def sha1(path: Path) -> str:
@@ -136,6 +180,13 @@ def exr_rgba(path: Path) -> np.ndarray:
     return pixels.astype(np.float32, copy=False)
 
 
+def image_rgba(path: Path) -> np.ndarray:
+    if path.suffix.lower() != ".png":
+        return exr_rgba(path)
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGBA"), dtype=np.float32) / 255.0
+
+
 def safe_dataset_file(dataset: Path, relative: Any) -> Path:
     if not isinstance(relative, str) or not relative:
         raise ValueError("file path must be a non-empty relative string")
@@ -149,6 +200,487 @@ def safe_dataset_file(dataset: Path, relative: Any) -> Path:
     except ValueError as exc:
         raise ValueError("file path escapes the dataset root") from exc
     return candidate
+
+
+def passing_check_map(report: Any) -> dict[str, bool]:
+    if not isinstance(report, dict):
+        return {}
+    return {
+        str(check.get("name")): bool(check.get("passed", False))
+        for check in report.get("checks", [])
+        if isinstance(check, dict)
+    }
+
+
+def report_complete(report: Any, gate: str = "formatAndIntegrityGate") -> bool:
+    if not isinstance(report, dict):
+        return False
+    required_failures = [
+        check
+        for check in report.get("checks", [])
+        if isinstance(check, dict)
+        and check.get("required", True)
+        and not check.get("passed", False)
+    ]
+    return bool(
+        int(report.get("validatorVersion", 0)) >= 7
+        and report.get(gate) == "pass"
+        and int(report.get("checksTotal", -1)) > 0
+        and int(report.get("checksPassed", -2))
+        == int(report.get("checksTotal", -1))
+        and not required_failures
+    )
+
+
+def named_proof_checks_pass(
+    report: Any, exact: tuple[str, ...], prefixes: tuple[str, ...]
+) -> tuple[bool, str]:
+    check_map = passing_check_map(report)
+    missing_exact = [name for name in exact if check_map.get(name) is not True]
+    missing_prefixes = [
+        prefix
+        for prefix in prefixes
+        if not any(name.startswith(prefix) and passed for name, passed in check_map.items())
+    ]
+    valid = not missing_exact and not missing_prefixes
+    return valid, f"missingExact={missing_exact} missingPrefixes={missing_prefixes}"
+
+
+def validate_project_skeletal_evidence(
+    checks: list[dict[str, Any]], dataset: Path, evidence: Any
+) -> bool:
+    prefix = "evidence.project_skeletal"
+    valid_record = isinstance(evidence, dict)
+    add_check(checks, f"{prefix}.record", valid_record, type(evidence).__name__)
+    if not valid_record:
+        return False
+
+    files = evidence.get("files", {})
+    hashes = evidence.get("sha1", {})
+    schema_ok = (
+        evidence.get("schemaVersion") == PROJECT_SKELETAL_EVIDENCE_VERSION
+        and evidence.get("proofScope")
+        == "project_authored_anim_blueprint_shared_pose_cache_exact_forward_reverse_identity_camera_depth_and_bidirectional_disocclusion"
+        and isinstance(files, dict)
+        and isinstance(hashes, dict)
+        and set(files) == PROJECT_SKELETAL_EVIDENCE_FILE_KEYS
+        and set(hashes) == PROJECT_SKELETAL_EVIDENCE_FILE_KEYS
+    )
+    add_check(
+        checks,
+        f"{prefix}.schema",
+        schema_ok,
+        f"version={evidence.get('schemaVersion')} fileKeys={sorted(files) if isinstance(files, dict) else []}",
+    )
+    if not isinstance(files, dict) or not isinstance(hashes, dict):
+        return False
+
+    loaded: dict[str, Any] = {}
+    resolved: dict[str, Path] = {}
+    all_files_valid = schema_ok
+    for key in sorted(PROJECT_SKELETAL_EVIDENCE_FILE_KEYS):
+        try:
+            path = safe_dataset_file(dataset, files.get(key))
+            error = ""
+        except Exception as exc:
+            path = dataset / "__invalid__"
+            error = str(exc)
+        present = not error and path.is_file()
+        actual_hash = sha1(path) if present else ""
+        declared_hash = str(hashes.get(key, "")).upper()
+        file_valid = present and len(declared_hash) == 40 and actual_hash == declared_hash
+        add_check(
+            checks,
+            f"{prefix}.{key}.integrity",
+            file_valid,
+            f"path={files.get(key)} actual={actual_hash} declared={declared_hash} error={error}",
+        )
+        all_files_valid = all_files_valid and file_valid
+        if not file_valid:
+            continue
+        resolved[key] = path
+        if key != "poseCacheArtifact":
+            try:
+                loaded[key] = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                add_check(checks, f"{prefix}.{key}.json", False, str(exc))
+                all_files_valid = False
+
+    if not all(key in loaded for key in PROJECT_SKELETAL_EVIDENCE_FILE_KEYS - {"poseCacheArtifact"}):
+        return False
+
+    forward_manifest = loaded["forwardManifest"]
+    reverse_manifest = loaded["reverseManifest"]
+    forward_report = loaded["forwardValidation"]
+    reverse_report = loaded["reverseValidation"]
+    comparison_report = loaded["reverseComparison"]
+    manifests_are_objects = isinstance(forward_manifest, dict) and isinstance(
+        reverse_manifest, dict
+    )
+    add_check(
+        checks,
+        f"{prefix}.manifest_objects",
+        manifests_are_objects,
+        f"forward={type(forward_manifest).__name__} reverse={type(reverse_manifest).__name__}",
+    )
+    if not manifests_are_objects:
+        return False
+
+    forward_job = forward_manifest.get("job", {})
+    reverse_job = reverse_manifest.get("job", {})
+    roles_ok = (
+        forward_manifest.get("state") == "Completed"
+        and reverse_manifest.get("state") == "Completed"
+        and forward_manifest.get("replayPass") == "FrameGenerationEndpoints"
+        and reverse_manifest.get("replayPass") == "FrameGenerationReverseEndpoints"
+    )
+    add_check(
+        checks,
+        f"{prefix}.capture_roles",
+        roles_ok,
+        f"forward={forward_manifest.get('replayPass')} reverse={reverse_manifest.get('replayPass')}",
+    )
+    jobs_ok = all(
+        isinstance(job, dict)
+        and job.get("bValidateNonFixtureSkeletalAnimation") is True
+        and job.get("bCacheSkeletalAnimationPosesForReplay") is True
+        and job.get("bUseDeterministicCameraTransform") is True
+        and bool(job.get("nonFixtureSkeletalValidationActorClass"))
+        for job in (forward_job, reverse_job)
+    ) and (
+        forward_job.get("nonFixtureSkeletalValidationActorClass")
+        == reverse_job.get("nonFixtureSkeletalValidationActorClass")
+        == evidence.get("actorClass")
+    )
+    add_check(
+        checks,
+        f"{prefix}.deterministic_project_anim_blueprint_jobs",
+        jobs_ok,
+        f"actor={evidence.get('actorClass')}",
+    )
+
+    try:
+        forward_frame_ids = sorted(
+            int(frame["logicalFrameId"]) for frame in forward_manifest.get("frames", [])
+        )
+        reverse_frame_ids = sorted(
+            int(frame["logicalFrameId"]) for frame in reverse_manifest.get("frames", [])
+        )
+    except Exception:
+        forward_frame_ids = []
+        reverse_frame_ids = []
+    declared_frame_ids = evidence.get("logicalFrameIds")
+    grids_ok = (
+        len(forward_frame_ids) >= 2
+        and forward_frame_ids == reverse_frame_ids
+        and forward_frame_ids == declared_frame_ids
+    )
+    add_check(
+        checks,
+        f"{prefix}.logical_frame_grid",
+        grids_ok,
+        f"forward={forward_frame_ids} reverse={reverse_frame_ids} declared={declared_frame_ids}",
+    )
+
+    forward_artifact_sha1 = str(
+        forward_manifest.get("provenance", {}).get("skeletalPoseCacheArtifactSha1", "")
+    ).upper()
+    reverse_artifact_sha1 = str(
+        reverse_manifest.get("provenance", {}).get("skeletalPoseCacheArtifactSha1", "")
+    ).upper()
+    copied_artifact_sha1 = sha1(resolved["poseCacheArtifact"]) if "poseCacheArtifact" in resolved else ""
+    declared_artifact_sha1 = str(evidence.get("poseCacheArtifactSha1", "")).upper()
+    artifact_ok = (
+        len(declared_artifact_sha1) == 40
+        and declared_artifact_sha1
+        == forward_artifact_sha1
+        == reverse_artifact_sha1
+        == copied_artifact_sha1
+    )
+    add_check(
+        checks,
+        f"{prefix}.shared_pose_cache_artifact",
+        artifact_ok,
+        f"declared={declared_artifact_sha1} forward={forward_artifact_sha1} "
+        f"reverse={reverse_artifact_sha1} copied={copied_artifact_sha1}",
+    )
+
+    standalone_exact = (
+        "skeletal_replay.job_and_contract",
+        "provenance.skeletal_pose_cache_artifact",
+        "skeletal_replay.project_anim_blueprint_pose_changes",
+        "skeletal_replay.project_disocclusion_transition_coverage",
+    )
+    standalone_prefixes = (
+        "frame_000000.project_anim_blueprint_probe",
+        "frame_000000.project_skeletal_probe_visible",
+    )
+    standalone_reports_ok = True
+    for label, report in (
+        ("forward", forward_report),
+        ("reverse", reverse_report),
+    ):
+        complete = report_complete(report)
+        proof_ok, proof_detail = named_proof_checks_pass(
+            report, standalone_exact, standalone_prefixes
+        )
+        check_map = passing_check_map(report)
+        endpoint_motion = any(
+            name.endswith(".project_skeletal_probe_endpoint_motion") and passed
+            for name, passed in check_map.items()
+        )
+        visibility = any(
+            name.endswith(".project_skeletal_bidirectional_visibility") and passed
+            for name, passed in check_map.items()
+        )
+        valid = complete and proof_ok and endpoint_motion and visibility
+        standalone_reports_ok = standalone_reports_ok and valid
+        add_check(
+            checks,
+            f"{prefix}.{label}_standalone_gate",
+            valid,
+            f"complete={complete} proof={proof_detail} endpointMotion={endpoint_motion} "
+            f"bidirectionalVisibility={visibility}",
+        )
+
+    comparison_proof_ok, comparison_detail = named_proof_checks_pass(
+        comparison_report,
+        (
+            "skeletal_reverse.opposite_endpoint_roles",
+            "skeletal_reverse.jobs_equal_except_identity_output_and_role",
+            "skeletal_reverse.provenance_equal_except_config_hash",
+            "skeletal_reverse.static_grids_compared",
+            "skeletal_replay.project_disocclusion_transition_coverage",
+        ),
+        (
+            "skeletal_reverse.frame_000000.project_pose_and_identity_exact",
+            "skeletal_reverse.frame_000000.camera_exact",
+            "skeletal_reverse.frame_000000.left_independent_motion_evidence",
+            "skeletal_reverse.frame_000000.right_independent_motion_evidence",
+        ),
+    )
+    comparison_ok = bool(
+        report_complete(comparison_report)
+        and isinstance(comparison_report, dict)
+        and comparison_report.get("skeletalReverseReplayGate") == "pass"
+        and comparison_proof_ok
+        and int(comparison_report.get("validatorVersion", 0))
+        == int(evidence.get("validatorVersion", -1))
+        and int(comparison_report.get("checksPassed", -1))
+        == int(evidence.get("checksPassed", -2))
+        and int(comparison_report.get("checksTotal", -1))
+        == int(evidence.get("checksTotal", -2))
+    )
+    add_check(
+        checks,
+        f"{prefix}.exact_forward_reverse_gate",
+        comparison_ok,
+        f"gate={comparison_report.get('skeletalReverseReplayGate') if isinstance(comparison_report, dict) else None} "
+        f"proof={comparison_detail}",
+    )
+    return bool(
+        all_files_valid
+        and roles_ok
+        and jobs_ok
+        and grids_ok
+        and artifact_ok
+        and standalone_reports_ok
+        and comparison_ok
+    )
+
+
+def validate_project_animated_material_evidence(
+    checks: list[dict[str, Any]], dataset: Path, evidence: Any
+) -> bool:
+    prefix = "evidence.project_animated_material"
+    valid_record = isinstance(evidence, dict)
+    add_check(checks, f"{prefix}.record", valid_record, type(evidence).__name__)
+    if not valid_record:
+        return False
+    files = evidence.get("files", {})
+    hashes = evidence.get("sha1", {})
+    schema_ok = bool(
+        evidence.get("schemaVersion")
+        == PROJECT_ANIMATED_MATERIAL_EVIDENCE_VERSION
+        and evidence.get("proofScope")
+        == "project_authored_surface_material_gpu_logical_game_time_visible_change_and_forward_reverse_current_color_tolerance"
+        and str(evidence.get("materialInterface", "")).startswith("/Game/")
+        and isinstance(files, dict)
+        and isinstance(hashes, dict)
+        and set(files) == PROJECT_ANIMATED_MATERIAL_EVIDENCE_FILE_KEYS
+        and set(hashes) == PROJECT_ANIMATED_MATERIAL_EVIDENCE_FILE_KEYS
+    )
+    add_check(
+        checks,
+        f"{prefix}.schema",
+        schema_ok,
+        f"version={evidence.get('schemaVersion')} material={evidence.get('materialInterface')} "
+        f"fileKeys={sorted(files) if isinstance(files, dict) else []}",
+    )
+    if not isinstance(files, dict) or not isinstance(hashes, dict):
+        return False
+
+    loaded: dict[str, Any] = {}
+    all_files_valid = schema_ok
+    for key in sorted(PROJECT_ANIMATED_MATERIAL_EVIDENCE_FILE_KEYS):
+        try:
+            path = safe_dataset_file(dataset, files.get(key))
+            error = ""
+        except Exception as exc:
+            path = dataset / "__invalid__"
+            error = str(exc)
+        present = not error and path.is_file()
+        actual_hash = sha1(path) if present else ""
+        declared_hash = str(hashes.get(key, "")).upper()
+        valid = present and len(declared_hash) == 40 and actual_hash == declared_hash
+        add_check(
+            checks,
+            f"{prefix}.{key}.integrity",
+            valid,
+            f"path={files.get(key)} actual={actual_hash} declared={declared_hash} error={error}",
+        )
+        all_files_valid = all_files_valid and valid
+        if not valid:
+            continue
+        try:
+            loaded[key] = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            add_check(checks, f"{prefix}.{key}.json", False, str(exc))
+            all_files_valid = False
+    if set(loaded) != PROJECT_ANIMATED_MATERIAL_EVIDENCE_FILE_KEYS:
+        return False
+
+    forward_manifest = loaded["forwardManifest"]
+    reverse_manifest = loaded["reverseManifest"]
+    forward_report = loaded["forwardValidation"]
+    reverse_report = loaded["reverseValidation"]
+    comparison_report = loaded["reverseComparison"]
+    manifests_ok = isinstance(forward_manifest, dict) and isinstance(
+        reverse_manifest, dict
+    )
+    add_check(checks, f"{prefix}.manifest_objects", manifests_ok, str(manifests_ok))
+    if not manifests_ok:
+        return False
+    roles_ok = bool(
+        forward_manifest.get("state") == "Completed"
+        and reverse_manifest.get("state") == "Completed"
+        and forward_manifest.get("replayPass") == "FrameGenerationEndpoints"
+        and reverse_manifest.get("replayPass")
+        == "FrameGenerationReverseEndpoints"
+    )
+    add_check(
+        checks,
+        f"{prefix}.capture_roles",
+        roles_ok,
+        f"forward={forward_manifest.get('replayPass')} reverse={reverse_manifest.get('replayPass')}",
+    )
+    jobs = (forward_manifest.get("job", {}), reverse_manifest.get("job", {}))
+    jobs_ok = all(
+        isinstance(job, dict)
+        and job.get("bValidateProjectAnimatedMaterial") is True
+        and job.get("bLockMaterialTimeToLogicalFrame") is True
+        and job.get("bUseDeterministicCameraTransform") is True
+        and job.get("projectAnimatedMaterialValidationMaterial")
+        == evidence.get("materialInterface")
+        for job in jobs
+    )
+    add_check(
+        checks,
+        f"{prefix}.deterministic_project_material_jobs",
+        jobs_ok,
+        f"material={evidence.get('materialInterface')}",
+    )
+    try:
+        forward_frame_ids = sorted(
+            int(frame["logicalFrameId"]) for frame in forward_manifest.get("frames", [])
+        )
+        reverse_frame_ids = sorted(
+            int(frame["logicalFrameId"]) for frame in reverse_manifest.get("frames", [])
+        )
+    except Exception:
+        forward_frame_ids = []
+        reverse_frame_ids = []
+    grids_ok = bool(
+        len(forward_frame_ids) >= 2
+        and forward_frame_ids == reverse_frame_ids
+        and forward_frame_ids == evidence.get("logicalFrameIds")
+    )
+    add_check(
+        checks,
+        f"{prefix}.logical_frame_grid",
+        grids_ok,
+        f"forward={forward_frame_ids} reverse={reverse_frame_ids} declared={evidence.get('logicalFrameIds')}",
+    )
+
+    standalone_exact = (
+        "material_time.logical_frame_contract",
+        "material_replay.project_validation_contract",
+        "material_replay.project_animated_material_changes_with_logical_time",
+    )
+    standalone_prefixes = (
+        "frame_000000.project_animated_material_schema",
+        "frame_000000.project_animated_material_visible",
+    )
+    standalone_ok = True
+    for label, report in (("forward", forward_report), ("reverse", reverse_report)):
+        proof_ok, detail = named_proof_checks_pass(
+            report, standalone_exact, standalone_prefixes
+        )
+        valid = bool(
+            report_complete(report)
+            and int(report.get("validatorVersion", 0)) >= 8
+            and proof_ok
+        )
+        standalone_ok = standalone_ok and valid
+        add_check(
+            checks,
+            f"{prefix}.{label}_standalone_gate",
+            valid,
+            f"proof={detail}",
+        )
+
+    comparison_proof_ok, comparison_detail = named_proof_checks_pass(
+        comparison_report,
+        (
+            "material_reverse.opposite_endpoint_roles",
+            "material_reverse.jobs_equal_except_identity_output_and_role",
+            "material_reverse.provenance_equal_except_config_hash",
+            "material_reverse.static_identity_grids_compared",
+        ),
+        (
+            "material_reverse.frame_000000.gpu_logical_game_time_and_signed_direction",
+            "material_reverse.frame_000000.project_material_identity_exact",
+            "material_reverse.frame_000000.project_material_current_color_exact",
+        ),
+    )
+    comparison_ok = bool(
+        report_complete(comparison_report)
+        and isinstance(comparison_report, dict)
+        and int(comparison_report.get("validatorVersion", 0)) >= 8
+        and comparison_report.get("materialReverseReplayGate") == "pass"
+        and comparison_proof_ok
+        and int(comparison_report.get("validatorVersion", 0))
+        == int(evidence.get("validatorVersion", -1))
+        and int(comparison_report.get("checksPassed", -1))
+        == int(evidence.get("checksPassed", -2))
+        and int(comparison_report.get("checksTotal", -1))
+        == int(evidence.get("checksTotal", -2))
+    )
+    add_check(
+        checks,
+        f"{prefix}.exact_forward_reverse_gate",
+        comparison_ok,
+        f"gate={comparison_report.get('materialReverseReplayGate') if isinstance(comparison_report, dict) else None} "
+        f"proof={comparison_detail}",
+    )
+    return bool(
+        all_files_valid
+        and roles_ok
+        and jobs_ok
+        and grids_ok
+        and standalone_ok
+        and comparison_ok
+    )
 
 
 def finite_matrix(values: Any) -> bool:
@@ -328,17 +860,91 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
     add_check(checks, "contract.version", manifest.get("contractVersion") == "nr-fg-data-v1", str(manifest.get("contractVersion")))
     add_check(checks, "contract.schema", manifest.get("schemaVersion") == 1, str(manifest.get("schemaVersion")))
     declared_gaps = set(manifest.get("missingRequirements", []))
+    validation_coverage = manifest.get("validationCoverage", {})
+    project_skeletal_claimed = bool(
+        isinstance(validation_coverage, dict)
+        and validation_coverage.get("projectAuthoredAnimBlueprintEndpointMotion") is True
+        and validation_coverage.get(
+            "projectAuthoredAnimBlueprintExactForwardReverseReplay"
+        )
+        is True
+        and validation_coverage.get("projectSkeletalBidirectionalDisocclusion") is True
+    )
+    project_animated_material_claimed = bool(
+        isinstance(validation_coverage, dict)
+        and validation_coverage.get("projectAnimatedMaterialLogicalGameTime") is True
+        and validation_coverage.get("projectAnimatedMaterialVisibleTimeVariation")
+        is True
+        and validation_coverage.get(
+            "projectAnimatedMaterialForwardReverseCurrentColor"
+        )
+        is True
+    )
+    hudless_world_widget_rejection_claimed = bool(
+        isinstance(validation_coverage, dict)
+        and validation_coverage.get("hudlessWorldSpaceWidgetResidueRejected")
+        is True
+    )
+    required_uncertified_gaps = set(BASE_REQUIRED_UNCERTIFIED_GAPS)
+    if not project_skeletal_claimed:
+        required_uncertified_gaps.update(PROJECT_SKELETAL_GAPS)
+    if not hudless_world_widget_rejection_claimed:
+        required_uncertified_gaps.add(WORLD_SPACE_WIDGET_GAP)
+    wpo_gap_ok = PROJECT_WPO_GAP in declared_gaps or (
+        not project_animated_material_claimed
+        and LEGACY_WPO_AND_MATERIAL_GAP in declared_gaps
+    )
+    animated_material_gap_ok = (
+        project_animated_material_claimed
+        and PROJECT_ANIMATED_MATERIAL_GAP not in declared_gaps
+        and LEGACY_WPO_AND_MATERIAL_GAP not in declared_gaps
+    ) or (
+        not project_animated_material_claimed
+        and (
+            PROJECT_ANIMATED_MATERIAL_GAP in declared_gaps
+            or LEGACY_WPO_AND_MATERIAL_GAP in declared_gaps
+        )
+    )
     add_check(
         checks,
         "contract.honest_uncertified_state",
         manifest.get("certificationStatus") == "experimental_uncertified"
         and manifest.get("frameGenerationCertified") is False
-        and REQUIRED_UNCERTIFIED_GAPS <= declared_gaps,
-        f"status={manifest.get('certificationStatus')} certified={manifest.get('frameGenerationCertified')} gaps={sorted(declared_gaps)}",
+        and required_uncertified_gaps <= declared_gaps
+        and wpo_gap_ok
+        and animated_material_gap_ok
+        and (
+            not project_skeletal_claimed
+            or not (PROJECT_SKELETAL_GAPS & declared_gaps)
+        )
+        and (
+            not hudless_world_widget_rejection_claimed
+            or WORLD_SPACE_WIDGET_GAP not in declared_gaps
+        ),
+        f"status={manifest.get('certificationStatus')} certified={manifest.get('frameGenerationCertified')} "
+        f"gaps={sorted(declared_gaps)} required={sorted(required_uncertified_gaps)} "
+        f"projectSkeletalClaimed={project_skeletal_claimed} "
+        f"projectAnimatedMaterialClaimed={project_animated_material_claimed} "
+        f"hudlessWorldWidgetRejectionClaimed={hudless_world_widget_rejection_claimed} "
+        f"wpoGapOk={wpo_gap_ok} animatedMaterialGapOk={animated_material_gap_ok}",
     )
     add_check(checks, "contract.tau", math.isclose(float(manifest.get("tau", math.nan)), 0.5, abs_tol=1e-12), str(manifest.get("tau")))
     add_check(checks, "contract.motion_blur_off", manifest.get("motionBlur") == "off", str(manifest.get("motionBlur")))
-    add_check(checks, "contract.ui_not_fabricated", manifest.get("uiSeparated") is False, str(manifest.get("uiSeparated")))
+    ui_semantics = manifest.get("bufferSemantics", {}).get("uiColorAlpha", {})
+    add_check(
+        checks,
+        "contract.ui_separated",
+        manifest.get("uiSeparated") is True
+        and ui_semantics.get("pipelineStage")
+        == "independent_slate_game_layer_before_scene_composite"
+        and ui_semantics.get("resolution") == "display"
+        and ui_semantics.get("encoding") == "display_referred_srgb_png_unorm8"
+        and ui_semantics.get("alphaSemantic")
+        == "straight_coverage_zero_is_transparent_one_is_opaque"
+        and ui_semantics.get("rgbSemantic") == "premultiplied_by_coverage_alpha"
+        and ui_semantics.get("sceneIncluded") is False,
+        json.dumps(ui_semantics, sort_keys=True),
+    )
 
     render_size = tuple(int(value) for value in manifest.get("renderSize", ()))
     display_size = tuple(int(value) for value in manifest.get("displaySize", ()))
@@ -369,7 +975,6 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
             f"passed={passed} total={total} validator={validation.get('validatorVersion')}",
         )
 
-    validation_coverage = manifest.get("validationCoverage", {})
     add_check(
         checks,
         "sources.semantic_motion_fixture_coverage",
@@ -379,6 +984,63 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         is True
         and validation_coverage.get("semanticFixturePreviousFrameSwitchWPOMotion")
         is True,
+        json.dumps(validation_coverage, sort_keys=True),
+    )
+    add_check(
+        checks,
+        "sources.hudless_world_widget_rejection_coverage",
+        not hudless_world_widget_rejection_claimed
+        or (
+            isinstance(validation_coverage, dict)
+            and validation_coverage.get("hudlessWorldSpaceWidgetResidueRejected")
+            is True
+        ),
+        json.dumps(validation_coverage, sort_keys=True),
+    )
+    validation_evidence = manifest.get("validationEvidence", {})
+    project_skeletal_evidence = (
+        validation_evidence.get("projectSkeletalAnimation")
+        if isinstance(validation_evidence, dict)
+        else None
+    )
+    project_skeletal_evidence_passed = (
+        validate_project_skeletal_evidence(
+            checks, dataset, project_skeletal_evidence
+        )
+        if project_skeletal_evidence is not None
+        else False
+    )
+    add_check(
+        checks,
+        "sources.project_skeletal_claim_matches_portable_evidence",
+        project_skeletal_claimed == project_skeletal_evidence_passed,
+        f"claimed={project_skeletal_claimed} evidencePassed={project_skeletal_evidence_passed}",
+    )
+    project_animated_material_evidence = (
+        validation_evidence.get("projectAnimatedMaterial")
+        if isinstance(validation_evidence, dict)
+        else None
+    )
+    project_animated_material_evidence_passed = (
+        validate_project_animated_material_evidence(
+            checks, dataset, project_animated_material_evidence
+        )
+        if project_animated_material_evidence is not None
+        else False
+    )
+    add_check(
+        checks,
+        "sources.project_animated_material_claim_matches_portable_evidence",
+        project_animated_material_claimed
+        == project_animated_material_evidence_passed,
+        f"claimed={project_animated_material_claimed} "
+        f"evidencePassed={project_animated_material_evidence_passed}",
+    )
+    add_check(
+        checks,
+        "sources.semantic_ui_color_alpha_coverage",
+        isinstance(validation_coverage, dict)
+        and validation_coverage.get("semanticFixtureUIColorAlpha") is True,
         json.dumps(validation_coverage, sort_keys=True),
     )
 
@@ -580,7 +1242,7 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                 scene_hashes_valid
                 and len(set(scene_values)) == 3
                 and pair.get("sceneStateHashScope")
-                == "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_state_cascade_component_state_not_particle_payload",
+                == EXPECTED_SCENE_STATE_HASH_SCOPE,
                 json.dumps(scene_hashes, sort_keys=True),
             )
 
@@ -647,7 +1309,7 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                 declared_hash = str(hashes.get(modality, "")).upper()
                 add_check(checks, f"{prefix}.{modality}.sha1", actual_hash == declared_hash, f"actual={actual_hash} declared={declared_hash}")
                 try:
-                    pixels = exr_rgba(path)
+                    pixels = image_rgba(path)
                     read_error = ""
                 except Exception as exc:
                     pixels = np.zeros((0, 0, 4), dtype=np.float32)
@@ -680,12 +1342,131 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                     add_check(checks, f"{prefix}.{modality}.uint8_contract", valid_values, f"min={float(np.min(channel))} max={float(np.max(channel))}")
                 elif modality.startswith("depth_"):
                     add_check(checks, f"{prefix}.{modality}.range", bool(np.min(channel) >= 0.0), f"min={float(np.min(channel))} max={float(np.max(channel))}")
+                elif modality in UI_MODALITIES:
+                    alpha = pixels[..., 3]
+                    unorm_range = bool((pixels >= 0.0).all() and (pixels <= 1.0).all())
+                    premultiplied = bool(
+                        (pixels[..., :3] <= alpha[..., None] + (1.0 / 255.0)).all()
+                    )
+                    add_check(
+                        checks,
+                        f"{prefix}.{modality}.ui_contract",
+                        unorm_range and premultiplied,
+                        f"min={float(np.min(pixels))} max={float(np.max(pixels))} "
+                        f"maxRgbMinusAlpha={float(np.max(pixels[..., :3] - alpha[..., None]))}",
+                    )
                 statistics[f"{prefix}.{modality}"] = {
                     "size": list(actual_size),
                     "min": float(np.min(pixels)),
                     "max": float(np.max(pixels)),
                     "mean": float(np.mean(pixels)),
                 }
+
+            ui_diagnostics = pair.get("uiColorAlphaDiagnostics", {})
+            for phase, modality in (
+                ("t0", "ui_color_alpha_t0"),
+                ("tau", "ui_color_alpha_tau"),
+                ("t1", "ui_color_alpha_t1"),
+            ):
+                ui = ui_diagnostics.get(phase, {}) if isinstance(ui_diagnostics, dict) else {}
+                pixels = pair_pixels.get(modality)
+                if pixels is None:
+                    continue
+                alpha = pixels[..., 3]
+                nonzero = int(np.count_nonzero(alpha > (0.5 / 255.0)))
+                fractional = int(
+                    np.count_nonzero(
+                        (alpha > (0.5 / 255.0)) & (alpha < (254.5 / 255.0))
+                    )
+                )
+                ui_contract = (
+                    isinstance(ui, dict)
+                    and ui.get("pipelineStage")
+                    == "independent_slate_game_layer_before_scene_composite"
+                    and ui.get("colorEncoding") == "display_referred_srgb_png_unorm8"
+                    and ui.get("alphaSemantic")
+                    == "straight_coverage_zero_is_transparent_one_is_opaque"
+                    and ui.get("rgbSemantic") == "premultiplied_by_coverage_alpha"
+                    and ui.get("source")
+                    == "SGameLayerManager_without_enclosing_SViewport_scene_backbuffer"
+                    and ui.get("sceneIncluded") is False
+                    and ui.get("screenSpaceGameLayersIncluded") is True
+                    and ui.get("displayResolution") is True
+                    and tuple(ui.get("size", ())) == display_size
+                    and int(ui.get("nonzeroAlphaPixelCount", -1)) == nonzero
+                    and int(ui.get("fractionalAlphaPixelCount", -1)) == fractional
+                    and math.isclose(
+                        float(ui.get("minAlpha", math.nan)),
+                        float(alpha.min()),
+                        rel_tol=0.0,
+                        abs_tol=0.5 / 255.0,
+                    )
+                    and math.isclose(
+                        float(ui.get("maxAlpha", math.nan)),
+                        float(alpha.max()),
+                        rel_tol=0.0,
+                        abs_tol=0.5 / 255.0,
+                    )
+                )
+                add_check(
+                    checks,
+                    f"{prefix}.{modality}.metadata",
+                    ui_contract,
+                    json.dumps(
+                        {
+                            "size": ui.get("size") if isinstance(ui, dict) else None,
+                            "nonzero": [ui.get("nonzeroAlphaPixelCount"), nonzero]
+                            if isinstance(ui, dict)
+                            else [None, nonzero],
+                            "fractional": [ui.get("fractionalAlphaPixelCount"), fractional]
+                            if isinstance(ui, dict)
+                            else [None, fractional],
+                        },
+                        sort_keys=True,
+                    ),
+                )
+                add_check(
+                    checks,
+                    f"{prefix}.{modality}.fixture_alpha_coverage",
+                    ui.get("semanticValidationFixture") is True
+                    and nonzero > 0
+                    and fractional > 0
+                    and float(alpha.min()) == 0.0
+                    and float(alpha.max()) == 1.0,
+                    f"nonzero={nonzero} fractional={fractional} min={float(alpha.min())} max={float(alpha.max())}",
+                )
+
+            widget_policy = pair.get("worldSpaceWidgetPolicy", {})
+            for phase in ("t0", "tau", "t1"):
+                phase_policy = (
+                    widget_policy.get(phase, {})
+                    if isinstance(widget_policy, dict)
+                    else {}
+                )
+                policy_ok = bool(
+                    not hudless_world_widget_rejection_claimed
+                    or (
+                        isinstance(phase_policy, dict)
+                        and phase_policy.get("policy")
+                        == "reject_visible_registered_widget_components"
+                        and int(
+                            phase_policy.get(
+                                "activeVisibleRegisteredComponentCount", -1
+                            )
+                        )
+                        == 0
+                        and phase_policy.get(
+                            "activeVisibleRegisteredComponentPaths"
+                        )
+                        == []
+                    )
+                )
+                add_check(
+                    checks,
+                    f"{prefix}.world_ui_{phase}_zero_widget_component_residue",
+                    policy_ok,
+                    json.dumps(phase_policy, sort_keys=True),
+                )
 
             for direction, object_modality, motion_modality, valid_modality, expected in (
                 (
@@ -772,7 +1553,7 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
 
     passed = all(check["passed"] for check in checks)
     report = {
-        "validatorVersion": 4,
+        "validatorVersion": 7,
         "dataset": str(dataset),
         "contractVersion": manifest.get("contractVersion"),
         "certificationStatus": manifest.get("certificationStatus"),

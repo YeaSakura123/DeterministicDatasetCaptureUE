@@ -43,6 +43,7 @@ TEMPORAL_MODALITIES = (
 )
 REFERENCE_MODALITIES = ("color_hr_reference_scene_hdr",)
 HUDLESS_MODALITIES = ("color_main_view_hudless_after_tonemap",)
+UI_MODALITIES = ("ui_color_alpha",)
 MASK_MODALITIES = {
     "velocity_coverage",
     "motion_valid",
@@ -54,11 +55,13 @@ COLOR_MODALITIES = {"hr", "lr", "color_lr_scene_hdr"}
 COLOR_MODALITIES.add("color_hr_native_scene_hdr")
 COLOR_MODALITIES.add("color_hr_reference_scene_hdr")
 COLOR_MODALITIES.add("color_main_view_hudless_after_tonemap")
+COLOR_MODALITIES.add("ui_color_alpha")
 HR_TEMPORAL_MODALITIES = {
     "color_hr_native_scene_hdr",
     "color_hr_reference_scene_hdr",
     "color_main_view_hudless_after_tonemap",
 }
+HR_DISPLAY_MODALITIES = HR_TEMPORAL_MODALITIES | {"hr", "ui_color_alpha"}
 REPLAY_ROLES = {
     "Standard",
     "FrameGenerationEndpoints",
@@ -91,6 +94,12 @@ REPLAY_METADATA_FIELDS = (
     "sceneBoneCount",
     "sceneFXComponentCount",
     "sceneNiagaraComponentCount",
+    "sceneNiagaraEmitterCount",
+    "sceneNiagaraCPUEmitterCount",
+    "sceneNiagaraGPUEmitterCount",
+    "sceneNiagaraParticleCount",
+    "sceneNiagaraTotalSpawnedParticleCount",
+    "niagaraFrameStates",
     "sceneControllableActorCount",
     "sceneUncontrolledTickingActorCount",
     "sceneControllableActors",
@@ -103,12 +112,18 @@ REPLAY_METADATA_FIELDS = (
     "nativeHRDiagnostics",
     "referenceHRDiagnostics",
     "hudlessColorDiagnostics",
+    "uiColorAlphaDiagnostics",
     "replayPass",
     "previousCapturedLogicalFrameId",
     "motionPreviousLogicalFrameId",
     "motionTimeSpanFrames",
     "motionTimeSpanS",
     "motionTrainingUsable",
+    "materialTimeLogicalFrameLocked",
+    "materialTimeSeconds",
+    "materialPreviousLogicalFrameId",
+    "materialPreviousTimeSeconds",
+    "materialDeltaTimeSeconds",
     "endpointPreviousTransformOverride",
     "endpointPreviousSkeletalBoneOverride",
     "endpointPreviousSkeletalBoneComponentCount",
@@ -116,6 +131,16 @@ REPLAY_METADATA_FIELDS = (
     "endpointPreviousSkeletalBoneSkippedComponents",
     "auxiliaryCaptureOrder",
     "logicalEvaluationDirection",
+    "skeletalPoseCacheReplayEnabled",
+    "skeletalPoseCacheApplied",
+    "skeletalPoseCacheAppliedComponentCount",
+    "skeletalPoseCacheAppliedBoneCount",
+    "skeletalPoseCacheSkippedComponents",
+    "skeletalPoseCacheSource",
+    "skeletalPoseCacheArtifactSha1",
+    "projectAnimatedMaterialValidation",
+    "worldSpaceWidgetPolicy",
+    "nonFixtureSkeletalComponents",
 )
 
 
@@ -134,6 +159,8 @@ def expected_submission_modalities(job: dict[str, Any]) -> list[str]:
         else high_resolution + low_resolution
     )
     if job.get("bCaptureMainViewTemporalDiagnostics", False):
+        if job.get("bCaptureUIColorAlpha", False):
+            auxiliary.append("ui_layer")
         auxiliary.append("main_view_temporal")
     return auxiliary
 
@@ -149,6 +176,51 @@ def normalized_capture_order_provenance(provenance: dict[str, Any]) -> dict[str,
     normalized = dict(provenance)
     normalized.pop("captureConfigSha1", None)
     return normalized
+
+
+def normalized_vfx_reverse_job(job: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(job)
+    for field in (
+        "jobName",
+        "outputDirectory",
+        "replayPass",
+        "skeletalPoseCacheInputFile",
+        "skeletalPoseCacheOutputFile",
+    ):
+        normalized.pop(field, None)
+    return normalized
+
+
+def normalized_vfx_reverse_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(provenance)
+    normalized.pop("captureConfigSha1", None)
+    return normalized
+
+
+def niagara_fixture_state(frame: dict[str, Any]) -> dict[str, Any] | None:
+    expected_asset = str(
+        frame.get("semanticValidationFixture", {}).get("niagaraFixtureAsset", "")
+    )
+    for state in frame.get("niagaraFrameStates", []):
+        if isinstance(state, dict) and str(state.get("assetPath", "")) == expected_asset:
+            return state
+    return None
+
+
+def nonfixture_project_probe_states(
+    frame: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    states = frame.get("nonFixtureSkeletalComponents", [])
+    if not isinstance(states, list):
+        return {}
+    return {
+        str(state.get("componentPath")): state
+        for state in states
+        if isinstance(state, dict)
+        and state.get("isProjectValidationProbe") is True
+        and isinstance(state.get("componentPath"), str)
+        and state.get("componentPath")
+    }
 
 
 def sha1(path: Path) -> str:
@@ -210,6 +282,7 @@ def numeric_comparison(left: np.ndarray, right: np.ndarray) -> dict[str, float |
         return {"valid": False, "shapeMatch": False}
     difference = np.abs(left.astype(np.float64) - right.astype(np.float64))
     rgb_difference = difference[..., :3]
+    changed_pixels = np.max(rgb_difference, axis=-1) > 1e-6
     mse = float(np.mean(np.square(rgb_difference)))
     peak = max(float(np.max(np.abs(left[..., :3]))), float(np.max(np.abs(right[..., :3]))), 1.0)
     return {
@@ -218,6 +291,7 @@ def numeric_comparison(left: np.ndarray, right: np.ndarray) -> dict[str, float |
         "meanAbs": float(np.mean(rgb_difference)),
         "p99Abs": float(np.quantile(rgb_difference, 0.99)),
         "maxAbs": float(np.max(rgb_difference)),
+        "changedPixelFraction": float(np.mean(changed_pixels)),
         "psnrDb": math.inf if mse == 0.0 else float(10.0 * math.log10((peak * peak) / mse)),
     }
 
@@ -758,7 +832,13 @@ def validate_semantic_fixture_frame(
         covered = mask & (velocity_coverage == 1.0)
         covered_count = int(np.count_nonzero(covered))
         covered_fraction = covered_count / visible_pixels
-        if not frame.get("reset", False) or intermediate_replay:
+        expected_is_finite = expected_motion.shape == (2,) and bool(
+            np.all(np.isfinite(expected_motion))
+        )
+        expected_is_moving = expected_is_finite and bool(
+            np.max(np.abs(expected_motion)) > reset_tolerance
+        )
+        if (not frame.get("reset", False) or intermediate_replay) and expected_is_moving:
             add_check(
                 checks,
                 f"{prefix}.{label}_velocity_coverage",
@@ -772,6 +852,17 @@ def validate_semantic_fixture_frame(
                 f"{prefix}.{label}_reset_motion_zero",
                 bool(np.max(np.abs(reset_motion)) <= reset_tolerance),
                 f"max_abs={float(np.max(np.abs(reset_motion))):.9g}",
+            )
+        elif not expected_is_moving:
+            static_motion = pixels["motion_full_current_to_previous"][mask, :2]
+            add_check(
+                checks,
+                f"{prefix}.{label}_static_motion_zero",
+                expected_is_finite
+                and bool(np.max(np.abs(static_motion)) <= reset_tolerance),
+                f"expected={expected_motion.tolist()} "
+                f"max_abs={float(np.max(np.abs(static_motion))):.9g} "
+                f"covered={covered_count}",
             )
         elif covered_count:
             measured_motion = np.median(
@@ -853,6 +944,42 @@ def validate_semantic_fixture_frame(
         reactive_pixels >= 8 and float(np.max(transparency)) >= 0.05,
         f"pixels_gt_0.01={reactive_pixels} max={float(np.max(transparency)):.9g}",
     )
+
+    if fixture.get("niagaraVisibleProbeExpected") is True:
+        display_size = np.asarray(
+            frame.get("temporalDiagnostics", {}).get("displaySize", (0, 0)),
+            dtype=np.float64,
+        )
+        anchor = np.asarray(
+            fixture.get("niagaraAnchorDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        radius = float(fixture.get("niagaraValidationRadiusDisplayPixels", math.nan))
+        valid_probe = (
+            display_size.shape == (2,)
+            and np.all(display_size > 0)
+            and anchor.shape == (2,)
+            and np.all(np.isfinite(anchor))
+            and math.isfinite(radius)
+            and radius > 0
+        )
+        roi_pixels = np.empty((0,), dtype=transparency.dtype)
+        if valid_probe:
+            height, width = transparency.shape
+            scale = np.asarray((width, height), dtype=np.float64) / display_size
+            center = anchor * scale
+            radius_render = radius * scale[0]
+            yy, xx = np.ogrid[:height, :width]
+            roi = (xx - center[0]) ** 2 + (yy - center[1]) ** 2 <= radius_render**2
+            roi_pixels = transparency[roi]
+        visible_pixels = int(np.count_nonzero(roi_pixels > 0.01))
+        maximum = float(np.max(roi_pixels)) if roi_pixels.size else 0.0
+        add_check(
+            checks,
+            f"{prefix}.niagara_visible_after_dof_probe",
+            valid_probe and visible_pixels >= 8 and maximum >= 0.5,
+            f"pixels_gt_0.01={visible_pixels} max={maximum:.9g} anchor={anchor.tolist()} radius={radius}",
+        )
 
 
 def validate(
@@ -951,12 +1078,151 @@ def validate(
                 sort_keys=True,
             ),
         )
+    determinism_contract = manifest.get("determinismContract", {})
+    if job.get("bLockMaterialTimeToLogicalFrame", False):
+        add_check(
+            checks,
+            "material_time.logical_frame_contract",
+            determinism_contract.get("materialTimeEvaluation")
+            == "scene_view_family_game_time_current_and_signed_previous_from_logical_frame_ids_real_time_frozen",
+            str(determinism_contract.get("materialTimeEvaluation")),
+        )
+    if job.get("bRejectVisibleWidgetComponents", False):
+        add_check(
+            checks,
+            "world_ui.job_and_contract",
+            determinism_contract.get("worldSpaceWidgetPolicy")
+            == "reject_any_visible_registered_UWidgetComponent_before_and_during_capture",
+            str(determinism_contract.get("worldSpaceWidgetPolicy")),
+        )
+    if job.get("bControlNiagara", False):
+        add_check(
+            checks,
+            "niagara.absolute_age_contract",
+            determinism_contract.get("niagaraAbsoluteAge") is True
+            and determinism_contract.get("niagaraAgeEvaluation")
+            == "solo_absolute_fixed_step_advance_wait_for_concurrent_tick_and_finalize_before_capture"
+            and determinism_contract.get("niagaraInitialAgeWarmup")
+            == "progressive_fixed_age_ramp_normal_single_tick_plus_one_ulp_when_initial_age_nonzero"
+            and determinism_contract.get("niagaraPayloadEvidence")
+            == "cpu_emitter_particle_counts_and_visible_semantic_fixture_pixels_gpu_payload_not_read_back",
+            json.dumps(
+                {
+                    key: determinism_contract.get(key)
+                    for key in (
+                        "niagaraAbsoluteAge",
+                        "niagaraAgeEvaluation",
+                        "niagaraInitialAgeWarmup",
+                        "niagaraPayloadEvidence",
+                    )
+                },
+                sort_keys=True,
+            ),
+        )
+        add_check(
+            checks,
+            "niagara.forced_determinism_contract",
+            determinism_contract.get("niagaraForcedDeterminism")
+            is bool(job.get("bForceNiagaraDeterminism", False)),
+            str(determinism_contract.get("niagaraForcedDeterminism")),
+        )
+    if job.get("bValidateNonFixtureSkeletalAnimation", False):
+        add_check(
+            checks,
+            "skeletal_replay.job_and_contract",
+            job.get("bCacheSkeletalAnimationPosesForReplay") is True
+            and determinism_contract.get("skeletalAnimationReplay")
+            == "shared_or_forward_baked_component_space_pose_cache_by_logical_frame"
+            and determinism_contract.get("skeletalPoseCacheArtifact")
+            == "engine_versioned_binary_component_path_asset_bones_visibility_sha1"
+            and determinism_contract.get("nonFixtureSkeletalValidationEnabled") is True
+            and determinism_contract.get("nonFixtureSkeletalValidationActorClass")
+            == job.get("nonFixtureSkeletalValidationActorClass")
+            and str(job.get("nonFixtureSkeletalValidationActorClass", "")).startswith(
+                "/Game/"
+            ),
+            json.dumps(
+                {
+                    key: determinism_contract.get(key)
+                    for key in (
+                        "skeletalAnimationReplay",
+                        "skeletalPoseCacheArtifact",
+                        "nonFixtureSkeletalValidationEnabled",
+                        "nonFixtureSkeletalValidationActorClass",
+                    )
+                },
+                sort_keys=True,
+            ),
+        )
+    if job.get("bValidateProjectAnimatedMaterial", False):
+        add_check(
+            checks,
+            "material_replay.project_validation_contract",
+            job.get("bLockMaterialTimeToLogicalFrame") is True
+            and determinism_contract.get(
+                "projectAnimatedMaterialValidationEnabled"
+            )
+            is True
+            and determinism_contract.get(
+                "projectAnimatedMaterialValidationInterface"
+            )
+            == job.get("projectAnimatedMaterialValidationMaterial")
+            and determinism_contract.get(
+                "projectAnimatedMaterialValidationCarrier"
+            )
+            == "transient_labeled_engine_cube_with_project_material_interface"
+            and str(job.get("projectAnimatedMaterialValidationMaterial", "")).startswith(
+                "/Game/"
+            ),
+            json.dumps(
+                {
+                    key: determinism_contract.get(key)
+                    for key in (
+                        "projectAnimatedMaterialValidationEnabled",
+                        "projectAnimatedMaterialValidationInterface",
+                        "projectAnimatedMaterialValidationCarrier",
+                    )
+                },
+                sort_keys=True,
+            ),
+        )
+    if job.get("bUseDeterministicCameraTransform", False):
+        add_check(
+            checks,
+            "camera.deterministic_override_contract",
+            determinism_contract.get("cameraEvaluation")
+            == "explicit_transient_player_view_target_locked_each_tick",
+            str(determinism_contract.get("cameraEvaluation")),
+        )
+    if job.get("bSuppressMainViewOnUncapturedFrames", False):
+        add_check(
+            checks,
+            "replay.uncaptured_renderer_prime_contract",
+            determinism_contract.get("uncapturedRendererPrime")
+            == "offscreen_scene_capture_64_pixel_long_edge_without_player_main_view_history",
+            str(determinism_contract.get("uncapturedRendererPrime")),
+        )
     provenance = manifest.get("provenance", {})
     add_check(checks, "provenance_present", isinstance(provenance, dict) and bool(provenance), "present")
     for name in ("captureConfigSha1", "cvarProfileSha1", "contentMapSha1", "shaderSourceSha1"):
         value = str(provenance.get(name, ""))
         valid_hash = len(value) == 40 and all(character in "0123456789ABCDEFabcdef" for character in value)
         add_check(checks, f"provenance.{name}", valid_hash, value)
+    if job.get("bCacheSkeletalAnimationPosesForReplay", False) and (
+        job.get("skeletalPoseCacheInputFile")
+        or job.get("skeletalPoseCacheOutputFile")
+    ):
+        artifact_hash = str(provenance.get("skeletalPoseCacheArtifactSha1", ""))
+        add_check(
+            checks,
+            "provenance.skeletal_pose_cache_artifact",
+            len(artifact_hash) == 40
+            and all(
+                character in "0123456789ABCDEFabcdef"
+                for character in artifact_hash
+            ),
+            artifact_hash,
+        )
     streaming_hash = str(provenance.get("streamingStateAfterBarrierSha1", ""))
     valid_streaming_hash = len(streaming_hash) == 40 and all(
         character in "0123456789ABCDEFabcdef" for character in streaming_hash
@@ -1022,6 +1288,13 @@ def validate(
             cvars.get("r.Velocity.EnableVertexDeformation") == "1",
             str(cvars.get("r.Velocity.EnableVertexDeformation")),
         )
+    if temporal_enabled:
+        add_check(
+            checks,
+            "provenance.custom_stencil_enabled",
+            cvars.get("r.CustomDepth") == "3",
+            str(cvars.get("r.CustomDepth")),
+        )
     if job.get("bForceSynchronousRendering", False):
         synchronous_names = (
             "r.RDG.ParallelExecute",
@@ -1055,6 +1328,12 @@ def validate(
     frame_paths: dict[tuple[int, str], Path] = {}
     temporal_records: list[tuple[int, dict[str, Any], bool]] = []
     semantic_records: list[tuple[int, dict[str, Any], dict[str, np.ndarray]]] = []
+    nonfixture_skeletal_records: list[
+        tuple[int, dict[str, dict[str, Any]], bool, dict[str, np.ndarray]]
+    ] = []
+    project_animated_material_records: list[
+        tuple[int, dict[str, Any], np.ndarray]
+    ] = []
     all_render_submission_ids: list[int] = []
     for frame in frames:
         frame_id = int(frame["logicalFrameId"])
@@ -1065,6 +1344,99 @@ def validate(
             frame_role == replay_role,
             f"expected={replay_role} actual={frame_role}",
         )
+        widget_policy = frame.get("worldSpaceWidgetPolicy", {})
+        if job.get("bRejectVisibleWidgetComponents", False):
+            widget_policy_ok = bool(
+                isinstance(widget_policy, dict)
+                and widget_policy.get("policy")
+                == "reject_visible_registered_widget_components"
+                and int(
+                    widget_policy.get(
+                        "activeVisibleRegisteredComponentCount", -1
+                    )
+                )
+                == 0
+                and widget_policy.get(
+                    "activeVisibleRegisteredComponentPaths"
+                )
+                == []
+            )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.world_ui_zero_widget_component_residue",
+                widget_policy_ok,
+                json.dumps(widget_policy, sort_keys=True),
+            )
+        if job.get("bUseDeterministicCameraTransform", False):
+            camera = frame.get("camera", {})
+            configured_location = job.get("deterministicCameraLocationCm", {})
+            configured_rotation = job.get(
+                "deterministicCameraRotationDegrees", {}
+            )
+            expected_location = np.asarray(
+                [
+                    configured_location.get("x", math.nan),
+                    configured_location.get("y", math.nan),
+                    configured_location.get("z", math.nan),
+                ],
+                dtype=np.float64,
+            )
+            expected_rotation = np.asarray(
+                [
+                    configured_rotation.get("pitch", math.nan),
+                    configured_rotation.get("yaw", math.nan),
+                    configured_rotation.get("roll", math.nan),
+                ],
+                dtype=np.float64,
+            )
+            actual_location = np.asarray(
+                camera.get("locationCm", (math.nan,) * 3), dtype=np.float64
+            )
+            actual_rotation = np.asarray(
+                camera.get("rotationDeg", (math.nan,) * 3), dtype=np.float64
+            )
+            expected_fov = float(
+                job.get("deterministicCameraFOVDegrees", math.nan)
+            )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.deterministic_camera_exact",
+                actual_location.shape == (3,)
+                and actual_rotation.shape == (3,)
+                and bool(
+                    np.allclose(
+                        actual_location,
+                        expected_location,
+                        rtol=0.0,
+                        atol=1e-5,
+                    )
+                )
+                and bool(
+                    np.allclose(
+                        actual_rotation,
+                        expected_rotation,
+                        rtol=0.0,
+                        atol=1e-5,
+                    )
+                )
+                and math.isclose(
+                    float(camera.get("fovDegrees", math.nan)),
+                    expected_fov,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ),
+                json.dumps(
+                    {
+                        "expectedLocation": expected_location.tolist(),
+                        "actualLocation": actual_location.tolist(),
+                        "expectedRotation": expected_rotation.tolist(),
+                        "actualRotation": actual_rotation.tolist(),
+                        "expectedFov": expected_fov,
+                        "actualFov": camera.get("fovDegrees"),
+                    },
+                    sort_keys=True,
+                ),
+            )
         motion_training_usable = frame.get("motionTrainingUsable")
         expected_motion_training_usable = replay_role != "FrameGenerationIntermediate"
         add_check(
@@ -1132,7 +1504,15 @@ def validate(
         actual_modalities = [str(item.get("modality")) for item in submissions]
         submission_ids = [int(item.get("renderSubmissionId", -1)) for item in submissions]
         expected_view_states = [
-            "player_main_view" if modality == "main_view_temporal" else f"{modality}_scene_capture"
+            (
+                "player_main_view"
+                if modality == "main_view_temporal"
+                else (
+                    "independent_slate_game_layer"
+                    if modality == "ui_layer"
+                    else f"{modality}_scene_capture"
+                )
+            )
             for modality in actual_modalities
         ]
         actual_view_states = [str(item.get("viewState")) for item in submissions]
@@ -1195,6 +1575,12 @@ def validate(
         bone_count = int(frame.get("sceneBoneCount", -1))
         fx_count = int(frame.get("sceneFXComponentCount", -1))
         niagara_count = int(frame.get("sceneNiagaraComponentCount", -1))
+        niagara_emitter_count = int(frame.get("sceneNiagaraEmitterCount", -1))
+        niagara_cpu_emitter_count = int(frame.get("sceneNiagaraCPUEmitterCount", -1))
+        niagara_gpu_emitter_count = int(frame.get("sceneNiagaraGPUEmitterCount", -1))
+        niagara_particle_count = int(frame.get("sceneNiagaraParticleCount", -1))
+        niagara_total_spawned = int(frame.get("sceneNiagaraTotalSpawnedParticleCount", -1))
+        niagara_states = frame.get("niagaraFrameStates", [])
         controllable_count = int(frame.get("sceneControllableActorCount", -1))
         uncontrolled_ticking_count = int(frame.get("sceneUncontrolledTickingActorCount", -1))
         controllable_actors = frame.get("sceneControllableActors", [])
@@ -1209,6 +1595,14 @@ def validate(
             and bone_count >= 0
             and (skeletal_count > 0 or bone_count == 0)
             and 0 <= niagara_count <= fx_count <= component_count
+            and niagara_emitter_count >= 0
+            and niagara_cpu_emitter_count >= 0
+            and niagara_gpu_emitter_count >= 0
+            and niagara_cpu_emitter_count + niagara_gpu_emitter_count == niagara_emitter_count
+            and niagara_particle_count >= 0
+            and niagara_total_spawned >= niagara_particle_count
+            and isinstance(niagara_states, list)
+            and len(niagara_states) == niagara_count
             and 0 <= controllable_count <= actor_count
             and 0 <= uncontrolled_ticking_count <= actor_count
             and isinstance(controllable_actors, list)
@@ -1218,7 +1612,7 @@ def validate(
             and len(uncontrolled_ticking_actors) == uncontrolled_ticking_count
             and len(set(uncontrolled_ticking_actors)) == uncontrolled_ticking_count
             and frame.get("sceneStateHashScope")
-            == "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_state_cascade_component_state_not_particle_payload",
+            == "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back",
             json.dumps(
                 {
                     "sha1": scene_state_hash,
@@ -1228,6 +1622,11 @@ def validate(
                     "bones": bone_count,
                     "fxComponents": fx_count,
                     "niagaraComponents": niagara_count,
+                    "niagaraEmitters": niagara_emitter_count,
+                    "niagaraCPUEmitters": niagara_cpu_emitter_count,
+                    "niagaraGPUEmitters": niagara_gpu_emitter_count,
+                    "niagaraParticles": niagara_particle_count,
+                    "niagaraTotalSpawned": niagara_total_spawned,
                     "controllableActors": controllable_count,
                     "uncontrolledTickingActors": uncontrolled_ticking_count,
                     "uncontrolledTickingActorPaths": uncontrolled_ticking_actors,
@@ -1235,6 +1634,89 @@ def validate(
                 sort_keys=True,
             ),
         )
+        if job.get("bControlNiagara", False):
+            state_totals_valid = all(
+                isinstance(state, dict)
+                and int(state.get("emitterCount", -1))
+                == int(state.get("cpuEmitterCount", -2)) + int(state.get("gpuEmitterCount", -2))
+                and int(state.get("particleCount", -1)) >= 0
+                and int(state.get("totalSpawnedParticleCount", -1))
+                >= int(state.get("particleCount", 0))
+                and state.get("soloInstanceObservable") is True
+                and len(state.get("emitterDeterminism", []))
+                == int(state.get("emitterCount", -1))
+                and len(state.get("emitterRandomSeeds", []))
+                == int(state.get("emitterCount", -1))
+                and (
+                    not job.get("bForceNiagaraDeterminism", False)
+                    or all(value is True for value in state.get("emitterDeterminism", []))
+                )
+                for state in niagara_states
+            )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.niagara_state_totals",
+                state_totals_valid
+                and sum(int(state["emitterCount"]) for state in niagara_states)
+                == niagara_emitter_count
+                and sum(int(state["cpuEmitterCount"]) for state in niagara_states)
+                == niagara_cpu_emitter_count
+                and sum(int(state["gpuEmitterCount"]) for state in niagara_states)
+                == niagara_gpu_emitter_count
+                and sum(int(state["particleCount"]) for state in niagara_states)
+                == niagara_particle_count
+                and sum(int(state["totalSpawnedParticleCount"]) for state in niagara_states)
+                == niagara_total_spawned,
+                json.dumps(niagara_states, sort_keys=True),
+            )
+            if job.get("bEnableSemanticValidationFixture", False):
+                fixture_state = niagara_fixture_state(frame)
+                fixed_delta = np.float32(
+                    frame_rate_denominator / frame_rate_numerator
+                )
+                expected_age = float(np.float32(frame_id) * fixed_delta)
+                age_error = (
+                    abs(float(fixture_state.get("simulationAgeS", math.nan)) - expected_age)
+                    if fixture_state is not None
+                    else math.inf
+                )
+                desired_age_error = (
+                    float(fixture_state.get("desiredAgeS", math.nan)) - expected_age
+                    if fixture_state is not None
+                    else math.inf
+                )
+                expected_asset = "/SuperResolutionDataset/Validation/NS_SRDatasetVFXFixture.NS_SRDatasetVFXFixture"
+                add_check(
+                    checks,
+                    f"frame_{frame_id:06d}.niagara_fixture_absolute_state",
+                    fixture_state is not None
+                    and fixture_state.get("assetPath") == expected_asset
+                    and fixture_state.get("soloInstanceObservable") is True
+                    and (
+                        not job.get("bForceNiagaraDeterminism", False)
+                        or fixture_state.get("systemDeterminism") is True
+                    )
+                    and fixture_state.get("systemFixedTick") is True
+                    and abs(float(fixture_state.get("systemFixedTickS", math.nan)) - float(fixed_delta)) <= 1e-7
+                    and age_error <= 1e-6
+                    and 0.0 <= desired_age_error <= 1e-6
+                    and int(fixture_state.get("emitterCount", -1)) == 1
+                    and int(fixture_state.get("cpuEmitterCount", -1)) == 1
+                    and int(fixture_state.get("gpuEmitterCount", -1)) == 0
+                    and int(fixture_state.get("rendererCount", -1)) == 1
+                    and fixture_state.get("emitterDeterminism") == [True]
+                    and len(fixture_state.get("emitterRandomSeeds", [])) == 1,
+                    f"expectedAge={expected_age:.9g} ageError={age_error:.9g} desiredAgeError={desired_age_error:.9g} state={json.dumps(fixture_state, sort_keys=True)}",
+                )
+                if frame.get("semanticValidationFixture", {}).get("niagaraVisibleProbeExpected") is True:
+                    add_check(
+                        checks,
+                        f"frame_{frame_id:06d}.niagara_fixture_nonzero_particle_payload",
+                        fixture_state is not None
+                        and int(fixture_state.get("particleCount", 0)) >= 100
+                        and int(fixture_state.get("totalSpawnedParticleCount", 0)) >= 100,
+                        json.dumps(fixture_state, sort_keys=True),
+                    )
         motion_span_frames = int(frame.get("motionTimeSpanFrames", -1))
         motion_span_seconds = float(frame.get("motionTimeSpanS", math.nan))
         expected_motion_seconds = (
@@ -1249,6 +1731,93 @@ def validate(
             and math.isclose(motion_span_seconds, expected_motion_seconds, rel_tol=0.0, abs_tol=1e-9),
             f"frames={motion_span_frames} seconds={motion_span_seconds} expected={expected_motion_seconds}",
         )
+        if job.get("bLockMaterialTimeToLogicalFrame", False) and valid_frame_rate:
+            material_current_time = (
+                frame_id * frame_rate_denominator / frame_rate_numerator
+            )
+            material_previous_frame = int(
+                frame.get("materialPreviousLogicalFrameId", frame_id)
+            )
+            material_previous_time = (
+                material_previous_frame
+                * frame_rate_denominator
+                / frame_rate_numerator
+            )
+            material_delta_time = material_current_time - material_previous_time
+            material_frame_contract = bool(
+                frame.get("materialTimeLogicalFrameLocked") is True
+                and math.isclose(
+                    float(frame.get("materialTimeSeconds", math.nan)),
+                    material_current_time,
+                    rel_tol=0.0,
+                    abs_tol=1e-7,
+                )
+                and math.isclose(
+                    float(frame.get("materialPreviousTimeSeconds", math.nan)),
+                    material_previous_time,
+                    rel_tol=0.0,
+                    abs_tol=1e-7,
+                )
+                and math.isclose(
+                    float(frame.get("materialDeltaTimeSeconds", math.nan)),
+                    material_delta_time,
+                    rel_tol=0.0,
+                    abs_tol=1e-7,
+                )
+            )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.material_logical_time",
+                material_frame_contract,
+                json.dumps(
+                    {
+                        "expectedCurrent": material_current_time,
+                        "expectedPrevious": material_previous_time,
+                        "expectedDelta": material_delta_time,
+                        "actualCurrent": frame.get("materialTimeSeconds"),
+                        "actualPreviousFrame": frame.get(
+                            "materialPreviousLogicalFrameId"
+                        ),
+                        "actualPrevious": frame.get("materialPreviousTimeSeconds"),
+                        "actualDelta": frame.get("materialDeltaTimeSeconds"),
+                    },
+                    sort_keys=True,
+                ),
+            )
+            for metadata_name in (
+                "temporalDiagnostics",
+                "nativeHRDiagnostics",
+                "referenceHRDiagnostics",
+                "hudlessColorDiagnostics",
+            ):
+                metadata = frame.get(metadata_name)
+                if not isinstance(metadata, dict):
+                    continue
+                render_current = float(metadata.get("renderGameTimeS", math.nan))
+                render_delta = float(metadata.get("renderDeltaTimeS", math.nan))
+                render_time_ok = bool(
+                    math.isfinite(render_current)
+                    and math.isfinite(render_delta)
+                    and math.isclose(
+                        render_current,
+                        material_current_time,
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                    and math.isclose(
+                        render_delta,
+                        material_delta_time,
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                )
+                add_check(
+                    checks,
+                    f"frame_{frame_id:06d}.{metadata_name}.material_logical_time",
+                    render_time_ok,
+                    f"current={render_current} expectedCurrent={material_current_time} "
+                    f"delta={render_delta} expectedDelta={material_delta_time}",
+                )
         files = frame.get("files", {})
         hashes = frame.get("sha1", {})
         frame_pixels: dict[str, np.ndarray] = {}
@@ -1259,6 +1828,8 @@ def validate(
             required.extend(REFERENCE_MODALITIES)
         if job.get("bCaptureMainViewHUDlessColor", False):
             required.extend(HUDLESS_MODALITIES)
+        if job.get("bCaptureUIColorAlpha", False):
+            required.extend(UI_MODALITIES)
         for modality in required:
             relative = files.get(modality)
             try:
@@ -1289,8 +1860,35 @@ def validate(
 
             if path.suffix.lower() == ".png":
                 size = png_size(path)
-                expected_size = hr_size if modality == "hr" else lr_size
+                expected_size = hr_size if modality in HR_DISPLAY_MODALITIES else lr_size
                 add_check(checks, f"frame_{frame_id:06d}.{modality}.size", size == expected_size, f"{size}")
+                if modality in UI_MODALITIES:
+                    pixels = png_rgba(path)
+                    frame_pixels[modality] = pixels
+                    finite = np.isfinite(pixels)
+                    add_check(
+                        checks,
+                        f"frame_{frame_id:06d}.{modality}.finite",
+                        bool(finite.all()),
+                        f"finite_fraction={finite.mean():.9f}",
+                    )
+                    add_check(
+                        checks,
+                        f"frame_{frame_id:06d}.{modality}.unorm_range",
+                        bool((pixels >= 0.0).all() and (pixels <= 1.0).all()),
+                        f"min={float(pixels.min()):.9f} max={float(pixels.max()):.9f}",
+                    )
+                    channel_min = np.min(pixels, axis=(0, 1))
+                    channel_max = np.max(pixels, axis=(0, 1))
+                    channel_mean = np.mean(pixels, axis=(0, 1))
+                    stats.setdefault(modality, []).append(
+                        {
+                            "logicalFrameId": frame_id,
+                            "minRGBA": channel_min.tolist(),
+                            "maxRGBA": channel_max.tolist(),
+                            "meanRGBA": channel_mean.tolist(),
+                        }
+                    )
                 continue
 
             pixels = exr_rgba(path)
@@ -1349,10 +1947,20 @@ def validate(
                         bool(result["valid"]),
                         json.dumps(result, sort_keys=True),
                     )
-                for name in ("preExposure", "exposure", "renderDeltaTimeS"):
+                for name in ("preExposure", "exposure"):
                     value = temporal.get(name)
                     valid = isinstance(value, (int, float)) and math.isfinite(value) and value > 0
                     add_check(checks, f"frame_{frame_id:06d}.{name}.positive", valid, str(value))
+                render_delta = temporal.get("renderDeltaTimeS")
+                valid_render_delta = isinstance(render_delta, (int, float)) and math.isfinite(
+                    render_delta
+                )
+                add_check(
+                    checks,
+                    f"frame_{frame_id:06d}.renderDeltaTimeS.finite_signed",
+                    valid_render_delta,
+                    str(render_delta),
+                )
 
                 if job.get("bLockTemporalJitterToLogicalFrame", False):
                     sequence_length = int(job.get("temporalJitterSequenceLength", 0))
@@ -1424,6 +2032,350 @@ def validate(
                             and int(hudless.get("colorGamut", -2)) == expected_color_gamut,
                             f"metadata_device={hudless.get('outputDevice')} cvar_device={expected_output_device} metadata_gamut={hudless.get('colorGamut')} cvar_gamut={expected_color_gamut}",
                         )
+                if job.get("bCaptureUIColorAlpha", False):
+                    ui = frame.get("uiColorAlphaDiagnostics")
+                    ui_pixels = frame_pixels.get("ui_color_alpha")
+                    add_check(
+                        checks,
+                        f"frame_{frame_id:06d}.ui_color_alpha_metadata",
+                        isinstance(ui, dict),
+                        "present",
+                    )
+                    if isinstance(ui, dict) and ui_pixels is not None:
+                        alpha = ui_pixels[..., 3]
+                        nonzero = int(np.count_nonzero(alpha > (0.5 / 255.0)))
+                        fractional = int(
+                            np.count_nonzero(
+                                (alpha > (0.5 / 255.0)) & (alpha < (254.5 / 255.0))
+                            )
+                        )
+                        metadata_ok = (
+                            ui.get("pipelineStage")
+                            == "independent_slate_game_layer_before_scene_composite"
+                            and ui.get("colorEncoding")
+                            == "display_referred_srgb_png_unorm8"
+                            and ui.get("alphaSemantic")
+                            == "straight_coverage_zero_is_transparent_one_is_opaque"
+                            and ui.get("rgbSemantic") == "premultiplied_by_coverage_alpha"
+                            and ui.get("source")
+                            == "SGameLayerManager_without_enclosing_SViewport_scene_backbuffer"
+                            and ui.get("sceneIncluded") is False
+                            and ui.get("screenSpaceGameLayersIncluded") is True
+                            and ui.get("displayResolution") is True
+                            and tuple(ui.get("size", ())) == hr_size
+                            and int(ui.get("nonzeroAlphaPixelCount", -1)) == nonzero
+                            and int(ui.get("fractionalAlphaPixelCount", -1)) == fractional
+                            and math.isclose(
+                                float(ui.get("minAlpha", math.nan)),
+                                float(alpha.min()),
+                                rel_tol=0.0,
+                                abs_tol=0.5 / 255.0,
+                            )
+                            and math.isclose(
+                                float(ui.get("maxAlpha", math.nan)),
+                                float(alpha.max()),
+                                rel_tol=0.0,
+                                abs_tol=0.5 / 255.0,
+                            )
+                        )
+                        add_check(
+                            checks,
+                            f"frame_{frame_id:06d}.ui_color_alpha_contract",
+                            metadata_ok,
+                            json.dumps(
+                                {
+                                    "size": ui.get("size"),
+                                    "nonzero": [ui.get("nonzeroAlphaPixelCount"), nonzero],
+                                    "fractional": [ui.get("fractionalAlphaPixelCount"), fractional],
+                                    "minAlpha": [ui.get("minAlpha"), float(alpha.min())],
+                                    "maxAlpha": [ui.get("maxAlpha"), float(alpha.max())],
+                                },
+                                sort_keys=True,
+                            ),
+                        )
+                        rgb_le_alpha = bool(
+                            (ui_pixels[..., :3] <= alpha[..., None] + (1.0 / 255.0)).all()
+                        )
+                        add_check(
+                            checks,
+                            f"frame_{frame_id:06d}.ui_premultiplied_rgb_bound",
+                            rgb_le_alpha,
+                            f"max_rgb_minus_alpha={float(np.max(ui_pixels[..., :3] - alpha[..., None])):.9f}",
+                        )
+                        if ui.get("semanticValidationFixture") is True:
+                            probes = ui.get("validationProbes", [])
+                            probe_results: dict[str, Any] = {}
+                            probes_ok = isinstance(probes, list) and len(probes) == 3
+                            height, width, _ = ui_pixels.shape
+                            for probe in probes if isinstance(probes, list) else []:
+                                try:
+                                    name = str(probe["name"])
+                                    minimum = np.asarray(probe["normalizedMin"], dtype=np.float64)
+                                    extent = np.asarray(probe["normalizedExtent"], dtype=np.float64)
+                                    straight = np.asarray(probe["straightRGBA"], dtype=np.float64)
+                                    x = min(width - 1, max(0, int(round((minimum[0] + 0.5 * extent[0]) * width))))
+                                    y = min(height - 1, max(0, int(round((minimum[1] + 0.5 * extent[1]) * height))))
+                                    actual = ui_pixels[y, x].astype(np.float64)
+                                    expected = straight.copy()
+                                    expected[:3] *= expected[3]
+                                    matched = bool(np.allclose(actual, expected, rtol=0.0, atol=1.5 / 255.0))
+                                    probes_ok = probes_ok and matched
+                                    probe_results[name] = {
+                                        "actual": actual.tolist(),
+                                        "expectedPremultiplied": expected.tolist(),
+                                    }
+                                except Exception as exc:
+                                    probes_ok = False
+                                    probe_results[str(probe)] = {"error": str(exc)}
+                            add_check(
+                                checks,
+                                f"frame_{frame_id:06d}.ui_validation_probes",
+                                probes_ok,
+                                json.dumps(probe_results, sort_keys=True),
+                            )
+
+        if job.get("bValidateNonFixtureSkeletalAnimation", False):
+            states = frame.get("nonFixtureSkeletalComponents", [])
+            cache_skips = frame.get("skeletalPoseCacheSkippedComponents")
+            cache_components = int(
+                frame.get("skeletalPoseCacheAppliedComponentCount", -1)
+            )
+            cache_bones = int(frame.get("skeletalPoseCacheAppliedBoneCount", -1))
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.skeletal_pose_cache_applied",
+                frame.get("skeletalPoseCacheReplayEnabled") is True
+                and frame.get("skeletalPoseCacheApplied") is True
+                and cache_components > 0
+                and cache_bones > 0
+                and isinstance(cache_skips, list)
+                and not cache_skips,
+                json.dumps(
+                    {
+                        "enabled": frame.get("skeletalPoseCacheReplayEnabled"),
+                        "applied": frame.get("skeletalPoseCacheApplied"),
+                        "components": cache_components,
+                        "bones": cache_bones,
+                        "skipped": cache_skips,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            expected_cache_source = (
+                "shared_artifact"
+                if job.get("skeletalPoseCacheInputFile")
+                else "forward_warmup_bake"
+            )
+            frame_artifact_hash = str(
+                frame.get("skeletalPoseCacheArtifactSha1", "")
+            )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.skeletal_pose_cache_artifact",
+                frame.get("skeletalPoseCacheSource") == expected_cache_source
+                and len(frame_artifact_hash) == 40
+                and frame_artifact_hash
+                == str(provenance.get("skeletalPoseCacheArtifactSha1", "")),
+                json.dumps(
+                    {
+                        "source": frame.get("skeletalPoseCacheSource"),
+                        "expectedSource": expected_cache_source,
+                        "frameSha1": frame_artifact_hash,
+                        "provenanceSha1": provenance.get(
+                            "skeletalPoseCacheArtifactSha1"
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+            )
+            state_list = states if isinstance(states, list) else []
+            component_paths = [
+                str(state.get("componentPath", ""))
+                for state in state_list
+                if isinstance(state, dict)
+            ]
+            object_ids = [
+                int(state.get("objectId", -1))
+                for state in state_list
+                if isinstance(state, dict)
+            ]
+            state_schema_ok = (
+                bool(state_list)
+                and len(component_paths) == len(state_list)
+                and all(component_paths)
+                and len(set(component_paths)) == len(component_paths)
+                and len(object_ids) == len(state_list)
+                and len(set(object_ids)) == len(object_ids)
+                and all(1 <= object_id <= 254 for object_id in object_ids)
+                and all(
+                    isinstance(state, dict)
+                    and state.get("projectAsset") is True
+                    and str(state.get("skinnedAssetPath", "")).startswith("/Game/")
+                    and int(state.get("boneCount", 0)) > 0
+                    and len(str(state.get("poseSha1", ""))) == 40
+                    and all(
+                        character in "0123456789ABCDEFabcdef"
+                        for character in str(state.get("poseSha1", ""))
+                    )
+                    and state.get("registered") is True
+                    for state in state_list
+                )
+            )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.nonfixture_skeletal_state_schema",
+                state_schema_ok,
+                f"states={len(state_list)} components={component_paths} objectIds={object_ids}",
+            )
+            probe_states = nonfixture_project_probe_states(frame)
+            configured_actor_class = str(
+                job.get("nonFixtureSkeletalValidationActorClass", "")
+            )
+            probe_schema_ok = bool(probe_states) and all(
+                state.get("ownerClass") == configured_actor_class
+                and state.get("animationMode") == "AnimationBlueprint"
+                and str(state.get("animationInstanceClass", "")).startswith("/Game/")
+                and state.get("visible") is True
+                and state.get("poseSha1") == state.get("cachedPoseSha1")
+                and float(state.get("currentToCachedPoseMaxMatrixAbs", math.inf))
+                <= 1e-9
+                for state in probe_states.values()
+            )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.project_anim_blueprint_probe",
+                probe_schema_ok,
+                json.dumps(probe_states, sort_keys=True),
+            )
+
+            object_id_pixels = frame_pixels.get("object_id")
+            motion_pixels = frame_pixels.get("motion_full_current_to_previous")
+            motion_valid_pixels = frame_pixels.get("motion_valid")
+            probe_metrics: dict[str, Any] = {}
+            visible_probe = False
+            moving_probe = False
+            if (
+                object_id_pixels is not None
+                and motion_pixels is not None
+                and motion_valid_pixels is not None
+            ):
+                ids = np.rint(object_id_pixels[..., 0]).astype(np.int32)
+                motion_valid = motion_valid_pixels[..., 0] == 1.0
+                motion_magnitude = np.linalg.norm(motion_pixels[..., :2], axis=-1)
+                for component_path, state in probe_states.items():
+                    object_id = int(state.get("objectId", -1))
+                    visible_mask = ids == object_id
+                    covered_mask = visible_mask & motion_valid
+                    visible_count = int(np.count_nonzero(visible_mask))
+                    covered_count = int(np.count_nonzero(covered_mask))
+                    p95_motion = (
+                        float(np.percentile(motion_magnitude[covered_mask], 95.0))
+                        if covered_count
+                        else 0.0
+                    )
+                    visible_probe = visible_probe or visible_count >= 20
+                    moving_probe = moving_probe or (
+                        covered_count >= 20 and p95_motion > 0.05
+                    )
+                    probe_metrics[component_path] = {
+                        "objectId": object_id,
+                        "visiblePixels": visible_count,
+                        "motionCoveredPixels": covered_count,
+                        "motionP95DisplayPixels": p95_motion,
+                    }
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.project_skeletal_probe_visible",
+                visible_probe,
+                json.dumps(probe_metrics, sort_keys=True),
+            )
+            if frame.get("reset") is not True:
+                add_check(
+                    checks,
+                    f"frame_{frame_id:06d}.project_skeletal_probe_endpoint_motion",
+                    moving_probe,
+                    json.dumps(probe_metrics, sort_keys=True),
+                )
+            nonfixture_skeletal_records.append(
+                (
+                    frame_id,
+                    probe_states,
+                    frame.get("reset") is True,
+                    frame_pixels,
+                )
+            )
+
+        if job.get("bValidateProjectAnimatedMaterial", False):
+            material_state = frame.get("projectAnimatedMaterialValidation", {})
+            configured_interface = str(
+                job.get("projectAnimatedMaterialValidationMaterial", "")
+            )
+            schema_ok = bool(
+                isinstance(material_state, dict)
+                and material_state.get("enabled") is True
+                and material_state.get("materialInterfacePath")
+                == configured_interface
+                and str(material_state.get("baseMaterialPath", "")).startswith(
+                    "/Game/"
+                )
+                and material_state.get("projectAuthoredInterface") is True
+                and material_state.get("projectAuthoredBaseMaterial") is True
+                and material_state.get("registered") is True
+                and material_state.get("visible") is True
+                and int(material_state.get("receiverObjectId", -1)) == 150
+                and math.isclose(
+                    float(
+                        material_state.get("logicalGameTimeSeconds", math.nan)
+                    ),
+                    float(frame.get("materialTimeSeconds", math.nan)),
+                    rel_tol=0.0,
+                    abs_tol=1e-7,
+                )
+                and math.isclose(
+                    float(
+                        material_state.get(
+                            "previousLogicalGameTimeSeconds", math.nan
+                        )
+                    ),
+                    float(frame.get("materialPreviousTimeSeconds", math.nan)),
+                    rel_tol=0.0,
+                    abs_tol=1e-7,
+                )
+            )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.project_animated_material_schema",
+                schema_ok,
+                json.dumps(material_state, sort_keys=True),
+            )
+            object_id_pixels = frame_pixels.get("object_id")
+            color_pixels = frame_pixels.get("color_lr_scene_hdr")
+            visible_count = 0
+            receiver_color = np.asarray((math.nan, math.nan, math.nan))
+            if object_id_pixels is not None and color_pixels is not None:
+                receiver_mask = (
+                    np.rint(object_id_pixels[..., 0]).astype(np.int32) == 150
+                )
+                visible_count = int(np.count_nonzero(receiver_mask))
+                if visible_count:
+                    receiver_color = np.mean(
+                        color_pixels[..., :3][receiver_mask], axis=0
+                    )
+            receiver_visible = bool(
+                visible_count >= 20
+                and receiver_color.shape == (3,)
+                and np.all(np.isfinite(receiver_color))
+                and float(np.max(np.abs(receiver_color))) > 0.001
+            )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.project_animated_material_visible",
+                receiver_visible,
+                f"pixels={visible_count} meanRgb={receiver_color.tolist()}",
+            )
+            project_animated_material_records.append(
+                (frame_id, material_state, receiver_color)
+            )
 
     add_check(
         checks,
@@ -1432,6 +2384,134 @@ def validate(
         or all_render_submission_ids == list(range(len(all_render_submission_ids))),
         f"count={len(all_render_submission_ids)} first={all_render_submission_ids[:4]} last={all_render_submission_ids[-4:]}",
     )
+
+    if job.get("bValidateProjectAnimatedMaterial", False):
+        material_colors = [
+            color
+            for _, _, color in project_animated_material_records
+            if color.shape == (3,) and np.all(np.isfinite(color))
+        ]
+        max_color_change = 0.0
+        for left_index in range(len(material_colors)):
+            for right_index in range(left_index + 1, len(material_colors)):
+                max_color_change = max(
+                    max_color_change,
+                    float(
+                        np.max(
+                            np.abs(
+                                material_colors[left_index]
+                                - material_colors[right_index]
+                            )
+                        )
+                    ),
+                )
+        add_check(
+            checks,
+            "material_replay.project_animated_material_changes_with_logical_time",
+            len(material_colors) >= 2 and max_color_change > 0.01,
+            f"records={len(material_colors)} maxMeanRgbChange={max_color_change}",
+        )
+
+    if job.get("bValidateNonFixtureSkeletalAnimation", False):
+        pose_hashes_by_component: dict[str, set[str]] = {}
+        for _, probe_states, _, _ in nonfixture_skeletal_records:
+            for component_path, state in probe_states.items():
+                pose_hashes_by_component.setdefault(component_path, set()).add(
+                    str(state.get("poseSha1", ""))
+                )
+        changed_components = sorted(
+            component_path
+            for component_path, pose_hashes in pose_hashes_by_component.items()
+            if len(pose_hashes) > 1
+        )
+        add_check(
+            checks,
+            "skeletal_replay.project_anim_blueprint_pose_changes",
+            len(nonfixture_skeletal_records) >= 2 and bool(changed_components),
+            f"records={len(nonfixture_skeletal_records)} changedComponents={changed_components}",
+        )
+        validated_project_disocclusion_transitions = 0
+        for index in range(1, len(nonfixture_skeletal_records)):
+            (
+                frame_id,
+                current_probe_states,
+                reset,
+                current_pixels,
+            ) = nonfixture_skeletal_records[index]
+            _, previous_probe_states, _, previous_pixels = (
+                nonfixture_skeletal_records[index - 1]
+            )
+            if reset:
+                continue
+            required_modalities_present = all(
+                modality in current_pixels
+                for modality in (
+                    "object_id",
+                    "history_rejection_mask",
+                    "history_rejection_valid",
+                )
+            ) and "object_id" in previous_pixels
+            if not required_modalities_present:
+                add_check(
+                    checks,
+                    f"frame_{frame_id:06d}.project_skeletal_disocclusion_buffers",
+                    False,
+                    "required Object ID/history-rejection buffers are missing",
+                )
+                continue
+            project_ids = {
+                int(state.get("objectId", -1))
+                for state in current_probe_states.values()
+            } | {
+                int(state.get("objectId", -1))
+                for state in previous_probe_states.values()
+            }
+            current_ids = np.rint(
+                current_pixels["object_id"][..., 0]
+            ).astype(np.int32)
+            previous_ids = np.rint(
+                previous_pixels["object_id"][..., 0]
+            ).astype(np.int32)
+            previous_probe = np.isin(previous_ids, list(project_ids))
+            current_probe = np.isin(current_ids, list(project_ids))
+            newly_revealed = previous_probe & ~current_probe
+            newly_occluded = ~previous_probe & current_probe
+            rejection = current_pixels["history_rejection_mask"][..., 0]
+            rejection_valid = current_pixels["history_rejection_valid"][..., 0]
+            transition_detail: dict[str, Any] = {}
+            transition_ok = True
+            for transition_name, transition_mask in (
+                ("revealed", newly_revealed),
+                ("occluded", newly_occluded),
+            ):
+                count = int(np.count_nonzero(transition_mask))
+                rejected_valid = int(
+                    np.count_nonzero(
+                        transition_mask
+                        & (rejection == 1.0)
+                        & (rejection_valid == 1.0)
+                    )
+                )
+                ratio = rejected_valid / count if count else 0.0
+                transition_detail[transition_name] = {
+                    "pixels": count,
+                    "rejectedValidPixels": rejected_valid,
+                    "ratio": ratio,
+                }
+                transition_ok = transition_ok and count >= 4 and ratio >= 0.95
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.project_skeletal_bidirectional_visibility",
+                transition_ok,
+                json.dumps(transition_detail, sort_keys=True),
+            )
+            validated_project_disocclusion_transitions += int(transition_ok)
+        add_check(
+            checks,
+            "skeletal_replay.project_disocclusion_transition_coverage",
+            validated_project_disocclusion_transitions >= 1,
+            f"validatedTransitions={validated_project_disocclusion_transitions}",
+        )
 
     # Preserve manifest/process order. Reverse endpoint replay intentionally
     # captures t1 before t0 so the retained View State yields motion_0_to_1.
@@ -1550,9 +2630,25 @@ def validate(
             len(semantic_scene_hashes) == len(semantic_records),
             f"frames={len(semantic_records)} uniqueSceneStateHashes={len(semantic_scene_hashes)}",
         )
+    validated_moving_transitions = 0
     for index in range(1, len(semantic_records)):
         frame_id, fixture, current_pixels = semantic_records[index]
         _, previous_fixture, previous_pixels = semantic_records[index - 1]
+        current_right_cm = float(fixture.get("movingCurrentRightCm", math.nan))
+        previous_right_cm = float(
+            previous_fixture.get("movingCurrentRightCm", math.nan)
+        )
+        # Occlusion/disocclusion are transition properties. Once the validation
+        # cube reaches its endpoint it intentionally stays still while Niagara
+        # continues aging; requiring fresh geometry changes on those frames is
+        # a false positive, not a stronger temporal contract.
+        if (
+            not math.isfinite(current_right_cm)
+            or not math.isfinite(previous_right_cm)
+            or math.isclose(current_right_cm, previous_right_cm, abs_tol=1e-5)
+        ):
+            continue
+        validated_moving_transitions += 1
         current_ids = np.rint(current_pixels["object_id"][..., 0]).astype(np.int32)
         previous_ids = np.rint(previous_pixels["object_id"][..., 0]).astype(np.int32)
         moving_id = int(fixture.get("movingObjectId", -1))
@@ -1601,6 +2697,13 @@ def validate(
             stable_kept >= 8,
             f"stable_background_kept_valid={stable_kept}",
         )
+    if len(semantic_records) > 1:
+        add_check(
+            checks,
+            "semantic_fixture.moving_transition_coverage",
+            validated_moving_transitions >= 1,
+            f"validatedMovingTransitions={validated_moving_transitions}",
+        )
 
     if compare is not None:
         other_manifest_path = compare / "manifest.json" if compare.is_dir() else compare
@@ -1608,12 +2711,31 @@ def validate(
         other = json.loads(other_manifest_path.read_text(encoding="utf-8"))
         other_job = other.get("job", {})
         other_role = str(other.get("replayPass") or other.get("job", {}).get("replayPass") or "Standard")
-        add_check(
-            checks,
-            "replay.role_exact",
-            other_role == replay_role,
-            f"left={replay_role} right={other_role}",
-        )
+        if compare_mode in ("vfx-reverse", "skeletal-reverse", "material-reverse"):
+            valid_role_pair = {replay_role, other_role} == {
+                "FrameGenerationEndpoints",
+                "FrameGenerationReverseEndpoints",
+            }
+            reverse_prefix = (
+                "vfx_reverse"
+                if compare_mode == "vfx-reverse"
+                else "skeletal_reverse"
+                if compare_mode == "skeletal-reverse"
+                else "material_reverse"
+            )
+            add_check(
+                checks,
+                f"{reverse_prefix}.opposite_endpoint_roles",
+                valid_role_pair,
+                f"left={replay_role} right={other_role}",
+            )
+        else:
+            add_check(
+                checks,
+                "replay.role_exact",
+                other_role == replay_role,
+                f"left={replay_role} right={other_role}",
+            )
         if compare_mode == "capture-order":
             other_order = str(other_job.get("auxiliaryCaptureOrder") or "HighResolutionFirst")
             order_pair_valid = {
@@ -1643,6 +2765,57 @@ def validate(
             add_check(
                 checks,
                 "capture_order.provenance_equal_except_config_hash",
+                normalized_provenance_match,
+                "exact after normalization" if normalized_provenance_match else "normalized provenance differs",
+            )
+        elif compare_mode == "vfx-reverse":
+            normalized_jobs_match = normalized_vfx_reverse_job(job) == normalized_vfx_reverse_job(other_job)
+            normalized_provenance_match = normalized_vfx_reverse_provenance(
+                provenance
+            ) == normalized_vfx_reverse_provenance(other.get("provenance", {}))
+            add_check(
+                checks,
+                "vfx_reverse.jobs_equal_except_identity_output_and_role",
+                normalized_jobs_match,
+                "exact after normalization" if normalized_jobs_match else "normalized jobs differ",
+            )
+            add_check(
+                checks,
+                "vfx_reverse.provenance_equal_except_config_hash",
+                normalized_provenance_match,
+                "exact after normalization" if normalized_provenance_match else "normalized provenance differs",
+            )
+        elif compare_mode == "skeletal-reverse":
+            normalized_jobs_match = normalized_vfx_reverse_job(job) == normalized_vfx_reverse_job(other_job)
+            normalized_provenance_match = normalized_vfx_reverse_provenance(
+                provenance
+            ) == normalized_vfx_reverse_provenance(other.get("provenance", {}))
+            add_check(
+                checks,
+                "skeletal_reverse.jobs_equal_except_identity_output_and_role",
+                normalized_jobs_match,
+                "exact after normalization" if normalized_jobs_match else "normalized jobs differ",
+            )
+            add_check(
+                checks,
+                "skeletal_reverse.provenance_equal_except_config_hash",
+                normalized_provenance_match,
+                "exact after normalization" if normalized_provenance_match else "normalized provenance differs",
+            )
+        elif compare_mode == "material-reverse":
+            normalized_jobs_match = normalized_vfx_reverse_job(job) == normalized_vfx_reverse_job(other_job)
+            normalized_provenance_match = normalized_vfx_reverse_provenance(
+                provenance
+            ) == normalized_vfx_reverse_provenance(other.get("provenance", {}))
+            add_check(
+                checks,
+                "material_reverse.jobs_equal_except_identity_output_and_role",
+                normalized_jobs_match,
+                "exact after normalization" if normalized_jobs_match else "normalized jobs differ",
+            )
+            add_check(
+                checks,
+                "material_reverse.provenance_equal_except_config_hash",
                 normalized_provenance_match,
                 "exact after normalization" if normalized_provenance_match else "normalized provenance differs",
             )
@@ -1684,11 +2857,352 @@ def validate(
 
         other_frames = {int(frame["logicalFrameId"]): frame for frame in other.get("frames", [])}
         add_check(checks, "replay.frame_ids", set(other_frames) == {int(frame["logicalFrameId"]) for frame in frames}, f"left={len(frames)} right={len(other_frames)}")
+        left_frames = {int(frame["logicalFrameId"]): frame for frame in frames}
+        if compare_mode == "vfx-reverse":
+            for frame_id in sorted(set(left_frames) & set(other_frames)):
+                left_frame = left_frames[frame_id]
+                right_frame = other_frames[frame_id]
+                left_state = niagara_fixture_state(left_frame)
+                right_state = niagara_fixture_state(right_frame)
+                add_check(
+                    checks,
+                    f"vfx_reverse.frame_{frame_id:06d}.fixture_particle_state_exact",
+                    left_state is not None and left_state == right_state,
+                    "exact" if left_state is not None and left_state == right_state else
+                    f"left={json.dumps(left_state, sort_keys=True)} right={json.dumps(right_state, sort_keys=True)}",
+                )
+                add_check(
+                    checks,
+                    f"vfx_reverse.frame_{frame_id:06d}.scene_state_hash_exact",
+                    left_frame.get("sceneStateSha1") == right_frame.get("sceneStateSha1"),
+                    f"left={left_frame.get('sceneStateSha1')} right={right_frame.get('sceneStateSha1')}",
+                    required=False,
+                )
+                scene_structure_fields = (
+                    "sceneActorCount",
+                    "sceneComponentCount",
+                    "sceneSkeletalComponentCount",
+                    "sceneBoneCount",
+                    "sceneFXComponentCount",
+                    "sceneNiagaraComponentCount",
+                    "sceneNiagaraEmitterCount",
+                    "sceneNiagaraCPUEmitterCount",
+                    "sceneNiagaraGPUEmitterCount",
+                    "sceneControllableActorCount",
+                    "sceneUncontrolledTickingActorCount",
+                )
+                add_check(
+                    checks,
+                    f"vfx_reverse.frame_{frame_id:06d}.scene_state_structure_exact",
+                    all(left_frame.get(field) == right_frame.get(field) for field in scene_structure_fields),
+                    json.dumps(
+                        {
+                            field: [left_frame.get(field), right_frame.get(field)]
+                            for field in scene_structure_fields
+                        },
+                        sort_keys=True,
+                    ),
+                )
+        elif compare_mode == "skeletal-reverse":
+            for frame_id in sorted(set(left_frames) & set(other_frames)):
+                left_frame = left_frames[frame_id]
+                right_frame = other_frames[frame_id]
+                left_probes = nonfixture_project_probe_states(left_frame)
+                right_probes = nonfixture_project_probe_states(right_frame)
+                probe_keys = set(left_probes) | set(right_probes)
+                pose_and_identity_exact = bool(probe_keys) and all(
+                    key in left_probes
+                    and key in right_probes
+                    and left_probes[key].get("poseSha1")
+                    == right_probes[key].get("poseSha1")
+                    and left_probes[key].get("objectId")
+                    == right_probes[key].get("objectId")
+                    and left_probes[key].get("skinnedAssetPath")
+                    == right_probes[key].get("skinnedAssetPath")
+                    and left_probes[key].get("animationInstanceClass")
+                    == right_probes[key].get("animationInstanceClass")
+                    for key in probe_keys
+                )
+                add_check(
+                    checks,
+                    f"skeletal_reverse.frame_{frame_id:06d}.project_pose_and_identity_exact",
+                    pose_and_identity_exact,
+                    json.dumps(
+                        {
+                            key: [
+                                left_probes.get(key, {}).get("poseSha1"),
+                                right_probes.get(key, {}).get("poseSha1"),
+                            ]
+                            for key in sorted(probe_keys)
+                        },
+                        sort_keys=True,
+                    ),
+                )
+                add_check(
+                    checks,
+                    f"skeletal_reverse.frame_{frame_id:06d}.camera_exact",
+                    left_frame.get("camera") == right_frame.get("camera"),
+                    "exact"
+                    if left_frame.get("camera") == right_frame.get("camera")
+                    else "camera metadata differs",
+                )
+                for side, root, side_frame in (
+                    ("left", dataset, left_frame),
+                    ("right", other_root, right_frame),
+                ):
+                    motion_evidence = False
+                    visible_evidence = False
+                    evidence_detail: dict[str, Any] = {}
+                    try:
+                        ids = np.rint(
+                            image_rgba(
+                                safe_dataset_file(
+                                    root, side_frame.get("files", {}).get("object_id")
+                                )
+                            )[..., 0]
+                        ).astype(np.int32)
+                        motion = image_rgba(
+                            safe_dataset_file(
+                                root,
+                                side_frame.get("files", {}).get(
+                                    "motion_full_current_to_previous"
+                                ),
+                            )
+                        )
+                        motion_valid = (
+                            image_rgba(
+                                safe_dataset_file(
+                                    root,
+                                    side_frame.get("files", {}).get("motion_valid"),
+                                )
+                            )[..., 0]
+                            == 1.0
+                        )
+                        magnitudes = np.linalg.norm(motion[..., :2], axis=-1)
+                        for key, state in nonfixture_project_probe_states(
+                            side_frame
+                        ).items():
+                            mask = ids == int(state.get("objectId", -1))
+                            covered = mask & motion_valid
+                            visible_count = int(np.count_nonzero(mask))
+                            covered_count = int(np.count_nonzero(covered))
+                            p95 = (
+                                float(np.percentile(magnitudes[covered], 95.0))
+                                if covered_count
+                                else 0.0
+                            )
+                            visible_evidence = visible_evidence or visible_count >= 20
+                            motion_evidence = motion_evidence or (
+                                covered_count >= 20 and p95 > 0.05
+                            )
+                            evidence_detail[key] = {
+                                "visiblePixels": visible_count,
+                                "motionCoveredPixels": covered_count,
+                                "motionP95DisplayPixels": p95,
+                            }
+                    except Exception as exc:
+                        evidence_detail["error"] = str(exc)
+                    add_check(
+                        checks,
+                        f"skeletal_reverse.frame_{frame_id:06d}.{side}_independent_motion_evidence",
+                        visible_evidence
+                        and (
+                            side_frame.get("reset") is True or motion_evidence
+                        ),
+                        json.dumps(evidence_detail, sort_keys=True),
+                    )
+        elif compare_mode == "material-reverse":
+            for frame_id in sorted(set(left_frames) & set(other_frames)):
+                left_frame = left_frames[frame_id]
+                right_frame = other_frames[frame_id]
+                left_time = float(left_frame.get("materialTimeSeconds", math.nan))
+                right_time = float(right_frame.get("materialTimeSeconds", math.nan))
+                left_gpu_time = float(
+                    left_frame.get("temporalDiagnostics", {}).get(
+                        "renderGameTimeS", math.nan
+                    )
+                )
+                right_gpu_time = float(
+                    right_frame.get("temporalDiagnostics", {}).get(
+                        "renderGameTimeS", math.nan
+                    )
+                )
+                left_delta = float(
+                    left_frame.get("materialDeltaTimeSeconds", math.nan)
+                )
+                right_delta = float(
+                    right_frame.get("materialDeltaTimeSeconds", math.nan)
+                )
+                left_gpu_delta = float(
+                    left_frame.get("temporalDiagnostics", {}).get(
+                        "renderDeltaTimeS", math.nan
+                    )
+                )
+                right_gpu_delta = float(
+                    right_frame.get("temporalDiagnostics", {}).get(
+                        "renderDeltaTimeS", math.nan
+                    )
+                )
+                expected_time = (
+                    frame_id * frame_rate_denominator / frame_rate_numerator
+                    if valid_frame_rate
+                    else math.nan
+                )
+                role_deltas = {
+                    replay_role: left_delta,
+                    other_role: right_delta,
+                }
+                time_contract_ok = bool(
+                    valid_frame_rate
+                    and all(
+                        math.isfinite(value)
+                        for value in (
+                            left_time,
+                            right_time,
+                            left_gpu_time,
+                            right_gpu_time,
+                            left_delta,
+                            right_delta,
+                            left_gpu_delta,
+                            right_gpu_delta,
+                        )
+                    )
+                    and all(
+                        math.isclose(
+                            value, expected_time, rel_tol=0.0, abs_tol=1e-6
+                        )
+                        for value in (
+                            left_time,
+                            right_time,
+                            left_gpu_time,
+                            right_gpu_time,
+                        )
+                    )
+                    and math.isclose(
+                        left_delta, left_gpu_delta, rel_tol=0.0, abs_tol=1e-6
+                    )
+                    and math.isclose(
+                        right_delta, right_gpu_delta, rel_tol=0.0, abs_tol=1e-6
+                    )
+                    and role_deltas.get("FrameGenerationEndpoints", 0.0) > 0.0
+                    and role_deltas.get("FrameGenerationReverseEndpoints", 0.0) < 0.0
+                )
+                add_check(
+                    checks,
+                    f"material_reverse.frame_{frame_id:06d}.gpu_logical_game_time_and_signed_direction",
+                    time_contract_ok,
+                    json.dumps(
+                        {
+                            "expectedTime": expected_time,
+                            "leftTime": left_time,
+                            "rightTime": right_time,
+                            "leftGpuTime": left_gpu_time,
+                            "rightGpuTime": right_gpu_time,
+                            "leftDelta": left_delta,
+                            "rightDelta": right_delta,
+                            "leftGpuDelta": left_gpu_delta,
+                            "rightGpuDelta": right_gpu_delta,
+                            "roleDeltas": role_deltas,
+                        },
+                        sort_keys=True,
+                    ),
+                )
+                project_material_probe = bool(
+                    job.get("bValidateProjectAnimatedMaterial", False)
+                )
+                left_material_state = left_frame.get(
+                    "projectAnimatedMaterialValidation", {}
+                )
+                right_material_state = right_frame.get(
+                    "projectAnimatedMaterialValidation", {}
+                )
+                material_identity_exact = bool(
+                    isinstance(left_material_state, dict)
+                    and isinstance(right_material_state, dict)
+                    and left_material_state.get("enabled") is True
+                    and right_material_state.get("enabled") is True
+                    and left_material_state.get("materialInterfacePath")
+                    == right_material_state.get("materialInterfacePath")
+                    and left_material_state.get("baseMaterialPath")
+                    == right_material_state.get("baseMaterialPath")
+                    and int(left_material_state.get("receiverObjectId", -1)) == 150
+                    and int(right_material_state.get("receiverObjectId", -1)) == 150
+                )
+                add_check(
+                    checks,
+                    f"material_reverse.frame_{frame_id:06d}.project_material_identity_exact",
+                    material_identity_exact,
+                    json.dumps(
+                        {
+                            "left": left_material_state,
+                            "right": right_material_state,
+                        },
+                        sort_keys=True,
+                    ),
+                    required=project_material_probe,
+                )
+                receiver_metrics: dict[str, Any] = {"valid": False}
+                receiver_pixels = 0
+                try:
+                    left_ids = np.rint(
+                        image_rgba(
+                            safe_dataset_file(
+                                dataset,
+                                left_frame.get("files", {}).get("object_id"),
+                            )
+                        )[..., 0]
+                    ).astype(np.int32)
+                    right_ids = np.rint(
+                        image_rgba(
+                            safe_dataset_file(
+                                other_root,
+                                right_frame.get("files", {}).get("object_id"),
+                            )
+                        )[..., 0]
+                    ).astype(np.int32)
+                    left_color = image_rgba(
+                        safe_dataset_file(
+                            dataset,
+                            left_frame.get("files", {}).get(
+                                "color_lr_scene_hdr"
+                            ),
+                        )
+                    )
+                    right_color = image_rgba(
+                        safe_dataset_file(
+                            other_root,
+                            right_frame.get("files", {}).get(
+                                "color_lr_scene_hdr"
+                            ),
+                        )
+                    )
+                    receiver_mask = (left_ids == 150) & (right_ids == 150)
+                    receiver_pixels = int(np.count_nonzero(receiver_mask))
+                    receiver_metrics = numeric_comparison(
+                        left_color[..., :3][receiver_mask],
+                        right_color[..., :3][receiver_mask],
+                    )
+                except Exception as exc:
+                    receiver_metrics = {"valid": False, "error": str(exc)}
+                add_check(
+                    checks,
+                    f"material_reverse.frame_{frame_id:06d}.project_material_current_color_exact",
+                    receiver_pixels >= 20
+                    and bool(receiver_metrics.get("valid"))
+                    and float(receiver_metrics.get("maxAbs", math.inf)) <= 0.025
+                    and float(receiver_metrics.get("meanAbs", math.inf)) <= 0.0012
+                    and float(receiver_metrics.get("p99Abs", math.inf)) <= 0.015,
+                    f"pixels={receiver_pixels} metrics={json.dumps(receiver_metrics, sort_keys=True)}",
+                    required=project_material_probe,
+                )
         replay_metrics: dict[str, dict[str, Any]] = {}
         heatmap_root = dataset / "validation_heatmaps"
         if heatmap_root.is_dir():
             for stale_heatmap in heatmap_root.glob("frame_*.png"):
                 stale_heatmap.unlink()
+        vfx_reverse_visible_probe_count = 0
+        skeletal_reverse_static_modality_count = 0
+        material_reverse_static_modality_count = 0
         for key in sorted(all_keys):
             frame_id, modality = key
             left_path = frame_paths.get(key)
@@ -1702,6 +3216,138 @@ def validate(
             add_check(checks, f"replay.frame_{frame_id:06d}.{modality}.present", present, f"left={left_path} right={right_path}")
             if not present:
                 continue
+
+            if compare_mode == "vfx-reverse":
+                if (
+                    modality != "translucency_after_dof_raw"
+                    or other_frame.get("semanticValidationFixture", {}).get(
+                        "niagaraVisibleProbeExpected"
+                    )
+                    is not True
+                ):
+                    continue
+                left_pixels = image_rgba(left_path)
+                right_pixels = image_rgba(right_path)
+                fixture = other_frame["semanticValidationFixture"]
+                display_size = np.asarray(
+                    other_frame.get("temporalDiagnostics", {}).get(
+                        "displaySize",
+                        other_frame.get("temporalDiagnostics", {}).get(
+                            "displayResolution", (0, 0)
+                        ),
+                    ),
+                    dtype=np.float64,
+                )
+                anchor = np.asarray(
+                    fixture.get("niagaraAnchorDisplayPixels", (math.nan, math.nan)),
+                    dtype=np.float64,
+                )
+                radius = float(
+                    fixture.get("niagaraValidationRadiusDisplayPixels", math.nan)
+                )
+                valid_roi = (
+                    left_pixels.shape == right_pixels.shape
+                    and left_pixels.ndim == 3
+                    and display_size.shape == (2,)
+                    and np.all(display_size > 0)
+                    and anchor.shape == (2,)
+                    and np.all(np.isfinite(anchor))
+                    and math.isfinite(radius)
+                    and radius > 0
+                )
+                if valid_roi:
+                    height, width = left_pixels.shape[:2]
+                    scale = np.asarray((width, height), dtype=np.float64) / display_size
+                    center = anchor * scale
+                    radius_render = radius * scale[0]
+                    yy, xx = np.ogrid[:height, :width]
+                    roi = (xx - center[0]) ** 2 + (yy - center[1]) ** 2 <= radius_render**2
+                    left_roi = left_pixels[roi]
+                    right_roi = right_pixels[roi]
+                    metrics = numeric_comparison(left_roi, right_roi)
+                    visible_left = int(np.count_nonzero(np.max(np.abs(left_roi[:, :3]), axis=1) > 0.01))
+                    visible_right = int(np.count_nonzero(np.max(np.abs(right_roi[:, :3]), axis=1) > 0.01))
+                else:
+                    metrics = {"valid": False, "reason": "invalid ROI metadata or shape"}
+                    visible_left = 0
+                    visible_right = 0
+                replay_metrics[f"vfx_reverse.{frame_id:06d}.{modality}.roi"] = metrics
+                add_check(
+                    checks,
+                    f"vfx_reverse.frame_{frame_id:06d}.visible_translucency_roi",
+                    bool(metrics.get("valid"))
+                    and visible_left >= 8
+                    and visible_right >= 8
+                    and float(metrics.get("maxAbs", math.inf)) <= 1e-3,
+                    f"leftVisible={visible_left} rightVisible={visible_right} metrics={json.dumps(metrics, sort_keys=True)}",
+                )
+                vfx_reverse_visible_probe_count += 1
+                continue
+
+            if compare_mode == "skeletal-reverse":
+                if modality not in {
+                    "depth",
+                    "object_id",
+                    "depth_device_raw",
+                    "depth_view_linear_meters",
+                    "depth_valid",
+                }:
+                    continue
+                left_pixels = image_rgba(left_path)
+                right_pixels = image_rgba(right_path)
+                metrics = numeric_comparison(left_pixels, right_pixels)
+                replay_metrics[
+                    f"skeletal_reverse.{frame_id:06d}.{modality}"
+                ] = metrics
+                changed_fraction = float(
+                    metrics.get("changedPixelFraction", math.inf)
+                )
+                if modality == "object_id":
+                    static_grid_within_tolerance = (
+                        bool(metrics.get("valid"))
+                        and float(metrics.get("maxAbs", math.inf)) <= 1e-6
+                    )
+                elif modality == "depth_device_raw":
+                    static_grid_within_tolerance = (
+                        bool(metrics.get("valid"))
+                        and changed_fraction <= 5e-4
+                        and float(metrics.get("meanAbs", math.inf)) <= 1e-5
+                        and float(metrics.get("p99Abs", math.inf)) <= 1e-5
+                    )
+                elif modality == "depth_view_linear_meters":
+                    static_grid_within_tolerance = (
+                        bool(metrics.get("valid"))
+                        and changed_fraction <= 5e-4
+                        and float(metrics.get("meanAbs", math.inf)) <= 5e-3
+                        and float(metrics.get("p99Abs", math.inf)) <= 1e-4
+                    )
+                elif modality == "depth_valid":
+                    static_grid_within_tolerance = (
+                        bool(metrics.get("valid"))
+                        and changed_fraction <= 5e-4
+                    )
+                else:
+                    static_grid_within_tolerance = (
+                        bool(metrics.get("valid"))
+                        and changed_fraction <= 5e-4
+                        and float(metrics.get("p99Abs", math.inf)) <= 1e-3
+                    )
+                add_check(
+                    checks,
+                    f"skeletal_reverse.frame_{frame_id:06d}.{modality}.static_grid_tolerance",
+                    static_grid_within_tolerance,
+                    json.dumps(metrics, sort_keys=True),
+                )
+                skeletal_reverse_static_modality_count += 1
+                continue
+
+            if compare_mode == "material-reverse":
+                if modality not in {
+                    "object_id",
+                    "ui_color_alpha",
+                }:
+                    continue
+                material_reverse_static_modality_count += 1
 
             byte_exact = frame_hashes.get(key) == other_hashes.get(key)
             add_check(checks, f"replay.frame_{frame_id:06d}.{modality}.byte_exact", byte_exact, str(byte_exact), required=False)
@@ -1735,12 +3381,37 @@ def validate(
                 json.dumps(metrics, sort_keys=True),
             )
 
-        left_frames = {int(frame["logicalFrameId"]): frame for frame in frames}
+        if compare_mode == "vfx-reverse":
+            add_check(
+                checks,
+                "vfx_reverse.visible_probe_compared",
+                vfx_reverse_visible_probe_count >= 1,
+                f"count={vfx_reverse_visible_probe_count}",
+            )
+        elif compare_mode == "skeletal-reverse":
+            add_check(
+                checks,
+                "skeletal_reverse.static_grids_compared",
+                skeletal_reverse_static_modality_count
+                >= 5 * len(set(left_frames) & set(other_frames)),
+                f"count={skeletal_reverse_static_modality_count}",
+            )
+        elif compare_mode == "material-reverse":
+            add_check(
+                checks,
+                "material_reverse.static_identity_grids_compared",
+                material_reverse_static_modality_count
+                >= len(set(left_frames) & set(other_frames)),
+                f"count={material_reverse_static_modality_count}",
+            )
+
         for frame_id, right_frame in other_frames.items():
             left_frame = left_frames.get(frame_id)
             if left_frame is None:
                 continue
             for field in REPLAY_METADATA_FIELDS:
+                if compare_mode in ("vfx-reverse", "skeletal-reverse", "material-reverse"):
+                    continue
                 if compare_mode == "capture-order" and field in {
                     "renderSubmissions",
                     "auxiliaryCaptureOrder",
@@ -1760,11 +3431,26 @@ def validate(
     required_checks = [check for check in checks if check["required"]]
     passed = all(check["passed"] for check in required_checks)
     report = {
-        "validatorVersion": 5,
+        "validatorVersion": 9,
         "comparisonMode": compare_mode if compare is not None else "none",
         "captureOrderInvarianceGate": (
             "pass" if compare is not None and compare_mode == "capture-order" and passed
             else "fail" if compare is not None and compare_mode == "capture-order"
+            else "not_run"
+        ),
+        "vfxReverseReplayGate": (
+            "pass" if compare is not None and compare_mode == "vfx-reverse" and passed
+            else "fail" if compare is not None and compare_mode == "vfx-reverse"
+            else "not_run"
+        ),
+        "skeletalReverseReplayGate": (
+            "pass" if compare is not None and compare_mode == "skeletal-reverse" and passed
+            else "fail" if compare is not None and compare_mode == "skeletal-reverse"
+            else "not_run"
+        ),
+        "materialReverseReplayGate": (
+            "pass" if compare is not None and compare_mode == "material-reverse" and passed
+            else "fail" if compare is not None and compare_mode == "material-reverse"
             else "not_run"
         ),
         "dataset": str(dataset.resolve()),
@@ -1778,7 +3464,7 @@ def validate(
         "checks": checks,
         "statistics": stats,
         "replayMetrics": replay_metrics,
-        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. When the semantic fixture is enabled it also validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion direction/magnitude, 1/10/100 m depth, nonzero After-DOF transparency, known occlusion/disocclusion geometry, and the experimental history-rejection signal. Exact replay requires matching provenance and metadata. Capture-order comparison requires opposite auxiliary submission orders, identical normalized jobs/provenance, exact non-color buffers and tolerance-gated color. Non-fixture animated-material/WPO motion, production disocclusion for unlabeled/deforming geometry and Main View/reference-HR pixel equivalence remain separate gates.",
+        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU Niagara particle counts and a visible AfterDOF VFX probe. The non-fixture skeletal gate requires a visible project-authored Actor and AnimBP, exact application of the shared cached pose and covered endpoint motion; skeletal-reverse requires exact absolute project poses, camera metadata and object-ID grids, tightly bounded depth-grid differences, and independent directional motion evidence. GPU particle payload readback, arbitrary Niagara data interfaces, non-fixture animated-material/WPO motion, production disocclusion and Main View/reference-HR pixel equivalence remain separate gates.",
     }
     return report, passed
 
@@ -1789,15 +3475,20 @@ def main() -> int:
     parser.add_argument("--compare", type=Path, help="Second dataset directory or manifest for deterministic hash comparison")
     parser.add_argument(
         "--compare-mode",
-        choices=("exact-replay", "capture-order"),
+        choices=("exact-replay", "capture-order", "vfx-reverse", "skeletal-reverse", "material-reverse"),
         default="exact-replay",
-        help="Comparison contract. capture-order allows only job identity/output/order and captureConfigSha1 to differ.",
+        help="Comparison contract. Reverse modes compare forward/reverse endpoint roles at identical absolute times.",
     )
     parser.add_argument("--report", type=Path, help="Output report path (default: <dataset>/validation_report.json)")
     args = parser.parse_args()
 
-    if args.compare_mode == "capture-order" and args.compare is None:
-        parser.error("--compare-mode capture-order requires --compare")
+    if args.compare_mode in (
+        "capture-order",
+        "vfx-reverse",
+        "skeletal-reverse",
+        "material-reverse",
+    ) and args.compare is None:
+        parser.error(f"--compare-mode {args.compare_mode} requires --compare")
 
     report, passed = validate(args.dataset, args.compare, args.compare_mode)
     report_path = args.report or (args.dataset / "validation_report.json")

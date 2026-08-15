@@ -2,6 +2,8 @@
 
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/SceneComponent.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/World.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "HAL/FileManager.h"
 #include "ImageCore.h"
@@ -9,6 +11,8 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/SecureHash.h"
+#include "Slate/SGameLayerManager.h"
+#include "Slate/WidgetRenderer.h"
 
 ASRDatasetCaptureRig::ASRDatasetCaptureRig()
 {
@@ -26,9 +30,11 @@ ASRDatasetCaptureRig::ASRDatasetCaptureRig()
 	ReferenceCapture->SetupAttachment(SceneRoot);
 	DepthCapture = CreateDefaultSubobject<USceneCaptureComponent2D>(TEXT("DepthCapture"));
 	DepthCapture->SetupAttachment(SceneRoot);
+	RendererPrimeCapture = CreateDefaultSubobject<USceneCaptureComponent2D>(TEXT("RendererPrimeCapture"));
+	RendererPrimeCapture->SetupAttachment(SceneRoot);
 
 	for (USceneCaptureComponent2D* Capture : {
-		HRCapture.Get(), LRCapture.Get(), ReferenceCapture.Get(), DepthCapture.Get() })
+		HRCapture.Get(), LRCapture.Get(), ReferenceCapture.Get(), DepthCapture.Get(), RendererPrimeCapture.Get() })
 	{
 		Capture->bCaptureEveryFrame = false;
 		Capture->bCaptureOnMovement = false;
@@ -40,6 +46,7 @@ ASRDatasetCaptureRig::ASRDatasetCaptureRig()
 	LRCapture->CaptureSource = SCS_FinalColorLDR;
 	ReferenceCapture->CaptureSource = SCS_FinalColorLDR;
 	DepthCapture->CaptureSource = SCS_SceneDepth;
+	RendererPrimeCapture->CaptureSource = SCS_FinalColorLDR;
 }
 
 bool ASRDatasetCaptureRig::Configure(const FSRDatasetCaptureJob& Job, FString& OutError)
@@ -52,7 +59,8 @@ bool ASRDatasetCaptureRig::Configure(const FSRDatasetCaptureJob& Job, FString& O
 	HRTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("SRDatasetHRTarget"));
 	LRTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("SRDatasetLRTarget"));
 	DepthTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("SRDatasetDepthTarget"));
-	if (!HRTarget || !LRTarget || !DepthTarget)
+	RendererPrimeTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("SRDatasetRendererPrimeTarget"));
+	if (!HRTarget || !LRTarget || !DepthTarget || !RendererPrimeTarget)
 	{
 		OutError = TEXT("Failed to allocate render targets.");
 		return false;
@@ -91,6 +99,41 @@ bool ASRDatasetCaptureRig::Configure(const FSRDatasetCaptureJob& Job, FString& O
 	DepthTarget->UpdateResourceImmediate(true);
 	DepthCapture->TextureTarget = DepthTarget;
 
+	// Endpoint replay suppresses uncaptured player Main Views so their temporal
+	// history does not advance. A tiny off-screen view keeps renderer resources
+	// such as newly spawned Niagara payloads resident without paying production
+	// capture resolution on every intermediate simulation frame.
+	constexpr int32 PrimeLongEdge = 64;
+	const bool bLandscape = Job.LRResolution.X >= Job.LRResolution.Y;
+	const int32 PrimeWidth = bLandscape
+		? PrimeLongEdge
+		: FMath::Max(1, FMath::RoundToInt(
+			static_cast<float>(PrimeLongEdge) * Job.LRResolution.X / Job.LRResolution.Y));
+	const int32 PrimeHeight = bLandscape
+		? FMath::Max(1, FMath::RoundToInt(
+			static_cast<float>(PrimeLongEdge) * Job.LRResolution.Y / Job.LRResolution.X))
+		: PrimeLongEdge;
+	RendererPrimeTarget->ClearColor = FLinearColor::Black;
+	RendererPrimeTarget->InitCustomFormat(PrimeWidth, PrimeHeight, PF_B8G8R8A8, false);
+	RendererPrimeTarget->UpdateResourceImmediate(true);
+	RendererPrimeCapture->TextureTarget = RendererPrimeTarget;
+
+	if (Job.bCaptureUIColorAlpha)
+	{
+		// FWidgetRenderer owns a dedicated Slate renderer, but the target must
+		// remain referenced by the rig across frames. The default (no explicit
+		// gamma pass) path writes display-encoded Slate color into an sRGB BGRA8
+		// target while preserving the transparent clear and coverage alpha.
+		UIColorAlphaTarget = FWidgetRenderer::CreateTargetFor(
+			FVector2D(Job.HRResolution), TF_Nearest, false);
+		if (!UIColorAlphaTarget)
+		{
+			OutError = TEXT("Failed to allocate the independent Slate UI render target.");
+			return false;
+		}
+		UIColorAlphaTarget->ClearColor = FLinearColor::Transparent;
+	}
+
 	OutError.Reset();
 	return true;
 }
@@ -106,6 +149,21 @@ void ASRDatasetCaptureRig::ApplyCameraView(
 	ApplyViewToCapture(LRCapture, View, bDisableMotionBlur, bLockExposure);
 	ApplyViewToCapture(ReferenceCapture, View, bDisableMotionBlur, bLockExposure);
 	ApplyViewToCapture(DepthCapture, View, bDisableMotionBlur, bLockExposure);
+	ApplyViewToCapture(RendererPrimeCapture, View, bDisableMotionBlur, bLockExposure);
+}
+
+void ASRDatasetCaptureRig::PrimeRendererState(const TArray<UPrimitiveComponent*>& Components)
+{
+	RendererPrimeCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
+	RendererPrimeCapture->ClearShowOnlyComponents();
+	for (UPrimitiveComponent* Component : Components)
+	{
+		if (IsValid(Component) && Component->IsRegistered())
+		{
+			RendererPrimeCapture->ShowOnlyComponent(Component);
+		}
+	}
+	RendererPrimeCapture->CaptureScene();
 }
 
 void ASRDatasetCaptureRig::WarmupRenderState(const FSRDatasetCaptureJob& Job)
@@ -189,6 +247,11 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 	LastReferenceHRMetadata = FSRDatasetTemporalFrameMetadata();
 	LastHUDlessColorMetadata = FSRDatasetTemporalFrameMetadata();
 	LastHUDlessColorSize = FIntPoint::ZeroValue;
+	LastUIColorAlphaSize = FIntPoint::ZeroValue;
+	LastUINonzeroAlphaPixelCount = 0;
+	LastUIFractionalAlphaPixelCount = 0;
+	LastUIMinAlpha = 0.0f;
+	LastUIMaxAlpha = 0.0f;
 	TSharedPtr<FSRDatasetViewExtension, ESPMode::ThreadSafe> ViewExtension;
 	if (Job.bCaptureTemporalDiagnostics)
 	{
@@ -444,6 +507,88 @@ bool ASRDatasetCaptureRig::SaveHUDlessColorResult(
 	OutHashes.Add(TEXT("color_main_view_hudless_after_tonemap"), Hash);
 	LastHUDlessColorMetadata = Result.Metadata;
 	LastHUDlessColorSize = Result.Size;
+	return true;
+}
+
+bool ASRDatasetCaptureRig::CaptureUIColorAlpha(
+	const FSRDatasetCaptureJob& Job,
+	const FString& OutputPath,
+	TMap<FString, FString>& OutHashes,
+	FString& OutError)
+{
+	if (!Job.bCaptureUIColorAlpha)
+	{
+		return true;
+	}
+	if (!UIColorAlphaTarget || !GetWorld())
+	{
+		OutError = TEXT("The independent Slate UI render target is unavailable.");
+		return false;
+	}
+
+	UGameViewportClient* ViewportClient = GetWorld()->GetGameViewport();
+	const TSharedPtr<IGameLayerManager> LayerManager = ViewportClient
+		? ViewportClient->GetGameLayerManager()
+		: nullptr;
+	if (!LayerManager)
+	{
+		OutError = TEXT("UI Color/Alpha capture requires a game viewport layer manager.");
+		return false;
+	}
+	// UGameEngine creates SGameLayerManager as the concrete implementation. By
+	// painting that child rather than the enclosing SViewport we include
+	// screen-space game layers while excluding the scene/backbuffer itself.
+	const TSharedPtr<SGameLayerManager> GameLayerWidget =
+		StaticCastSharedPtr<SGameLayerManager>(LayerManager);
+	if (!GameLayerWidget)
+	{
+		OutError = TEXT("The game viewport uses an unsupported layer-manager implementation.");
+		return false;
+	}
+
+	FWidgetRenderer WidgetRenderer(false, true);
+	WidgetRenderer.SetApplyColorDeficiencyCorrection(false);
+	WidgetRenderer.DrawWidget(
+		UIColorAlphaTarget,
+		StaticCastSharedRef<SWidget>(GameLayerWidget.ToSharedRef()),
+		FVector2D(Job.HRResolution),
+		static_cast<float>(Job.GetFixedDeltaSeconds()),
+		false);
+	FlushRenderingCommands();
+
+	FImage Image;
+	if (!FImageUtils::GetRenderTargetImage(UIColorAlphaTarget, Image) ||
+		Image.SizeX != Job.HRResolution.X || Image.SizeY != Job.HRResolution.Y)
+	{
+		OutError = TEXT("Could not read the independent Slate UI Color/Alpha target.");
+		return false;
+	}
+	FImage LinearImage;
+	Image.CopyTo(LinearImage, ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+	const TArrayView64<const FLinearColor> Pixels = LinearImage.AsRGBA32F();
+	LastUIMinAlpha = 1.0f;
+	LastUIMaxAlpha = 0.0f;
+	for (const FLinearColor& Pixel : Pixels)
+	{
+		const float Alpha = FMath::Clamp(Pixel.A, 0.0f, 1.0f);
+		LastUIMinAlpha = FMath::Min(LastUIMinAlpha, Alpha);
+		LastUIMaxAlpha = FMath::Max(LastUIMaxAlpha, Alpha);
+		LastUINonzeroAlphaPixelCount += Alpha > (0.5f / 255.0f) ? 1 : 0;
+		LastUIFractionalAlphaPixelCount +=
+			Alpha > (0.5f / 255.0f) && Alpha < (254.5f / 255.0f) ? 1 : 0;
+	}
+	if (Pixels.IsEmpty())
+	{
+		LastUIMinAlpha = 0.0f;
+	}
+	LastUIColorAlphaSize = Job.HRResolution;
+
+	FString Hash;
+	if (!SaveImageAtomic(OutputPath, TEXT("png"), Image, Hash, OutError))
+	{
+		return false;
+	}
+	OutHashes.Add(TEXT("ui_color_alpha"), Hash);
 	return true;
 }
 

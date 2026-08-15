@@ -3,17 +3,32 @@
 Run through UnrealEditor-Cmd with the PythonScriptPlugin enabled. The generated
 material exposes explicit current/previous world-space WPO parameters and uses
 PreviousFrameSwitch, so endpoint motion is produced by UE's velocity pass rather
-than reconstructed by an offline approximation.
+than reconstructed by an offline approximation. A plugin-owned Niagara system is
+also built from UE's deterministic Grid Location emitter template so the runtime
+gate never depends on content from the host project.
 """
 
 from __future__ import annotations
+
+import sys
 
 import unreal
 
 
 PACKAGE_PATH = "/SuperResolutionDataset/Validation"
-ASSET_NAME = "M_SRDatasetWPOFixture"
-ASSET_PATH = f"{PACKAGE_PATH}/{ASSET_NAME}"
+WPO_ASSET_NAME = "M_SRDatasetWPOFixture"
+WPO_ASSET_PATH = f"{PACKAGE_PATH}/{WPO_ASSET_NAME}"
+VFX_MATERIAL_ASSET_NAME = "M_SRDatasetVFXSpriteFixture"
+VFX_MATERIAL_ASSET_PATH = f"{PACKAGE_PATH}/{VFX_MATERIAL_ASSET_NAME}"
+NIAGARA_EMITTER_TEMPLATE_PATH = (
+    "/Niagara/DefaultAssets/Templates/BehaviorExamples/GridLocation.GridLocation"
+)
+NIAGARA_ASSET_NAME = "NS_SRDatasetVFXFixture"
+NIAGARA_ASSET_PATH = f"{PACKAGE_PATH}/{NIAGARA_ASSET_NAME}"
+
+
+def has_command_line_flag(flag: str) -> bool:
+    return flag in sys.argv or flag.lower() in unreal.SystemLibrary.get_command_line().lower()
 
 
 def require(value: bool, message: str) -> None:
@@ -30,22 +45,21 @@ def create_expression(material, expression_class, x: int, y: int):
     return expression
 
 
-def generate() -> None:
-    unreal.EditorAssetLibrary.make_directory(PACKAGE_PATH)
-    if unreal.EditorAssetLibrary.does_asset_exist(ASSET_PATH):
+def generate_wpo_material() -> None:
+    if unreal.EditorAssetLibrary.does_asset_exist(WPO_ASSET_PATH):
         require(
-            unreal.EditorAssetLibrary.delete_asset(ASSET_PATH),
-            f"Could not replace generated asset {ASSET_PATH}",
+            unreal.EditorAssetLibrary.delete_asset(WPO_ASSET_PATH),
+            f"Could not replace generated asset {WPO_ASSET_PATH}",
         )
 
     material = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
-        ASSET_NAME,
+        WPO_ASSET_NAME,
         PACKAGE_PATH,
         unreal.Material,
         unreal.MaterialFactoryNew(),
     )
     if material is None:
-        raise RuntimeError(f"Could not create {ASSET_PATH}")
+        raise RuntimeError(f"Could not create {WPO_ASSET_PATH}")
 
     material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
     material.set_editor_property(
@@ -111,9 +125,153 @@ def generate() -> None:
     unreal.MaterialEditingLibrary.recompile_material(material)
     require(
         unreal.EditorAssetLibrary.save_loaded_asset(material, False),
-        f"Could not save {ASSET_PATH}",
+        f"Could not save {WPO_ASSET_PATH}",
     )
-    unreal.log(f"Generated deterministic WPO validation material: {ASSET_PATH}")
+    unreal.log(f"Generated deterministic WPO validation material: {WPO_ASSET_PATH}")
+
+
+def generate_vfx_material() -> None:
+    existing_material = unreal.load_asset(VFX_MATERIAL_ASSET_PATH)
+    if (
+        existing_material is not None
+        and not has_command_line_flag("--replace-vfx-material")
+    ):
+        existing_material.set_editor_property("used_with_niagara_sprites", True)
+        existing_material.set_editor_property("used_with_niagara_ribbons", True)
+        existing_material.set_editor_property(
+            "translucency_pass", unreal.MaterialTranslucencyPass.MTP_AFTER_DOF
+        )
+        # Changing TranslucencyPass affects mesh-pass shader compilation. Saving
+        # the package alone can leave the already-compiled default (Before DOF)
+        # resource active in command-line game captures, even though the editor
+        # property serializes as After DOF.
+        unreal.MaterialEditingLibrary.recompile_material(existing_material)
+        require(
+            unreal.EditorAssetLibrary.save_loaded_asset(existing_material, False),
+            f"Could not update usage flags on {VFX_MATERIAL_ASSET_PATH}",
+        )
+        unreal.log(
+            f"Preserving existing Niagara sprite validation material: "
+            f"{VFX_MATERIAL_ASSET_PATH} (pass --replace-vfx-material to rebuild it)"
+        )
+        return
+    if existing_material is not None:
+        require(
+            unreal.EditorAssetLibrary.delete_asset(VFX_MATERIAL_ASSET_PATH),
+            f"Could not replace generated asset {VFX_MATERIAL_ASSET_PATH}",
+        )
+    material = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+        VFX_MATERIAL_ASSET_NAME,
+        PACKAGE_PATH,
+        unreal.Material,
+        unreal.MaterialFactoryNew(),
+    )
+    if material is None:
+        raise RuntimeError(f"Could not create {VFX_MATERIAL_ASSET_PATH}")
+    material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+    material.set_editor_property(
+        "shading_model", unreal.MaterialShadingModel.MSM_UNLIT
+    )
+    material.set_editor_property("two_sided", True)
+    material.set_editor_property("used_with_niagara_sprites", True)
+    material.set_editor_property("used_with_niagara_ribbons", True)
+    material.set_editor_property(
+        "translucency_pass", unreal.MaterialTranslucencyPass.MTP_AFTER_DOF
+    )
+
+    emissive = create_expression(
+        material, unreal.MaterialExpressionConstant3Vector, -350, -80
+    )
+    emissive.set_editor_property("constant", unreal.LinearColor(5.0, 0.02, 2.0, 1.0))
+    opacity = create_expression(material, unreal.MaterialExpressionConstant, -350, 80)
+    opacity.set_editor_property("r", 0.85)
+    require(
+        unreal.MaterialEditingLibrary.connect_material_property(
+            emissive, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR
+        ),
+        "Could not connect VFX fixture emissive color",
+    )
+    require(
+        unreal.MaterialEditingLibrary.connect_material_property(
+            opacity, "", unreal.MaterialProperty.MP_OPACITY
+        ),
+        "Could not connect VFX fixture opacity",
+    )
+    unreal.MaterialEditingLibrary.layout_material_expressions(material)
+    unreal.MaterialEditingLibrary.recompile_material(material)
+    require(
+        unreal.EditorAssetLibrary.save_loaded_asset(material, False),
+        f"Could not save {VFX_MATERIAL_ASSET_PATH}",
+    )
+    unreal.log(f"Generated Niagara sprite validation material: {VFX_MATERIAL_ASSET_PATH}")
+
+
+def generate_niagara_system() -> None:
+    # Build from a deterministic grid emitter instead of duplicating a system
+    # template whose modules explicitly opt into non-deterministic random
+    # distributions. A small editor-only C++ bridge adds the emitter because
+    # FNiagaraEmitterHandle is not exposed to Unreal Python.
+    template = unreal.load_asset(NIAGARA_EMITTER_TEMPLATE_PATH)
+    require(
+        template is not None,
+        f"Missing built-in Niagara emitter template {NIAGARA_EMITTER_TEMPLATE_PATH}",
+    )
+    existing_system = unreal.load_asset(NIAGARA_ASSET_PATH)
+    if existing_system is not None and not has_command_line_flag("--replace-niagara"):
+        unreal.log(
+            f"Preserving existing Niagara validation system: {NIAGARA_ASSET_PATH} "
+            "(pass --replace-niagara to rebuild it)"
+        )
+        return
+    if existing_system is not None:
+        require(
+            unreal.EditorAssetLibrary.delete_asset(NIAGARA_ASSET_PATH),
+            f"Could not replace generated asset {NIAGARA_ASSET_PATH}",
+        )
+    generation_result = unreal.SRDatasetBlueprintLibrary.generate_validation_niagara_system_asset(
+        NIAGARA_ASSET_PATH,
+        NIAGARA_EMITTER_TEMPLATE_PATH,
+        1337,
+    )
+    unreal.log(
+        f"Validation Niagara editor bridge result: {generation_result!r} "
+        f"({type(generation_result)!r})"
+    )
+    if isinstance(generation_result, tuple):
+        generated, generation_error = generation_result
+    elif isinstance(generation_result, str):
+        # Unreal Python exposes a sole FString out parameter directly and omits
+        # the native bool return value. Empty OutError means the bridge succeeded.
+        generated, generation_error = not generation_result, generation_result
+    else:
+        generated, generation_error = bool(generation_result), "unknown editor bridge error"
+    require(generated, generation_error)
+    system = unreal.load_asset(NIAGARA_ASSET_PATH)
+    if system is None:
+        raise RuntimeError(
+            f"Could not load generated Niagara system {NIAGARA_ASSET_PATH}"
+        )
+    # These properties are consumed when a component instance is initialized.
+    # Runtime capture also enforces and restores them for host systems.
+    system.set_editor_property("determinism", True)
+    system.set_editor_property("fixed_tick_delta", True)
+    system.set_editor_property("random_seed", 1337)
+    system.set_editor_property("fixed_tick_delta_time", 1.0 / 30.0)
+    require(
+        unreal.EditorAssetLibrary.save_loaded_asset(system, False),
+        f"Could not save {NIAGARA_ASSET_PATH}",
+    )
+    unreal.log(
+        "Generated deterministic Niagara validation system: "
+        f"{NIAGARA_ASSET_PATH} from {NIAGARA_EMITTER_TEMPLATE_PATH}"
+    )
+
+
+def generate() -> None:
+    unreal.EditorAssetLibrary.make_directory(PACKAGE_PATH)
+    generate_wpo_material()
+    generate_vfx_material()
+    generate_niagara_system()
 
 
 if __name__ == "__main__":

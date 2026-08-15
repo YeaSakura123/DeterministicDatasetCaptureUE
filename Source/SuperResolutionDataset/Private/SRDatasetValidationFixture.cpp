@@ -7,6 +7,12 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "Engine/SkeletalMesh.h"
+#include "NiagaraComponent.h"
+#include "NiagaraEmitter.h"
+#include "NiagaraEmitterHandle.h"
+#include "NiagaraRibbonRendererProperties.h"
+#include "NiagaraSpriteRendererProperties.h"
+#include "NiagaraSystem.h"
 #include "UObject/ConstructorHelpers.h"
 
 namespace SRDataset::ValidationFixture
@@ -29,6 +35,12 @@ namespace SRDataset::ValidationFixture
 	constexpr float WPOComponentUpCm = 75.0f;
 	constexpr float WPOLeftCm = -35.0f;
 	constexpr float WPORightCm = 35.0f;
+	// Keep the VFX probe off the opaque chart so translucent sprites must change
+	// visible scene pixels rather than disappearing against the white panel.
+	constexpr float NiagaraForwardCm = 400.0f;
+	constexpr float NiagaraRightCm = -300.0f;
+	constexpr float NiagaraUpCm = 140.0f;
+	constexpr float NiagaraValidationRadiusAt256Pixels = 34.0f;
 	constexpr float PanelThicknessCm = 2.0f;
 	const FName SkeletalRootBoneName(TEXT("Bone01"));
 	const FName WPOCurrentWorldParameter(TEXT("SRDatasetWPOCurrentWorldCm"));
@@ -51,6 +63,7 @@ ASRDatasetValidationFixture::ASRDatasetValidationFixture()
 	TranslucentPanel = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("TranslucentPanel"));
 	SkeletalCube = CreateDefaultSubobject<UPoseableMeshComponent>(TEXT("SkeletalCube"));
 	WPOCube = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("WPOCube"));
+	NiagaraFixture = CreateDefaultSubobject<UNiagaraComponent>(TEXT("NiagaraVFXFixture"));
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeMeshFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
 	static ConstructorHelpers::FObjectFinder<USkeletalMesh> SkeletalCubeFinder(
@@ -61,9 +74,12 @@ ASRDatasetValidationFixture::ASRDatasetValidationFixture()
 		TEXT("/Engine/EngineDebugMaterials/M_SimpleUnlitTranslucent.M_SimpleUnlitTranslucent"));
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> WPOBaseMaterialFinder(
 		TEXT("/SuperResolutionDataset/Validation/M_SRDatasetWPOFixture.M_SRDatasetWPOFixture"));
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> VFXSpriteMaterialFinder(
+		TEXT("/SuperResolutionDataset/Validation/M_SRDatasetVFXSpriteFixture.M_SRDatasetVFXSpriteFixture"));
 	OpaqueMaterial = OpaqueMaterialFinder.Object;
 	TranslucentMaterial = TranslucentMaterialFinder.Object;
 	WPOBaseMaterial = WPOBaseMaterialFinder.Object;
+	VFXSpriteMaterial = VFXSpriteMaterialFinder.Object;
 
 	for (UStaticMeshComponent* Component : {
 		MovingCube.Get(), BackgroundPanel.Get(), DepthOneMeterPanel.Get(), DepthTenMetersPanel.Get(),
@@ -107,15 +123,33 @@ ASRDatasetValidationFixture::ASRDatasetValidationFixture()
 	SkeletalCube->SetReceivesDecals(false);
 	SkeletalCube->SetMaterial(0, OpaqueMaterial);
 	ConfigurePrimitive(SkeletalCube, SkeletalObjectId);
+
+	NiagaraFixture->SetupAttachment(SceneRoot);
+	NiagaraFixture->SetAutoActivate(true);
+	NiagaraFixture->SetMobility(EComponentMobility::Movable);
+	NiagaraFixture->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	NiagaraFixture->SetGenerateOverlapEvents(false);
+	NiagaraFixture->SetCastShadow(false);
+	NiagaraFixture->SetAllowScalability(false);
+	NiagaraFixture->SetForceLocalPlayerEffect(true);
+	NiagaraFixture->SetRenderingEnabled(true);
+	NiagaraFixture->SetSystemFixedBounds(FBox(FVector(-300.0), FVector(300.0)));
 }
 
 bool ASRDatasetValidationFixture::Configure(FString& OutError)
 {
+	// Loading a Niagara system from the actor CDO constructor can run before the
+	// Niagara runtime module reaches PreDefault in command-line -game sessions.
+	// Defer it until the subsystem prepares the fixture after module startup.
+	NiagaraSystem = LoadObject<UNiagaraSystem>(
+		nullptr,
+		TEXT("/SuperResolutionDataset/Validation/NS_SRDatasetVFXFixture.NS_SRDatasetVFXFixture"));
 	if (!MovingCube->GetStaticMesh() || !OpaqueMaterial || !TranslucentMaterial || !WPOBaseMaterial ||
-		!SkeletalCube->GetSkinnedAsset() ||
+		!VFXSpriteMaterial ||
+		!SkeletalCube->GetSkinnedAsset() || !NiagaraSystem ||
 		SkeletalCube->GetBoneIndex(SRDataset::ValidationFixture::SkeletalRootBoneName) == INDEX_NONE)
 	{
-		OutError = TEXT("Semantic validation fixture could not load its Engine mesh/material assets or plugin WPO material.");
+		OutError = TEXT("Semantic validation fixture could not load its Engine mesh/material assets or plugin WPO/Niagara assets.");
 		return false;
 	}
 	WPOMaterial = UMaterialInstanceDynamic::Create(WPOBaseMaterial, this);
@@ -125,6 +159,25 @@ bool ASRDatasetValidationFixture::Configure(FString& OutError)
 		return false;
 	}
 	WPOCube->SetMaterial(0, WPOMaterial);
+	for (FNiagaraEmitterHandle& EmitterHandle : NiagaraSystem->GetEmitterHandles())
+	{
+		if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+		{
+			for (UNiagaraRendererProperties* Renderer : EmitterData->GetRenderers())
+			{
+				if (UNiagaraSpriteRendererProperties* Sprite = Cast<UNiagaraSpriteRendererProperties>(Renderer))
+				{
+					Sprite->Material = VFXSpriteMaterial;
+				}
+				else if (UNiagaraRibbonRendererProperties* Ribbon = Cast<UNiagaraRibbonRendererProperties>(Renderer))
+				{
+					Ribbon->Material = VFXSpriteMaterial;
+				}
+			}
+		}
+	}
+	NiagaraFixture->SetAsset(NiagaraSystem);
+	NiagaraFixture->Activate(true);
 	OutError.Reset();
 	return true;
 }
@@ -203,6 +256,10 @@ void ASRDatasetValidationFixture::Evaluate(
 	WPOMaterial->SetVectorParameterValue(
 		WPOPreviousWorldParameter,
 		FLinearColor(PreviousWPOWorld.X, PreviousWPOWorld.Y, PreviousWPOWorld.Z, 0.0f));
+	NiagaraFixture->SetWorldTransform(FTransform(
+		CameraView.Rotation,
+		CameraView.Location + CameraForward * NiagaraForwardCm +
+			CameraRight * NiagaraRightCm + CameraUp * NiagaraUpCm));
 	SkeletalCube->SetWorldTransform(FTransform(
 		CameraView.Rotation,
 		CameraView.Location + CameraForward * SkeletalForwardCm +
@@ -247,6 +304,16 @@ void ASRDatasetValidationFixture::Evaluate(
 	FrameMetadata.ExpectedWPOMotionDisplayPixels = FVector2f(
 		(PreviousWPORight - WPORight) * WPOPixelsPerRightCm,
 		0.0f);
+	const float CameraFocalLengthPixels = 0.5f * static_cast<float>(DisplaySize.X) /
+		FMath::Tan(0.5f * HorizontalFovRadians);
+	FrameMetadata.NiagaraAnchorDisplayPixels = FVector2f(
+		0.5f * static_cast<float>(DisplaySize.X) +
+			NiagaraRightCm * CameraFocalLengthPixels / NiagaraForwardCm,
+		0.5f * static_cast<float>(DisplaySize.Y) -
+			NiagaraUpCm * CameraFocalLengthPixels / NiagaraForwardCm);
+	FrameMetadata.NiagaraValidationRadiusDisplayPixels =
+		NiagaraValidationRadiusAt256Pixels * static_cast<float>(DisplaySize.X) / 256.0f;
+	FrameMetadata.bNiagaraVisibleProbeExpected = LogicalFrame - StartFrame >= 15;
 	FrameMetadata.ExpectedFrontDepthMeters.Add(DepthOneMeterObjectId, (100.0f - 0.5f * PanelThicknessCm) * 0.01f);
 	FrameMetadata.ExpectedFrontDepthMeters.Add(DepthTenMetersObjectId, (1000.0f - 0.5f * PanelThicknessCm) * 0.01f);
 	FrameMetadata.ExpectedFrontDepthMeters.Add(DepthHundredMetersObjectId, (10000.0f - 0.5f * PanelThicknessCm) * 0.01f);

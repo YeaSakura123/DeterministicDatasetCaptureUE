@@ -79,9 +79,22 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay")
 	FString ExpectedMap;
 
-	/** Uses the active Sequencer camera first, then this tag, then player camera 0. */
+	/** Uses the active Sequencer camera first, then this tag, then player camera 0 unless the deterministic override is enabled. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")
 	FName CameraActorTag;
+
+	/** Spawn and lock the player Main View to an explicit camera for cross-process replay. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")
+	bool bUseDeterministicCameraTransform = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (EditCondition = "bUseDeterministicCameraTransform"))
+	FVector DeterministicCameraLocationCm = FVector::ZeroVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (EditCondition = "bUseDeterministicCameraTransform"))
+	FRotator DeterministicCameraRotationDegrees = FRotator::ZeroRotator;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (EditCondition = "bUseDeterministicCameraTransform", ClampMin = "5.0", ClampMax = "170.0"))
+	float DeterministicCameraFOVDegrees = 90.0f;
 
 	/** Inclusive source-frame interval in CaptureFrameRate time. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Frames", meta = (ClampMin = "0"))
@@ -160,6 +173,14 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureMainViewTemporalDiagnostics"))
 	bool bCaptureMainViewHUDlessColor = false;
 
+	/**
+	 * Capture the screen-space game UI layer independently on a transparent
+	 * display-resolution target. RGB is premultiplied by straight coverage alpha;
+	 * the scene/backbuffer is never used to infer alpha.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureMainViewHUDlessColor"))
+	bool bCaptureUIColorAlpha = false;
+
 	/** Relative paths resolve beneath the project directory. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
 	FString OutputDirectory = TEXT("Saved/SRDataset/default");
@@ -194,6 +215,39 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	/** Disables parallel/async render paths whose completion order can perturb offline captures. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
 	bool bForceSynchronousRendering = true;
+
+	/**
+	 * Override every dataset SceneViewFamily's game time and signed delta from
+	 * logical current/previous frame IDs, while freezing real time at a stable
+	 * non-zero origin. This makes Time-driven materials and WPO independent of
+	 * wall-clock time and replay direction without resetting temporal view state.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
+	bool bLockMaterialTimeToLogicalFrame = true;
+
+	/**
+	 * Fail before and during capture if any visible registered UWidgetComponent
+	 * exists. Screen-space Slate/UMG is captured separately; world/component UI
+	 * must not silently remain in the HUD-less scene target.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
+	bool bRejectVisibleWidgetComponents = true;
+
+	/**
+	 * Bake every registered skeletal component pose during a forward warmup
+	 * prepass and replay those component-space bones by logical frame. This is
+	 * the deterministic adapter for otherwise stateful AnimBP/gameplay poses.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
+	bool bCacheSkeletalAnimationPosesForReplay = false;
+
+	/** Optional shared pose-cache artifact to load before replay (project-relative or absolute). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism", meta = (EditCondition = "bCacheSkeletalAnimationPosesForReplay"))
+	FString SkeletalPoseCacheInputFile;
+
+	/** Optional shared pose-cache artifact written after the forward warmup bake. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism", meta = (EditCondition = "bCacheSkeletalAnimationPosesForReplay"))
+	FString SkeletalPoseCacheOutputFile;
 
 	/**
 	 * Bind the non-shipping Temporal AA/TSR jitter phase to logical frame ID.
@@ -242,6 +296,22 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation")
 	bool bEnableSemanticValidationFixture = false;
+
+	/** Assign temporary Custom Stencil IDs to non-fixture skeletal components and require their production-scene pose/motion gate. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheSkeletalAnimationPosesForReplay"))
+	bool bValidateNonFixtureSkeletalAnimation = false;
+
+	/** Optional project-authored Actor/AnimBP probe spawned by the non-fixture skeletal gate. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bValidateNonFixtureSkeletalAnimation"))
+	FSoftClassPath NonFixtureSkeletalValidationActorClass;
+
+	/** Apply a project-authored animated surface material to a labeled transient receiver and require logical-time replay evidence. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation")
+	bool bValidateProjectAnimatedMaterial = false;
+
+	/** Project-authored material or material instance used by the animated-material validation receiver. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bValidateProjectAnimatedMaterial"))
+	FSoftObjectPath ProjectAnimatedMaterialValidationMaterial;
 
 	/** Exit Unreal automatically after a command-line job completes or fails. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Automation")

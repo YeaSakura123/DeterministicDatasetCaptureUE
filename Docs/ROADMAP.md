@@ -44,9 +44,13 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Capture `motion_0_to_1` in an independent reverse-endpoint process; never infer it by negation.
 - [x] Validate controlled pure-skinning endpoint motion by injecting double-buffered component-space bones in both directions.
 - [x] Validate explicit `PreviousFrameSwitch` WPO endpoint motion in forward/reverse/midpoint processes and the assembled pair.
-- [ ] Capture UI Color/Alpha independently and validate zero UI residue in HUD-less color.
-- [ ] Validate non-fixture AnimBP, project WPO/animated materials, Niagara and translucency endpoint motion.
-- [ ] Certify disocclusion/visibility for unlabeled moving, skeletal, WPO and animated-material geometry and capture both endpoint directions.
+- [x] Capture screen-space UI Color/Alpha independently and reject visible registered world-space `UWidgetComponent` residue in HUD-less color.
+- [x] Validate a real project AnimBP through a shared portable pose cache in both endpoint directions.
+- [x] Validate a real project-authored time-animated material at exact logical frames in both traversal directions.
+- [x] Validate labeled project-skeletal reveal/occlusion evidence in both endpoint directions.
+- [x] Validate Niagara and translucency fixture playback at endpoints and intermediate time.
+- [ ] Validate a project-authored WPO asset with explicit current/previous endpoint motion; the checked project contains no suitable asset.
+- [ ] Generalize production disocclusion/visibility beyond labeled project skeletal probes to arbitrary unlabeled moving, WPO and animated-material geometry.
 - [ ] Add static/camera-only/mixed-motion and four-direction jitter-sign fixtures.
 - [ ] Add a preflight scanner for every tickable actor, Niagara data interface and nondeterministic material input.
 - [ ] Add Niagara Sim Cache, Chaos cache and an actor-state recorder for non-Sequencer gameplay.
@@ -123,3 +127,13 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - WPO native Velocity coverage was 100% in both directions. Expected `-17.23077/+17.23077` display pixels measured `-17.23032/+17.23033`.
 - The self-contained FG pair re-measured both WPO fields and passed 131/131 integrity checks. Opposite auxiliary capture-order comparison passed 599/599 checks.
 - UI RGBA, non-fixture AnimBP/project WPO/animated-material coverage and production-certified bidirectional visibility remain open, so FG certification remains false.
+
+## Version 0.5.0 project replay, UI isolation and formal-resolution snapshot
+
+- UE 5.7 Development Editor build passed on Windows/D3D12 with an AMD Radeon RX 7900 XTX.
+- Fast semantic regression passed 461/461 validator-v9 checks with independent UI RGBA and zero visible registered `UWidgetComponent` residue.
+- Formal two-frame capture produced real `1920x1080` HR/HUD-less/UI/main-depth files and `960x540` LR/temporal files; validation passed 431/431 checks.
+- FG forward/reverse/intermediate captures passed 469/469, 469/469 and 247/247 checks.
+- Real project AnimBP forward/reverse captures passed 385/385 checks in each direction and shared the exact same pose-cache artifact; 17-18 skeletal reveal/occlusion pixels per direction were validity-gated and rejected correctly.
+- Real project animated-material forward/reverse captures passed 1279/1279 checks in each direction; the cross-direction logical-time/color comparison passed 1452/1452 checks.
+- The self-contained assembled pair copied and revalidated all project evidence and passed 186/186 checks. Its sole remaining declared requirement is project-authored WPO endpoint-motion validation, so FG certification remains false.
