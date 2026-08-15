@@ -1880,6 +1880,360 @@ def validate_stable_instance_ids(
     return (reported_hash if hash_valid else ""), set(expected_ids if schema_valid else [])
 
 
+def finite_distribution(values: np.ndarray) -> dict[str, float | int | None]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return {
+            "count": 0,
+            "min": None,
+            "p01": None,
+            "p05": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+            "mean": None,
+        }
+    percentiles = np.percentile(finite, (1.0, 5.0, 50.0, 95.0, 99.0))
+    return {
+        "count": int(finite.size),
+        "min": float(np.min(finite)),
+        "p01": float(percentiles[0]),
+        "p05": float(percentiles[1]),
+        "p50": float(percentiles[2]),
+        "p95": float(percentiles[3]),
+        "p99": float(percentiles[4]),
+        "max": float(np.max(finite)),
+        "mean": float(np.mean(finite)),
+    }
+
+
+def camera_motion_metrics(
+    frame: dict[str, Any], previous_frame: dict[str, Any] | None
+) -> dict[str, float | bool | None]:
+    if previous_frame is None or frame.get("reset") is True:
+        return {
+            "hasPreviousSample": False,
+            "translationMeters": 0.0,
+            "translationSpeedMetersPerSecond": 0.0,
+            "rotationDegrees": 0.0,
+            "angularSpeedDegreesPerSecond": 0.0,
+        }
+    camera = frame.get("camera", {})
+    previous_camera = previous_frame.get("camera", {})
+    location = np.asarray(camera.get("locationCm", []), dtype=np.float64)
+    previous_location = np.asarray(
+        previous_camera.get("locationCm", []), dtype=np.float64
+    )
+    rotation = np.asarray(camera.get("rotationDeg", []), dtype=np.float64)
+    previous_rotation = np.asarray(
+        previous_camera.get("rotationDeg", []), dtype=np.float64
+    )
+    time_span = abs(
+        float(frame.get("simulationTimeS", 0.0))
+        - float(previous_frame.get("simulationTimeS", 0.0))
+    )
+    if time_span <= 0.0:
+        time_span = abs(float(frame.get("deltaTimeS", 0.0)))
+    if (
+        location.shape != (3,)
+        or previous_location.shape != (3,)
+        or rotation.shape != (3,)
+        or previous_rotation.shape != (3,)
+        or not np.isfinite(location).all()
+        or not np.isfinite(previous_location).all()
+        or not np.isfinite(rotation).all()
+        or not np.isfinite(previous_rotation).all()
+    ):
+        return {
+            "hasPreviousSample": False,
+            "translationMeters": None,
+            "translationSpeedMetersPerSecond": None,
+            "rotationDegrees": None,
+            "angularSpeedDegreesPerSecond": None,
+        }
+
+    translation_meters = float(np.linalg.norm(location - previous_location) * 0.01)
+    # Profile camera rotation with the shortest wrapped Euler delta. This is
+    # intentionally a distribution diagnostic, not a replacement for the exact
+    # current/previous matrices used by reprojection validation.
+    wrapped_rotation_delta = (rotation - previous_rotation + 180.0) % 360.0 - 180.0
+    rotation_degrees = float(np.linalg.norm(wrapped_rotation_delta))
+    return {
+        "hasPreviousSample": True,
+        "translationMeters": translation_meters,
+        "translationSpeedMetersPerSecond": (
+            translation_meters / time_span if time_span > 0.0 else None
+        ),
+        "rotationDegrees": rotation_degrees,
+        "angularSpeedDegreesPerSecond": (
+            rotation_degrees / time_span if time_span > 0.0 else None
+        ),
+    }
+
+
+def compute_frame_training_profile(
+    frame: dict[str, Any],
+    previous_frame: dict[str, Any] | None,
+    pixels: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    profile: dict[str, Any] = {
+        "logicalFrameId": int(frame.get("logicalFrameId", -1)),
+        "simulationTimeS": float(frame.get("simulationTimeS", math.nan)),
+        "reset": bool(frame.get("reset", False)),
+        "camera": camera_motion_metrics(frame, previous_frame),
+    }
+
+    motion = pixels.get("motion_full_current_to_previous")
+    motion_valid_pixels = pixels.get("motion_valid")
+    velocity_coverage_pixels = pixels.get("velocity_coverage")
+    if motion is not None and motion_valid_pixels is not None:
+        motion_valid = motion_valid_pixels[..., 0] >= 0.5
+        finite_motion = np.isfinite(motion[..., 0]) & np.isfinite(motion[..., 1])
+        usable_motion = motion_valid & finite_motion
+        magnitude = np.hypot(motion[..., 0], motion[..., 1])
+        motion_profile: dict[str, Any] = {
+            "validRatio": float(np.mean(motion_valid)),
+            "finiteValidRatio": float(np.mean(usable_motion)),
+            "magnitudeDisplayPixels": finite_distribution(magnitude[usable_motion]),
+        }
+        if velocity_coverage_pixels is not None:
+            motion_profile["nativeVelocityCoverageRatio"] = float(
+                np.mean(velocity_coverage_pixels[..., 0] >= 0.5)
+            )
+        profile["motion"] = motion_profile
+
+    rejection_pixels = pixels.get(
+        "disocclusion_mask", pixels.get("history_rejection_mask")
+    )
+    rejection_valid_pixels = pixels.get(
+        "disocclusion_valid", pixels.get("history_rejection_valid")
+    )
+    rejection_reason_pixels = pixels.get(
+        "disocclusion_reason", pixels.get("history_rejection_reason")
+    )
+    if rejection_pixels is not None and rejection_valid_pixels is not None:
+        rejection = rejection_pixels[..., 0] >= 0.5
+        rejection_valid = rejection_valid_pixels[..., 0] >= 0.5
+        valid_count = int(np.count_nonzero(rejection_valid))
+        disocclusion_profile: dict[str, Any] = {
+            "validRatio": float(np.mean(rejection_valid)),
+            "rejectRatioAllPixels": float(np.mean(rejection)),
+            "rejectRatioAmongValid": (
+                float(np.mean(rejection[rejection_valid])) if valid_count else None
+            ),
+            "uncertainRejectRatio": float(np.mean(rejection & ~rejection_valid)),
+        }
+        if rejection_reason_pixels is not None:
+            reason = np.rint(rejection_reason_pixels[..., 0]).astype(np.int32)
+            disocclusion_profile["reasonCounts"] = {
+                str(code): int(np.count_nonzero(reason == code)) for code in range(9)
+            }
+        profile["disocclusion"] = disocclusion_profile
+
+    for modality, output_name in (
+        ("reactive_mask", "reactive"),
+        ("transparency_mask", "transparency"),
+    ):
+        mask_pixels = pixels.get(modality)
+        if mask_pixels is None:
+            continue
+        coverage = np.clip(mask_pixels[..., 0], 0.0, 1.0)
+        profile[output_name] = {
+            "coveredPixelRatio": float(np.mean(coverage > 1.0e-4)),
+            "strongPixelRatio": float(np.mean(coverage >= 0.5)),
+            "meanCoverage": float(np.mean(coverage)),
+        }
+
+    depth_pixels = pixels.get("depth_view_linear_meters")
+    depth_valid_pixels = pixels.get("depth_valid")
+    if depth_pixels is not None and depth_valid_pixels is not None:
+        depth = depth_pixels[..., 0]
+        depth_valid = (
+            (depth_valid_pixels[..., 0] >= 0.5)
+            & np.isfinite(depth)
+            & (depth > 0.0)
+        )
+        profile["depth"] = {
+            "validRatio": float(np.mean(depth_valid)),
+            "linearMeters": finite_distribution(depth[depth_valid]),
+        }
+
+    color_pixels = pixels.get("color_lr_scene_hdr")
+    temporal = frame.get("temporalDiagnostics", {})
+    if color_pixels is not None:
+        pre_exposure = float(temporal.get("preExposure", 1.0))
+        exposure = float(temporal.get("exposure", math.nan))
+        radiance = color_pixels[..., :3].astype(np.float64)
+        if math.isfinite(pre_exposure) and pre_exposure > 0.0:
+            radiance = radiance / pre_exposure
+        luminance = (
+            radiance[..., 0] * 0.2126
+            + radiance[..., 1] * 0.7152
+            + radiance[..., 2] * 0.0722
+        )
+        finite_luminance = luminance[np.isfinite(luminance)]
+        luminance_distribution = finite_distribution(finite_luminance)
+        luminance_p95 = luminance_distribution.get("p95")
+        normalization = (
+            max(float(luminance_p95), 1.0e-6)
+            if isinstance(luminance_p95, (int, float))
+            and math.isfinite(float(luminance_p95))
+            else 1.0e-6
+        )
+        normalized_luminance = np.clip(luminance / normalization, 0.0, 1.0)
+        horizontal_gradient = np.abs(np.diff(normalized_luminance, axis=1))
+        vertical_gradient = np.abs(np.diff(normalized_luminance, axis=0))
+        gradient = np.hypot(
+            horizontal_gradient[:-1, :], vertical_gradient[:, :-1]
+        )
+        profile["color"] = {
+            "preExposure": pre_exposure,
+            "exposure": exposure,
+            "negativeLuminanceRatio": float(np.mean(luminance < 0.0)),
+            "luminanceAfterPreExposureRemoval": luminance_distribution,
+            "highFrequencyEnergy": float(np.mean(gradient)),
+            "edgeDensityAtNormalizedGradient005": float(np.mean(gradient >= 0.05)),
+        }
+        if previous_frame is not None and frame.get("reset") is not True:
+            previous_temporal = previous_frame.get("temporalDiagnostics", {})
+            previous_exposure = float(previous_temporal.get("exposure", math.nan))
+            previous_pre_exposure = float(
+                previous_temporal.get("preExposure", math.nan)
+            )
+            profile["color"]["exposureChangeStops"] = (
+                float(math.log2(exposure / previous_exposure))
+                if math.isfinite(exposure)
+                and math.isfinite(previous_exposure)
+                and exposure > 0.0
+                and previous_exposure > 0.0
+                else None
+            )
+            profile["color"]["preExposureChangeStops"] = (
+                float(math.log2(pre_exposure / previous_pre_exposure))
+                if math.isfinite(pre_exposure)
+                and math.isfinite(previous_pre_exposure)
+                and pre_exposure > 0.0
+                and previous_pre_exposure > 0.0
+                else None
+            )
+    return profile
+
+
+def aggregate_training_profile(frame_profiles: list[dict[str, Any]]) -> dict[str, Any]:
+    def metric(
+        path: tuple[str, ...],
+        *,
+        include_reset: bool = True,
+        require_previous_camera_sample: bool = False,
+    ) -> np.ndarray:
+        values: list[float] = []
+        for frame_profile in frame_profiles:
+            if not include_reset and frame_profile.get("reset") is True:
+                continue
+            if require_previous_camera_sample and not bool(
+                frame_profile.get("camera", {}).get("hasPreviousSample", False)
+            ):
+                continue
+            value: Any = frame_profile
+            for key in path:
+                value = value.get(key) if isinstance(value, dict) else None
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                values.append(float(value))
+        return np.asarray(values, dtype=np.float64)
+
+    motion_p95 = metric(
+        ("motion", "magnitudeDisplayPixels", "p95"), include_reset=False
+    )
+    disocclusion_ratio = metric(
+        ("disocclusion", "rejectRatioAmongValid"), include_reset=False
+    )
+    uncertain_ratio = metric(
+        ("disocclusion", "uncertainRejectRatio"), include_reset=False
+    )
+    reactive_ratio = metric(("reactive", "coveredPixelRatio"))
+    transparency_ratio = metric(("transparency", "coveredPixelRatio"))
+    edge_density = metric(("color", "edgeDensityAtNormalizedGradient005"))
+    high_frequency = metric(("color", "highFrequencyEnergy"))
+    luminance_p95 = metric(
+        ("color", "luminanceAfterPreExposureRemoval", "p95")
+    )
+    depth_p05_meters = metric(("depth", "linearMeters", "p05"))
+    depth_p95_meters = metric(("depth", "linearMeters", "p95"))
+    exposure_change_stops = metric(("color", "exposureChangeStops"))
+    camera_translation_speed = metric(
+        ("camera", "translationSpeedMetersPerSecond"),
+        require_previous_camera_sample=True,
+    )
+    camera_angular_speed = metric(
+        ("camera", "angularSpeedDegreesPerSecond"),
+        require_previous_camera_sample=True,
+    )
+
+    motion_bucket_counts = {
+        "static_lt_0_1_px": int(np.count_nonzero(motion_p95 < 0.1)),
+        "slow_0_1_to_2_px": int(
+            np.count_nonzero((motion_p95 >= 0.1) & (motion_p95 < 2.0))
+        ),
+        "medium_2_to_10_px": int(
+            np.count_nonzero((motion_p95 >= 2.0) & (motion_p95 < 10.0))
+        ),
+        "fast_ge_10_px": int(np.count_nonzero(motion_p95 >= 10.0)),
+    }
+    recommendations: list[str] = []
+    if motion_p95.size and motion_bucket_counts["static_lt_0_1_px"] == motion_p95.size:
+        recommendations.append(
+            "All profiled frames are static at motion p95 < 0.1 display pixel; add camera/object motion clips before training."
+        )
+    if disocclusion_ratio.size and float(np.max(disocclusion_ratio)) < 0.01:
+        recommendations.append(
+            "No frame has at least 1% valid rejected-history pixels; add foreground reveal/occlusion clips."
+        )
+    if reactive_ratio.size and float(np.max(reactive_ratio)) < 0.001:
+        recommendations.append(
+            "Reactive coverage is below 0.1% in every frame; add particles/translucency clips if they are in deployment scope."
+        )
+    if camera_angular_speed.size and float(np.max(camera_angular_speed)) < 1.0:
+        recommendations.append(
+            "Camera angular speed never reaches 1 degree/s; add rotation and fast-pan clips."
+        )
+    return {
+        "schemaVersion": 1,
+        "status": "diagnostic_not_a_certification_gate",
+        "frameCount": len(frame_profiles),
+        "temporalDistributionExcludesResetFrames": True,
+        "motionP95DisplayPixelsAcrossFrames": finite_distribution(motion_p95),
+        "motionBucketCounts": motion_bucket_counts,
+        "validDisocclusionRatioAcrossFrames": finite_distribution(
+            disocclusion_ratio
+        ),
+        "uncertainDisocclusionRatioAcrossFrames": finite_distribution(
+            uncertain_ratio
+        ),
+        "reactiveCoveredRatioAcrossFrames": finite_distribution(reactive_ratio),
+        "transparentCoveredRatioAcrossFrames": finite_distribution(
+            transparency_ratio
+        ),
+        "edgeDensityAcrossFrames": finite_distribution(edge_density),
+        "highFrequencyEnergyAcrossFrames": finite_distribution(high_frequency),
+        "luminanceP95AcrossFrames": finite_distribution(luminance_p95),
+        "depthP05MetersAcrossFrames": finite_distribution(depth_p05_meters),
+        "depthP95MetersAcrossFrames": finite_distribution(depth_p95_meters),
+        "exposureChangeStopsAcrossFrames": finite_distribution(
+            exposure_change_stops
+        ),
+        "cameraTranslationSpeedMetersPerSecondAcrossFrames": finite_distribution(
+            camera_translation_speed
+        ),
+        "cameraAngularSpeedDegreesPerSecondAcrossFrames": finite_distribution(
+            camera_angular_speed
+        ),
+        "recommendations": recommendations,
+        "frames": frame_profiles,
+    }
+
+
 def validate(
     dataset: Path,
     compare: Path | None,
@@ -2293,6 +2647,8 @@ def validate(
     project_animated_material_records: list[
         tuple[int, dict[str, Any], np.ndarray]
     ] = []
+    dataset_profile_frames: list[dict[str, Any]] = []
+    previous_profile_frame: dict[str, Any] | None = None
     all_render_submission_ids: list[int] = []
     for frame in frames:
         frame_id = int(frame["logicalFrameId"])
@@ -3463,6 +3819,15 @@ def validate(
                 (frame_id, material_state, receiver_color)
             )
 
+        dataset_profile_frames.append(
+            compute_frame_training_profile(
+                frame,
+                previous_profile_frame,
+                frame_pixels,
+            )
+        )
+        previous_profile_frame = frame
+
     add_check(
         checks,
         "capture_order.submission_ids_global",
@@ -3473,6 +3838,16 @@ def validate(
 
     if history_rejection_v2:
         validate_history_rejection_v2_cross_frame(checks, frames, frame_paths)
+
+    dataset_profile = aggregate_training_profile(dataset_profile_frames)
+    add_check(
+        checks,
+        "dataset_profile.frame_coverage",
+        len(dataset_profile_frames) == len(frames)
+        and [record["logicalFrameId"] for record in dataset_profile_frames]
+        == [int(frame["logicalFrameId"]) for frame in frames],
+        f"profiled={len(dataset_profile_frames)} manifest={len(frames)}",
+    )
 
     if job.get("bValidateProjectAnimatedMaterial", False):
         material_colors = [
@@ -4738,11 +5113,13 @@ def validate(
         else "not_run"
     )
     report = {
-        "validatorVersion": 14,
+        "validatorVersion": 15,
         "comparisonMode": compare_mode if compare is not None else "none",
         "mainViewSceneCapturePixelDomainGate": pixel_domain_gate,
         "stableInstanceIdGate": stable_instance_gate,
         "disocclusionGate": disocclusion_gate,
+        "datasetProfileGate": "pass",
+        "datasetDiversityGate": "diagnostic",
         "captureOrderInvarianceGate": (
             "pass" if compare is not None and compare_mode == "capture-order" and passed
             else "fail" if compare is not None and compare_mode == "capture-order"
@@ -4773,6 +5150,7 @@ def validate(
         "informationalChecks": len(checks) - len(required_checks),
         "checks": checks,
         "statistics": stats,
+        "datasetProfile": dataset_profile,
         "replayMetrics": replay_metrics,
         "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. Scene-control preflight evidence inventories and hashes ticking Actors/components, loaded Niagara Data Interfaces and known time/random material inputs; strict jobs reject every unclassified record. The optional Main View/SceneCapture LR gate compares the same AfterDOF linear-HDR stage after independent pre-exposure normalization and metadata-defined subpixel jitter alignment, without an extra render submission or simulation advance. Stable instance-ID jobs finalize a fixed renderable-component topology after warmup/streaming, assign collision-free uint8 Custom Stencil IDs, hash an ID-to-component/Actor/class map, fail on topology or label drift and verify that every nonzero raster value resolves through that map; the 255-instance/fixed-topology limit remains explicit. Disocclusion v2 independently reconstructs every non-reset reason from current motion/depth/ID plus the previous saved depth/ID buffers; cross-instance and static-depth decisions are valid, while dynamic same-instance or unlabeled motion is conservatively rejected with validity zero. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU Niagara particle counts and a visible AfterDOF VFX probe. The non-fixture skeletal gate requires a visible project-authored Actor and AnimBP, exact application of the shared cached pose and covered endpoint motion; skeletal-reverse requires exact absolute project poses, camera metadata and object-ID grids, tightly bounded depth-grid differences, and independent directional motion evidence. GPU particle payload readback, generalized actor-state recording, dynamic same-instance surface identity and Main View/reference-HR pixel equivalence remain separate gates.",
     }

@@ -59,10 +59,12 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 
 ## Phase 4 — dataset operations
 
-- Multi-map/multi-sequence job queue and sharding across workers.
-- Per-frame retry journal, disk-space estimation and graceful crash recovery.
-- Dataset index export for common PyTorch/WebDataset layouts.
-- Automated quality gates for blank frames, invalid depth, exposure drift and HR/LR geometric alignment.
+- [ ] Multi-map/multi-sequence job queue and sharding across workers.
+- [ ] Per-frame retry journal, disk-space estimation and graceful crash recovery.
+- [ ] Dataset index export for common PyTorch/WebDataset layouts.
+- [x] Deterministic per-frame/aggregate training-distribution profile for motion, disocclusion, reactive/transparency coverage, depth, luminance, frequency, exposure and camera speed.
+- [ ] Turn selected profile thresholds into configurable production diversity gates; current recommendations are intentionally diagnostic.
+- [ ] Automated quality gates for blank frames, invalid depth, exposure drift and HR/LR geometric alignment.
 
 ## Version 0.2.0 validation snapshot
 
@@ -170,3 +172,10 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - The moving semantic fixture passed 534/534 checks, including 134/134 newly revealed pixels rejected-valid and 305 dynamic same-instance pixels reject-invalid.
 - The fixture-free strict First Person production example captured two `1920x1080` HR / `960x540` LR frames and passed 466/466 checks with zero uncontrolled preflight records and 60 stable IDs.
 - Production-valid dynamic same-instance self-occlusion, dynamic topology and wider IDs remain open.
+
+## Version 0.10.0 training-distribution profile snapshot
+
+- Validator v15 records per-frame and aggregate motion p50/p95 buckets, disocclusion valid/uncertain ratios, reactive/transparency coverage, linear-depth range, pre-exposure-normalized luminance percentiles, edge/high-frequency content, exposure change and camera speed.
+- Reset frames are excluded from temporal distributions. Profile integrity is a required gate; diversity recommendations remain diagnostic so a two-frame validation job is not mistaken for a balanced training corpus.
+- The strict 1080p/540p dataset passed 467/467 and correctly reported its static/no-VFX coverage gaps. The moving/VFX semantic fixture passed 535/535, classified its non-reset sample as fast motion, measured 25.18% valid rejected history and about 5% reactive coverage.
+- Independent stable-ID captures passed 424/424 each; geometry-derived profile values were exact, while color-profile drift stayed within the existing color replay tolerance.

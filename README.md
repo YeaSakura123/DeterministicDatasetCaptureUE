@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.9.0-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.10.0-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,7 +11,7 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.9.0 deliberately separates implemented output from certified training contracts:
+Version 0.10.0 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
@@ -310,6 +310,12 @@ Actors spawned during capture are discovered and prepared before their first eva
 `color_hr_reference_scene_hdr` first renders at `HRResolution * ReferenceHRScale`, then downsamples to the fixed non-jittered HR grid. For example, a 1920x1080 HR target with scale 2 renders internally at 3840x2160 but still writes a 1920x1080 EXR.
 
 ## Verified release evidence
+
+Version 0.10.0 adds a deterministic training-distribution profile to validator v15. It reports per-frame and aggregate motion p50/p95, valid/uncertain disocclusion, reactive/transparency coverage, linear-depth range, pre-exposure-normalized luminance percentiles, edge/high-frequency content, exposure change and camera translation/angular speed. Reset frames are excluded from temporal distributions, and recommendations identify missing motion, reveal, VFX and camera-rotation coverage without weakening the integrity gate. The checked UE 5.7 datasets produced:
+
+- strict fixture-free 1080p/540p example: 467/467 checks and a passing profile-integrity gate; its diagnostic correctly classified the only non-reset sample as static and requested motion/reveal/VFX/rotation coverage;
+- moving/VFX semantic fixture: 535/535 checks; the non-reset frame fell in the fast `motion p95 >= 10 px` bucket, valid rejected-history coverage was 25.18%, and reactive coverage was approximately 5%;
+- two independently captured stable-ID datasets: 424/424 checks each; geometry-derived profile metrics were exact, while small color-profile differences remained bounded by the existing numeric color replay policy.
 
 Version 0.9.0 adds reason-coded, validity-gated disocclusion/history rejection with explicit output aliases and independent cross-frame reconstruction. The checked UE 5.7 runs produced:
 

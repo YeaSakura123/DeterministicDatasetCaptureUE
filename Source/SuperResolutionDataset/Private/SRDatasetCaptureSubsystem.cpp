@@ -2686,7 +2686,7 @@ bool USRDatasetCaptureSubsystem::WriteSceneControlPreflightReport(FString& OutEr
 	};
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 1);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.9.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.10.0"));
 	Root->SetBoolField(TEXT("ran"), SceneControlPreflight.bRan);
 	Root->SetBoolField(TEXT("required"), ActiveJob.bRequireSceneControlPreflight);
 	Root->SetBoolField(TEXT("passed"), SceneControlPreflight.bPassed);
@@ -4667,7 +4667,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.9.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.10.0"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
