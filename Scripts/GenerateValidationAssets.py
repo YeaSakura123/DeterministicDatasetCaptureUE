@@ -25,6 +25,8 @@ NIAGARA_EMITTER_TEMPLATE_PATH = (
 )
 NIAGARA_ASSET_NAME = "NS_SRDatasetVFXFixture"
 NIAGARA_ASSET_PATH = f"{PACKAGE_PATH}/{NIAGARA_ASSET_NAME}"
+NIAGARA_GPU_ASSET_NAME = "NS_SRDatasetGPUVFXFixture"
+NIAGARA_GPU_ASSET_PATH = f"{PACKAGE_PATH}/{NIAGARA_GPU_ASSET_NAME}"
 
 
 def has_command_line_flag(flag: str) -> bool:
@@ -46,7 +48,14 @@ def create_expression(material, expression_class, x: int, y: int):
 
 
 def generate_wpo_material() -> None:
-    if unreal.EditorAssetLibrary.does_asset_exist(WPO_ASSET_PATH):
+    existing_material = unreal.load_asset(WPO_ASSET_PATH)
+    if existing_material is not None and not has_command_line_flag("--replace-wpo"):
+        unreal.log(
+            f"Preserving existing WPO validation material: {WPO_ASSET_PATH} "
+            "(pass --replace-wpo to rebuild it)"
+        )
+        return
+    if existing_material is not None:
         require(
             unreal.EditorAssetLibrary.delete_asset(WPO_ASSET_PATH),
             f"Could not replace generated asset {WPO_ASSET_PATH}",
@@ -206,7 +215,7 @@ def generate_vfx_material() -> None:
     unreal.log(f"Generated Niagara sprite validation material: {VFX_MATERIAL_ASSET_PATH}")
 
 
-def generate_niagara_system() -> None:
+def generate_niagara_system(asset_path: str, use_gpu_simulation: bool) -> None:
     # Build from a deterministic grid emitter instead of duplicating a system
     # template whose modules explicitly opt into non-deterministic random
     # distributions. A small editor-only C++ bridge adds the emitter because
@@ -216,22 +225,23 @@ def generate_niagara_system() -> None:
         template is not None,
         f"Missing built-in Niagara emitter template {NIAGARA_EMITTER_TEMPLATE_PATH}",
     )
-    existing_system = unreal.load_asset(NIAGARA_ASSET_PATH)
+    existing_system = unreal.load_asset(asset_path)
     if existing_system is not None and not has_command_line_flag("--replace-niagara"):
         unreal.log(
-            f"Preserving existing Niagara validation system: {NIAGARA_ASSET_PATH} "
+            f"Preserving existing Niagara validation system: {asset_path} "
             "(pass --replace-niagara to rebuild it)"
         )
         return
     if existing_system is not None:
         require(
-            unreal.EditorAssetLibrary.delete_asset(NIAGARA_ASSET_PATH),
-            f"Could not replace generated asset {NIAGARA_ASSET_PATH}",
+            unreal.EditorAssetLibrary.delete_asset(asset_path),
+            f"Could not replace generated asset {asset_path}",
         )
     generation_result = unreal.SRDatasetBlueprintLibrary.generate_validation_niagara_system_asset(
-        NIAGARA_ASSET_PATH,
+        asset_path,
         NIAGARA_EMITTER_TEMPLATE_PATH,
         1337,
+        use_gpu_simulation,
     )
     unreal.log(
         f"Validation Niagara editor bridge result: {generation_result!r} "
@@ -246,10 +256,10 @@ def generate_niagara_system() -> None:
     else:
         generated, generation_error = bool(generation_result), "unknown editor bridge error"
     require(generated, generation_error)
-    system = unreal.load_asset(NIAGARA_ASSET_PATH)
+    system = unreal.load_asset(asset_path)
     if system is None:
         raise RuntimeError(
-            f"Could not load generated Niagara system {NIAGARA_ASSET_PATH}"
+            f"Could not load generated Niagara system {asset_path}"
         )
     # These properties are consumed when a component instance is initialized.
     # Runtime capture also enforces and restores them for host systems.
@@ -259,11 +269,12 @@ def generate_niagara_system() -> None:
     system.set_editor_property("fixed_tick_delta_time", 1.0 / 30.0)
     require(
         unreal.EditorAssetLibrary.save_loaded_asset(system, False),
-        f"Could not save {NIAGARA_ASSET_PATH}",
+        f"Could not save {asset_path}",
     )
     unreal.log(
         "Generated deterministic Niagara validation system: "
-        f"{NIAGARA_ASSET_PATH} from {NIAGARA_EMITTER_TEMPLATE_PATH}"
+        f"{asset_path} from {NIAGARA_EMITTER_TEMPLATE_PATH}; "
+        f"sim_target={'GPUComputeSim' if use_gpu_simulation else 'CPUSim'}"
     )
 
 
@@ -271,7 +282,8 @@ def generate() -> None:
     unreal.EditorAssetLibrary.make_directory(PACKAGE_PATH)
     generate_wpo_material()
     generate_vfx_material()
-    generate_niagara_system()
+    generate_niagara_system(NIAGARA_ASSET_PATH, False)
+    generate_niagara_system(NIAGARA_GPU_ASSET_PATH, True)
 
 
 if __name__ == "__main__":

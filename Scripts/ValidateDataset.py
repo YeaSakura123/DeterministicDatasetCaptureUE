@@ -23,7 +23,7 @@ except ImportError as exc:
     ) from exc
 
 
-TEMPORAL_MODALITIES = (
+TEMPORAL_MODALITIES_V1 = (
     "color_hr_native_scene_hdr",
     "color_lr_scene_hdr",
     "velocity_raw",
@@ -41,7 +41,49 @@ TEMPORAL_MODALITIES = (
     "reactive_mask",
     "object_id",
 )
+DISOCCLUSION_MODALITIES_V2 = (
+    "history_rejection_reason",
+    "disocclusion_mask",
+    "disocclusion_valid",
+    "disocclusion_reason",
+)
+TEMPORAL_MODALITIES_V2 = TEMPORAL_MODALITIES_V1 + DISOCCLUSION_MODALITIES_V2
+GBUFFER_MODALITIES_V3 = (
+    "normal_world",
+    "base_color_linear",
+    "material_properties",
+    "gbuffer_valid",
+)
+GBUFFER_ATTRIBUTE_MODALITIES = frozenset(
+    modality for modality in GBUFFER_MODALITIES_V3 if modality != "gbuffer_valid"
+)
+# UE's deferred GBuffer is quantized and sparse pixels on shared raster/material
+# boundaries can select an adjacent representable value across process launches.
+# The contract remains exact for validity and all non-GBuffer structural rasters;
+# these narrow bounds make the known quantization edge visible and auditable.
+GBUFFER_REPLAY_TOLERANCES_V1 = {
+    "normal_world": {
+        "changedPixelFraction": 2.5e-4,
+        "meanAbs": 1.0e-5,
+        "p99Abs": 1.0e-6,
+        "maxAbs": 8.0e-2,
+    },
+    "base_color_linear": {
+        "changedPixelFraction": 2.0e-3,
+        "meanAbs": 5.0e-5,
+        "p99Abs": 1.0e-6,
+        "maxAbs": 2.5e-2,
+    },
+    "material_properties": {
+        "changedPixelFraction": 2.5e-3,
+        "meanAbs": 5.0e-6,
+        "p99Abs": 1.0e-6,
+        "maxAbs": 4.0e-3,
+    },
+}
+TEMPORAL_MODALITIES = TEMPORAL_MODALITIES_V2 + GBUFFER_MODALITIES_V3
 REFERENCE_MODALITIES = ("color_hr_reference_scene_hdr",)
+SCENE_CAPTURE_LR_COMPARISON_MODALITIES = ("color_lr_scene_capture_hdr",)
 HUDLESS_MODALITIES = ("color_main_view_hudless_after_tonemap",)
 UI_MODALITIES = ("ui_color_alpha",)
 MASK_MODALITIES = {
@@ -50,9 +92,25 @@ MASK_MODALITIES = {
     "depth_valid",
     "history_rejection_mask",
     "history_rejection_valid",
+    "disocclusion_mask",
+    "disocclusion_valid",
+    "gbuffer_valid",
+}
+
+HISTORY_REJECTION_REASON_CODES_V2 = {
+    "0": "accepted_static_or_camera_depth",
+    "1": "history_reset",
+    "2": "invalid_current_inputs",
+    "3": "previous_pixel_out_of_bounds",
+    "4": "instance_identity_mismatch",
+    "5": "static_depth_occlusion",
+    "6": "dynamic_same_instance_uncertain",
+    "7": "unlabeled_dynamic_uncertain",
+    "8": "depth_evidence_unavailable",
 }
 COLOR_MODALITIES = {"hr", "lr", "color_lr_scene_hdr"}
 COLOR_MODALITIES.add("color_hr_native_scene_hdr")
+COLOR_MODALITIES.add("color_lr_scene_capture_hdr")
 COLOR_MODALITIES.add("color_hr_reference_scene_hdr")
 COLOR_MODALITIES.add("color_main_view_hudless_after_tonemap")
 COLOR_MODALITIES.add("ui_color_alpha")
@@ -72,6 +130,13 @@ AUXILIARY_CAPTURE_ORDERS = {
     "HighResolutionFirst",
     "LowResolutionFirst",
 }
+SEMANTIC_MOTION_SCENARIOS = {
+    "LegacyCameraRelative",
+    "Static",
+    "CameraOnly",
+    "ObjectOnly",
+    "Mixed",
+}
 REPLAY_METADATA_FIELDS = (
     "logicalFrameId",
     "simulationTick",
@@ -88,6 +153,25 @@ REPLAY_METADATA_FIELDS = (
     "pendingStreamingTextureCount",
     "streamingRequestsWanting",
     "sceneStateSha1",
+    "stableInstanceIdsEnabled",
+    "stableInstanceIdMappingSha1",
+    "stableInstanceIdCount",
+    "stableInstanceIdFixedTopologyRequired",
+    "stableInstanceIdDynamicTopologyAllowed",
+    "stableInstanceIdActiveIds",
+    "stableInstanceIdNewIds",
+    "dynamicInstanceIdValidation",
+    "controllableStateCacheActorCount",
+    "controllableStateCacheFrameSha1",
+    "controllableStateCacheArtifactSha1",
+    "niagaraSimCacheFrameIndex",
+    "niagaraSimCacheComponentCount",
+    "niagaraSimCacheCPUEmitterCount",
+    "niagaraSimCacheGPUEmitterCount",
+    "niagaraSimCacheCachedParticleCount",
+    "niagaraSimCacheCachedGPUParticleCount",
+    "niagaraSimCacheArtifactSha1",
+    "niagaraSimCacheValidationEnabled",
     "sceneActorCount",
     "sceneComponentCount",
     "sceneSkeletalComponentCount",
@@ -101,8 +185,11 @@ REPLAY_METADATA_FIELDS = (
     "sceneNiagaraTotalSpawnedParticleCount",
     "niagaraFrameStates",
     "sceneControllableActorCount",
+    "sceneControllableStateCount",
     "sceneUncontrolledTickingActorCount",
     "sceneControllableActors",
+    "sceneControllableStates",
+    "sceneControllableActorsWithoutState",
     "sceneUncontrolledTickingActors",
     "sceneStateHashScope",
     "renderSubmissions",
@@ -110,6 +197,7 @@ REPLAY_METADATA_FIELDS = (
     "camera",
     "temporalDiagnostics",
     "nativeHRDiagnostics",
+    "sceneCaptureLRComparisonDiagnostics",
     "referenceHRDiagnostics",
     "hudlessColorDiagnostics",
     "uiColorAlphaDiagnostics",
@@ -197,9 +285,59 @@ def normalized_vfx_reverse_provenance(provenance: dict[str, Any]) -> dict[str, A
     return normalized
 
 
+def normalized_state_cache_job(job: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(job)
+    for field in (
+        "jobName",
+        "outputDirectory",
+        "controllableStateCacheInputFile",
+        "controllableStateCacheOutputFile",
+    ):
+        normalized.pop(field, None)
+    return normalized
+
+
+def normalized_state_cache_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(provenance)
+    normalized.pop("captureConfigSha1", None)
+    return normalized
+
+
+def normalized_niagara_cache_job(job: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(job)
+    for field in (
+        "jobName",
+        "outputDirectory",
+        "niagaraSimCacheInputFile",
+        "niagaraSimCacheOutputFile",
+    ):
+        normalized.pop(field, None)
+    return normalized
+
+
+def normalized_niagara_cache_provenance(
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(provenance)
+    normalized.pop("captureConfigSha1", None)
+    return normalized
+
+
 def niagara_fixture_state(frame: dict[str, Any]) -> dict[str, Any] | None:
     expected_asset = str(
         frame.get("semanticValidationFixture", {}).get("niagaraFixtureAsset", "")
+    )
+    for state in frame.get("niagaraFrameStates", []):
+        if isinstance(state, dict) and str(state.get("assetPath", "")) == expected_asset:
+            return state
+    return None
+
+
+def niagara_gpu_fixture_state(frame: dict[str, Any]) -> dict[str, Any] | None:
+    expected_asset = str(
+        frame.get("semanticValidationFixture", {}).get(
+            "niagaraGPUFixtureAsset", ""
+        )
     )
     for state in frame.get("niagaraFrameStates", []):
         if isinstance(state, dict) and str(state.get("assetPath", "")) == expected_asset:
@@ -229,6 +367,45 @@ def sha1(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest().upper()
+
+
+def sha1_text(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest().upper()
+
+
+def is_sha1_hex(value: Any) -> bool:
+    text = str(value or "")
+    return len(text) == 40 and all(
+        character in "0123456789ABCDEFabcdef" for character in text
+    )
+
+
+def project_root_for_dataset(dataset: Path) -> Path | None:
+    for candidate in (dataset.resolve(), *dataset.resolve().parents):
+        if any(candidate.glob("*.uproject")):
+            return candidate
+    return None
+
+
+def resolve_state_cache_artifact(dataset: Path, configured_path: str) -> Path | None:
+    if not configured_path:
+        return None
+    path = Path(configured_path)
+    if path.is_absolute():
+        return path.resolve()
+    project_root = project_root_for_dataset(dataset)
+    return (project_root / path).resolve() if project_root is not None else None
+
+
+def controllable_state_frame_sha1(frame: dict[str, Any]) -> str:
+    logical_frame = int(frame["logicalFrame"])
+    lines = [f"logicalFrame={logical_frame}"]
+    for actor in frame["actors"]:
+        lines.append(
+            f"{actor['actorPath']}|{actor['actorClassPath']}|"
+            f"sha1={actor['stateSha1']}|utf8Bytes={int(actor['utf8Bytes'])}"
+        )
+    return sha1_text("\n".join(lines))
 
 
 def png_size(path: Path) -> tuple[int, int]:
@@ -294,6 +471,38 @@ def numeric_comparison(left: np.ndarray, right: np.ndarray) -> dict[str, float |
         "changedPixelFraction": float(np.mean(changed_pixels)),
         "psnrDb": math.inf if mse == 0.0 else float(10.0 * math.log10((peak * peak) / mse)),
     }
+
+
+def translate_bilinear(
+    pixels: np.ndarray, shift_x: float, shift_y: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Translate an HxWxC image; output(x,y) samples input(x-shift_x,y-shift_y)."""
+    height, width = pixels.shape[:2]
+    output_y, output_x = np.mgrid[0:height, 0:width]
+    source_x = output_x.astype(np.float64) - float(shift_x)
+    source_y = output_y.astype(np.float64) - float(shift_y)
+    x0 = np.floor(source_x).astype(np.int64)
+    y0 = np.floor(source_y).astype(np.int64)
+    x1 = x0 + 1
+    y1 = y0 + 1
+    valid = (x0 >= 0) & (y0 >= 0) & (x1 < width) & (y1 < height)
+    clipped_x0 = np.clip(x0, 0, width - 1)
+    clipped_x1 = np.clip(x1, 0, width - 1)
+    clipped_y0 = np.clip(y0, 0, height - 1)
+    clipped_y1 = np.clip(y1, 0, height - 1)
+    weight_x = (source_x - x0)[..., None]
+    weight_y = (source_y - y0)[..., None]
+    top = (
+        pixels[clipped_y0, clipped_x0] * (1.0 - weight_x)
+        + pixels[clipped_y0, clipped_x1] * weight_x
+    )
+    bottom = (
+        pixels[clipped_y1, clipped_x0] * (1.0 - weight_x)
+        + pixels[clipped_y1, clipped_x1] * weight_x
+    )
+    return (top * (1.0 - weight_y) + bottom * weight_y).astype(
+        np.float32, copy=False
+    ), valid
 
 
 def write_heatmap(left: np.ndarray, right: np.ndarray, path: Path) -> None:
@@ -389,6 +598,8 @@ def validate_temporal_frame(
     lr_size: tuple[int, int],
     hr_size: tuple[int, int],
     main_view: bool,
+    scene_capture_lr_comparison: bool,
+    pixel_domain_required: bool,
     cvars: dict[str, Any],
 ) -> None:
     frame_id = int(frame["logicalFrameId"])
@@ -473,6 +684,166 @@ def validate_temporal_frame(
             bool(np.allclose(native_unjittered, matrix(temporal.get("viewToClipCurrentUnjittered")), rtol=0.0, atol=1e-6))
             and bool(np.allclose(native_view, main_view_matrix, rtol=0.0, atol=1e-6)),
             f"projection_max_error={float(np.max(np.abs(native_unjittered - matrix(temporal.get('viewToClipCurrentUnjittered'))))):.9g} view_max_error={float(np.max(np.abs(native_view - main_view_matrix))):.9g}",
+        )
+
+    scene_capture_lr = frame.get("sceneCaptureLRComparisonDiagnostics")
+    add_check(
+        checks,
+        f"{prefix}.scene_capture_lr_comparison_metadata",
+        isinstance(scene_capture_lr, dict) is scene_capture_lr_comparison,
+        f"expected={scene_capture_lr_comparison} present={isinstance(scene_capture_lr, dict)}",
+    )
+    if scene_capture_lr_comparison and isinstance(scene_capture_lr, dict):
+        validate_mip_bias_metadata(
+            checks,
+            f"{prefix}.scene_capture_lr",
+            scene_capture_lr,
+            expected_full_resolution_mip_bias,
+            global_mip_bias,
+        )
+        scene_jitter = np.asarray(
+            scene_capture_lr.get("jitterCurrentNDC", (math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        scene_jittered = matrix(scene_capture_lr.get("viewToClipCurrentJittered"))
+        scene_unjittered = matrix(scene_capture_lr.get("viewToClipCurrentUnjittered"))
+        scene_view = matrix(scene_capture_lr.get("translatedWorldToViewCurrent"))
+        main_projection = matrix(temporal.get("viewToClipCurrentUnjittered"))
+        main_view_matrix = matrix(temporal.get("translatedWorldToViewCurrent"))
+        add_check(
+            checks,
+            f"{prefix}.scene_capture_lr_contract",
+            tuple(scene_capture_lr.get("renderSize", ())) == lr_size
+            and tuple(scene_capture_lr.get("displaySize", ())) == hr_size
+            and scene_capture_lr.get("pipelineStage")
+            == "after_dof_before_temporal_upscaler"
+            and scene_capture_lr.get("colorSpace") == "linear_scene_rgb"
+            and scene_capture_lr.get("preExposed") is True
+            and scene_capture_lr.get("viewState")
+            == "isolated_native_lr_scene_capture"
+            and scene_capture_lr.get("historyAdvance") is False
+            and scene_capture_lr.get("simulationAdvance") is False
+            and scene_capture_lr.get("pixelAlignment")
+            == "scene_capture_resampled_to_main_view_using_main_view_current_render_pixel_jitter",
+            json.dumps(
+                {
+                    key: scene_capture_lr.get(key)
+                    for key in (
+                        "renderSize",
+                        "displaySize",
+                        "pipelineStage",
+                        "colorSpace",
+                        "preExposed",
+                        "viewState",
+                        "historyAdvance",
+                        "simulationAdvance",
+                        "pixelAlignment",
+                    )
+                },
+                sort_keys=True,
+            ),
+        )
+        add_check(
+            checks,
+            f"{prefix}.scene_capture_lr_fixed_grid",
+            scene_capture_lr.get("fixedOutputGrid") is True
+            and bool(np.allclose(scene_jitter, 0.0, rtol=0.0, atol=1e-7))
+            and bool(
+                np.allclose(
+                    scene_jittered, scene_unjittered, rtol=0.0, atol=1e-7
+                )
+            ),
+            f"jitter={scene_jitter.tolist()} fixed={scene_capture_lr.get('fixedOutputGrid')}",
+        )
+        add_check(
+            checks,
+            f"{prefix}.scene_capture_lr_main_view_alignment",
+            bool(np.allclose(scene_unjittered, main_projection, rtol=0.0, atol=1e-6))
+            and bool(np.allclose(scene_view, main_view_matrix, rtol=0.0, atol=1e-6)),
+            f"projection_max_error={float(np.max(np.abs(scene_unjittered - main_projection))):.9g} "
+            f"view_max_error={float(np.max(np.abs(scene_view - main_view_matrix))):.9g}",
+        )
+        main_pre_exposure = float(temporal.get("preExposure", math.nan))
+        scene_pre_exposure = float(scene_capture_lr.get("preExposure", math.nan))
+        add_check(
+            checks,
+            f"{prefix}.scene_capture_lr_exposure_valid",
+            math.isfinite(main_pre_exposure)
+            and main_pre_exposure > 0.0
+            and math.isfinite(scene_pre_exposure)
+            and scene_pre_exposure > 0.0,
+            f"main={main_pre_exposure} scene_capture={scene_pre_exposure}",
+        )
+
+        main_pixels = pixels.get("color_lr_scene_hdr")
+        scene_pixels = pixels.get("color_lr_scene_capture_hdr")
+        pixel_metrics: dict[str, Any] = {"valid": False, "reason": "missing pixels"}
+        pixel_gate = False
+        if (
+            main_pixels is not None
+            and scene_pixels is not None
+            and main_pixels.shape == scene_pixels.shape
+            and math.isfinite(main_pre_exposure)
+            and main_pre_exposure > 0.0
+            and math.isfinite(scene_pre_exposure)
+            and scene_pre_exposure > 0.0
+        ):
+            main_scene_rgb = main_pixels[..., :3] / main_pre_exposure
+            isolated_scene_rgb = scene_pixels[..., :3] / scene_pre_exposure
+            jitter = np.asarray(
+                temporal.get("jitterCurrentRenderPixel", (math.nan, math.nan)),
+                dtype=np.float64,
+            )
+            if jitter.shape == (2,) and bool(np.isfinite(jitter).all()):
+                aligned_scene, valid = translate_bilinear(
+                    isolated_scene_rgb, float(jitter[0]), float(jitter[1])
+                )
+                opposite_scene, opposite_valid = translate_bilinear(
+                    isolated_scene_rgb, -float(jitter[0]), -float(jitter[1])
+                )
+                border = 2
+                interior = np.zeros(valid.shape, dtype=bool)
+                if valid.shape[0] > 2 * border and valid.shape[1] > 2 * border:
+                    interior[border:-border, border:-border] = True
+                valid &= interior
+                opposite_valid &= interior
+                aligned_metrics = numeric_comparison(
+                    main_scene_rgb[valid], aligned_scene[valid]
+                )
+                opposite_metrics = numeric_comparison(
+                    main_scene_rgb[opposite_valid], opposite_scene[opposite_valid]
+                )
+                robust_peak = max(
+                    float(np.quantile(np.abs(main_scene_rgb[valid]), 0.99)),
+                    float(np.quantile(np.abs(aligned_scene[valid]), 0.99)),
+                    1.0e-3,
+                )
+                normalized_mean_abs = float(aligned_metrics.get("meanAbs", math.inf)) / robust_peak
+                aligned_better = float(aligned_metrics.get("meanAbs", math.inf)) <= (
+                    float(opposite_metrics.get("meanAbs", math.inf)) + 1.0e-7
+                )
+                pixel_metrics = {
+                    "valid": bool(aligned_metrics.get("valid", False)),
+                    "alignmentShiftRenderPixels": jitter.tolist(),
+                    "comparedPixelCount": int(np.count_nonzero(valid)),
+                    "robustPeakP99": robust_peak,
+                    "normalizedMeanAbs": normalized_mean_abs,
+                    "aligned": aligned_metrics,
+                    "oppositeSign": opposite_metrics,
+                    "alignedSignNoWorse": aligned_better,
+                }
+                pixel_gate = bool(
+                    aligned_metrics.get("valid", False)
+                    and aligned_better
+                    and normalized_mean_abs <= 0.05
+                    and float(aligned_metrics.get("psnrDb", -math.inf)) >= 20.0
+                )
+        add_check(
+            checks,
+            f"{prefix}.main_view_scene_capture_pixel_domain",
+            pixel_gate,
+            json.dumps(pixel_metrics, sort_keys=True),
+            required=pixel_domain_required,
         )
 
     reference_enabled = bool(frame.get("referenceHRDiagnostics"))
@@ -635,7 +1006,7 @@ def validate_temporal_frame(
         f"max_error={float(np.max(np.abs(world_to_view @ current_projection - world_to_clip))):.9g}",
     )
 
-    needed = set(TEMPORAL_MODALITIES) - {"color_lr_scene_hdr"}
+    needed = set(TEMPORAL_MODALITIES_V1) - {"color_lr_scene_hdr"}
     if not needed.issubset(pixels):
         return
     velocity_raw = pixels["velocity_raw"]
@@ -659,13 +1030,21 @@ def validate_temporal_frame(
         bool(np.isfinite(depth_previous_reprojected).all() and np.min(depth_previous_reprojected) >= 0.0),
         f"min={float(np.min(depth_previous_reprojected)):.9g} max={float(np.max(depth_previous_reprojected)):.9g}",
     )
+    history_rejection_source = temporal.get("historyRejectionSource")
+    history_rejection_v2 = (
+        history_rejection_source
+        == "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
+    )
     add_check(
         checks,
         f"{prefix}.history_rejection_contract",
         temporal.get("historyRejectionDefinition")
         == "one_rejects_previous_history_at_motion_reprojected_pixel"
-        and temporal.get("historyRejectionSource")
-        == "custom_stencil_identity_else_static_camera_depth_reprojection_v1"
+        and history_rejection_source
+        in {
+            "custom_stencil_identity_else_static_camera_depth_reprojection_v1",
+            "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2",
+        }
         and temporal.get("historyRejectionTrainingUsable") is True
         and temporal.get("historyRejectionRequiresValidityMask") is True
         and temporal.get("historyRejectionProductionCertified") is False,
@@ -683,6 +1062,59 @@ def validate_temporal_frame(
             sort_keys=True,
         ),
     )
+    if history_rejection_v2:
+        v2_present = set(DISOCCLUSION_MODALITIES_V2).issubset(pixels)
+        add_check(
+            checks,
+            f"{prefix}.disocclusion_v2_modalities",
+            v2_present,
+            "history rejection reason plus explicit disocclusion mask/valid/reason aliases",
+        )
+        if v2_present:
+            history_reason = pixels["history_rejection_reason"][..., 0]
+            disocclusion = pixels["disocclusion_mask"][..., 0]
+            disocclusion_valid = pixels["disocclusion_valid"][..., 0]
+            disocclusion_reason = pixels["disocclusion_reason"][..., 0]
+            reason_integer = np.rint(history_reason)
+            reason_contract = temporal.get("historyRejectionReasonCodes")
+            add_check(
+                checks,
+                f"{prefix}.disocclusion_alias_exact",
+                bool(
+                    np.array_equal(disocclusion, history_rejection)
+                    and np.array_equal(disocclusion_valid, history_rejection_valid)
+                    and np.array_equal(disocclusion_reason, history_reason)
+                    and temporal.get("disocclusionMaskAlias")
+                    == "history_rejection_mask"
+                    and temporal.get("disocclusionValidityAlias")
+                    == "history_rejection_valid"
+                    and temporal.get("disocclusionReasonAlias")
+                    == "history_rejection_reason"
+                ),
+                "disocclusion files and metadata are exact history-rejection aliases",
+            )
+            add_check(
+                checks,
+                f"{prefix}.history_rejection_reason_codes",
+                bool(
+                    np.array_equal(history_reason, reason_integer)
+                    and np.all((reason_integer >= 0.0) & (reason_integer <= 8.0))
+                    and reason_contract == HISTORY_REJECTION_REASON_CODES_V2
+                ),
+                f"values={np.unique(history_reason).tolist()} contract={json.dumps(reason_contract, sort_keys=True)}",
+            )
+            reason = reason_integer.astype(np.int32)
+            expected_reject = np.where(reason == 0, 0.0, 1.0)
+            expected_valid = np.isin(reason, (0, 1, 3, 4, 5)).astype(np.float32)
+            add_check(
+                checks,
+                f"{prefix}.history_rejection_reason_semantics",
+                bool(
+                    np.array_equal(history_rejection, expected_reject)
+                    and np.array_equal(history_rejection_valid, expected_valid)
+                ),
+                "reason 0 keeps; 1/3/4/5 reject-valid; 2/6/7/8 reject-invalid",
+            )
     if frame.get("reset") is True:
         add_check(
             checks,
@@ -690,6 +1122,13 @@ def validate_temporal_frame(
             bool(np.all(history_rejection == 1.0) and np.all(history_rejection_valid == 1.0)),
             f"reject_mean={float(np.mean(history_rejection)):.9g} valid_mean={float(np.mean(history_rejection_valid)):.9g}",
         )
+        if history_rejection_v2 and "history_rejection_reason" in pixels:
+            add_check(
+                checks,
+                f"{prefix}.history_rejection_reset_reason",
+                bool(np.all(pixels["history_rejection_reason"][..., 0] == 1.0)),
+                "all reset pixels use reason 1",
+            )
     else:
         add_check(
             checks,
@@ -740,9 +1179,123 @@ def validate_temporal_frame(
     add_check(
         checks,
         f"{prefix}.object_id_contract",
-        temporal.get("objectIdSource") == "custom_stencil_uint8_zero_unlabeled",
+        temporal.get("objectIdSource")
+        in {
+            "custom_stencil_uint8_zero_unlabeled",
+            "stable_component_unique_custom_stencil_uint8_zero_background",
+            "stable_dynamic_component_unique_custom_stencil_uint8_zero_background",
+        },
         str(temporal.get("objectIdSource")),
     )
+
+    gbuffer_v3 = (
+        temporal.get("gbufferAttributeSource")
+        == "deferred_main_view_gbuffer_same_pixel_observed_at_after_dof"
+    )
+    if gbuffer_v3:
+        gbuffer_present = set(GBUFFER_MODALITIES_V3).issubset(pixels)
+        add_check(
+            checks,
+            f"{prefix}.gbuffer_modalities",
+            gbuffer_present,
+            "world normal, base color, material properties and validity",
+        )
+        if gbuffer_present:
+            normal = pixels["normal_world"]
+            base_color = pixels["base_color_linear"]
+            material = pixels["material_properties"]
+            gbuffer_valid = pixels["gbuffer_valid"][..., 0]
+            valid_gbuffer = gbuffer_valid == 1.0
+            invalid_gbuffer = ~valid_gbuffer
+            normal_length = np.linalg.norm(normal[..., :3], axis=-1)
+            has_valid_gbuffer = bool(np.any(valid_gbuffer))
+            normal_unit_error = (
+                float(np.max(np.abs(normal_length[valid_gbuffer] - 1.0)))
+                if has_valid_gbuffer
+                else math.inf
+            )
+            add_check(
+                checks,
+                f"{prefix}.gbuffer_contract",
+                bool(
+                    cvars.get("r.ForwardShading") == "0"
+                    and temporal.get("worldNormalSpace")
+                    == "unreal_world_left_handed_xyz_unit_vector"
+                    and temporal.get("baseColorSpace")
+                    == "linear_material_base_color_rgb"
+                    and temporal.get("materialPropertiesChannels")
+                    == "R_roughness_G_metallic_B_specular_A_valid"
+                    and temporal.get("gbufferValidity")
+                    == "one_for_finite_positive_scene_depth_zero_for_sky_or_no_opaque_surface"
+                    and temporal.get("gbufferReplayComparison")
+                    == "quantized_attribute_numeric_tolerance_v1_with_heatmap"
+                    and temporal.get("gbufferReplayKnownLimit")
+                    == "sparse_raster_and_material_quantization_boundary_pixels_are_not_promised_byte_exact"
+                ),
+                json.dumps(
+                    {
+                        key: temporal.get(key)
+                        for key in (
+                            "gbufferAttributeSource",
+                            "worldNormalSpace",
+                            "baseColorSpace",
+                            "materialPropertiesChannels",
+                            "gbufferValidity",
+                            "gbufferReplayComparison",
+                            "gbufferReplayKnownLimit",
+                        )
+                    },
+                    sort_keys=True,
+                ),
+            )
+            add_check(
+                checks,
+                f"{prefix}.gbuffer_validity_channels",
+                bool(
+                    np.array_equal(gbuffer_valid, depth_valid)
+                    and np.array_equal(normal[..., 3], gbuffer_valid)
+                    and np.array_equal(base_color[..., 3], gbuffer_valid)
+                    and np.array_equal(material[..., 3], gbuffer_valid)
+                    and has_valid_gbuffer
+                ),
+                f"valid_fraction={float(np.mean(valid_gbuffer)):.9g}",
+            )
+            add_check(
+                checks,
+                f"{prefix}.world_normal_unit_length",
+                bool(
+                    has_valid_gbuffer
+                    and normal_unit_error <= 1.0e-3
+                    and np.all(normal[..., :3][invalid_gbuffer] == 0.0)
+                ),
+                f"max_unit_error={normal_unit_error:.9g}",
+            )
+            add_check(
+                checks,
+                f"{prefix}.base_color_range",
+                bool(
+                    has_valid_gbuffer
+                    and np.all(
+                        (base_color[..., :3][valid_gbuffer] >= 0.0)
+                        & (base_color[..., :3][valid_gbuffer] <= 1.0)
+                    )
+                    and np.all(base_color[..., :3][invalid_gbuffer] == 0.0)
+                ),
+                f"min={float(np.min(base_color[..., :3][valid_gbuffer])) if has_valid_gbuffer else math.nan:.9g} max={float(np.max(base_color[..., :3][valid_gbuffer])) if has_valid_gbuffer else math.nan:.9g}",
+            )
+            add_check(
+                checks,
+                f"{prefix}.material_properties_range",
+                bool(
+                    has_valid_gbuffer
+                    and np.all(
+                        (material[..., :3][valid_gbuffer] >= 0.0)
+                        & (material[..., :3][valid_gbuffer] <= 1.0)
+                    )
+                    and np.all(material[..., :3][invalid_gbuffer] == 0.0)
+                ),
+                f"valid_pixels={int(np.count_nonzero(valid_gbuffer))}",
+            )
 
     valid = (depth_valid == 1.0) & (depth_device > 0.0)
     add_check(checks, f"{prefix}.valid_depth_present", bool(np.any(valid)), f"valid_fraction={float(np.mean(valid)):.9f}")
@@ -781,6 +1334,176 @@ def validate_temporal_frame(
         )
 
 
+def validate_history_rejection_v2_cross_frame(
+    checks: list[dict[str, Any]],
+    frames: list[dict[str, Any]],
+    frame_paths: dict[tuple[int, str], Path],
+) -> None:
+    """Independently reconstruct the v2 per-pixel rejection policy."""
+
+    for frame in frames:
+        temporal = frame.get("temporalDiagnostics")
+        if (
+            not isinstance(temporal, dict)
+            or temporal.get("historyRejectionSource")
+            != "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
+            or frame.get("reset") is True
+        ):
+            continue
+        frame_id = int(frame["logicalFrameId"])
+        previous_frame_id = int(
+            frame.get("motionPreviousLogicalFrameId", frame_id)
+        )
+        current_names = (
+            "motion_full_current_to_previous",
+            "motion_valid",
+            "depth_valid",
+            "depth_previous_reprojected_device",
+            "velocity_coverage",
+            "object_id",
+            "history_rejection_mask",
+            "history_rejection_valid",
+            "history_rejection_reason",
+        )
+        previous_names = ("depth_device_raw", "object_id")
+        paths_present = all(
+            (frame_id, name) in frame_paths for name in current_names
+        ) and all(
+            (previous_frame_id, name) in frame_paths for name in previous_names
+        )
+        prefix = f"frame_{frame_id:06d}.history_rejection_v2"
+        add_check(
+            checks,
+            f"{prefix}.cross_frame_inputs",
+            paths_present,
+            f"previousLogicalFrameId={previous_frame_id}",
+        )
+        if not paths_present:
+            continue
+
+        current = {
+            name: exr_rgba(frame_paths[(frame_id, name)])
+            for name in current_names
+        }
+        previous = {
+            name: exr_rgba(frame_paths[(previous_frame_id, name)])
+            for name in previous_names
+        }
+        motion = current["motion_full_current_to_previous"]
+        motion_valid = current["motion_valid"][..., 0]
+        depth_valid = current["depth_valid"][..., 0]
+        previous_reprojected_depth = current[
+            "depth_previous_reprojected_device"
+        ][..., 0]
+        velocity_coverage = current["velocity_coverage"][..., 0]
+        current_id = np.rint(current["object_id"][..., 0]).astype(np.int32)
+        previous_id_image = np.rint(previous["object_id"][..., 0]).astype(
+            np.int32
+        )
+        previous_depth_image = previous["depth_device_raw"][..., 0]
+        actual_reject = current["history_rejection_mask"][..., 0]
+        actual_valid = current["history_rejection_valid"][..., 0]
+        actual_reason = current["history_rejection_reason"][..., 0]
+
+        height, width = motion_valid.shape
+        yy, xx = np.mgrid[:height, :width]
+        resolution_fraction = float(temporal.get("resolutionFraction", 0.0))
+        reprojection_x = xx + motion[..., 0] * resolution_fraction
+        reprojection_y = yy + motion[..., 1] * resolution_fraction
+        # FMath::RoundToInt uses nearest integer with half values away from zero.
+        previous_x = np.where(
+            reprojection_x >= 0.0,
+            np.floor(reprojection_x + 0.5),
+            np.ceil(reprojection_x - 0.5),
+        ).astype(np.int64)
+        previous_y = np.where(
+            reprojection_y >= 0.0,
+            np.floor(reprojection_y + 0.5),
+            np.ceil(reprojection_y - 0.5),
+        ).astype(np.int64)
+
+        expected_reject = np.ones((height, width), dtype=np.float32)
+        expected_valid = np.zeros((height, width), dtype=np.float32)
+        expected_reason = np.full((height, width), 2.0, dtype=np.float32)
+        inputs_valid = (
+            (depth_valid >= 0.5)
+            & (motion_valid >= 0.5)
+            & math.isfinite(resolution_fraction)
+            & (resolution_fraction > 0.0)
+            & np.isfinite(motion[..., 0])
+            & np.isfinite(motion[..., 1])
+        )
+        in_bounds = (
+            inputs_valid
+            & (previous_x >= 0)
+            & (previous_y >= 0)
+            & (previous_x < width)
+            & (previous_y < height)
+        )
+        out_of_bounds = inputs_valid & ~in_bounds
+        expected_valid[out_of_bounds] = 1.0
+        expected_reason[out_of_bounds] = 3.0
+
+        safe_x = np.clip(previous_x, 0, width - 1)
+        safe_y = np.clip(previous_y, 0, height - 1)
+        previous_id = previous_id_image[safe_y, safe_x]
+        previous_depth = previous_depth_image[safe_y, safe_x]
+        any_labeled = (current_id != 0) | (previous_id != 0)
+        same_labeled = (current_id != 0) & (current_id == previous_id)
+        identity_mismatch = in_bounds & any_labeled & ~same_labeled
+        expected_valid[identity_mismatch] = 1.0
+        expected_reason[identity_mismatch] = 4.0
+
+        identity_not_decisive = in_bounds & ~identity_mismatch
+        native_velocity = identity_not_decisive & (velocity_coverage >= 0.5)
+        expected_reason[native_velocity & same_labeled] = 6.0
+        expected_reason[native_velocity & ~same_labeled] = 7.0
+
+        depth_candidate = identity_not_decisive & ~native_velocity
+        depth_evidence = (
+            depth_candidate
+            & (previous_depth > 0.0)
+            & (previous_reprojected_depth > 0.0)
+            & np.isfinite(previous_depth)
+            & np.isfinite(previous_reprojected_depth)
+        )
+        tolerance = np.maximum(
+            1.0e-5, np.abs(previous_reprojected_depth) * 2.0e-3
+        )
+        depth_occlusion = depth_evidence & (
+            previous_depth > previous_reprojected_depth + tolerance
+        )
+        depth_accept = depth_evidence & ~depth_occlusion
+        expected_reject[depth_accept] = 0.0
+        expected_valid[depth_accept] = 1.0
+        expected_reason[depth_accept] = 0.0
+        expected_valid[depth_occlusion] = 1.0
+        expected_reason[depth_occlusion] = 5.0
+        expected_reason[depth_candidate & ~depth_evidence] = 8.0
+
+        reject_mismatch = int(np.count_nonzero(actual_reject != expected_reject))
+        valid_mismatch = int(np.count_nonzero(actual_valid != expected_valid))
+        reason_mismatch = int(np.count_nonzero(actual_reason != expected_reason))
+        add_check(
+            checks,
+            f"{prefix}.independent_reconstruction",
+            reject_mismatch == 0 and valid_mismatch == 0 and reason_mismatch == 0,
+            json.dumps(
+                {
+                    "pixels": width * height,
+                    "rejectMismatch": reject_mismatch,
+                    "validMismatch": valid_mismatch,
+                    "reasonMismatch": reason_mismatch,
+                    "reasonCounts": {
+                        str(code): int(np.count_nonzero(actual_reason == code))
+                        for code in range(9)
+                    },
+                },
+                sort_keys=True,
+            ),
+        )
+
+
 def validate_semantic_fixture_frame(
     checks: list[dict[str, Any]],
     frame: dict[str, Any],
@@ -792,6 +1515,7 @@ def validate_semantic_fixture_frame(
     required_modalities = {
         "object_id",
         "motion_full_current_to_previous",
+        "motion_valid",
         "velocity_coverage",
         "depth_view_linear_meters",
         "depth_valid",
@@ -807,8 +1531,17 @@ def validate_semantic_fixture_frame(
         return
 
     object_id = np.rint(pixels["object_id"][..., 0]).astype(np.int32)
+    motion_valid = pixels["motion_valid"][..., 0]
     velocity_coverage = pixels["velocity_coverage"][..., 0]
     intermediate_replay = frame.get("replayPass") == "FrameGenerationIntermediate"
+    motion_scenario = str(fixture.get("motionScenario") or "LegacyCameraRelative")
+    object_motion_enabled = fixture.get("objectMotionEnabled") is True
+    add_check(
+        checks,
+        f"{prefix}.analytic_projection_valid",
+        fixture.get("analyticProjectionValid") is True,
+        f"scenario={motion_scenario} worldAnchored={fixture.get('worldAnchored')}",
+    )
 
     def validate_motion_object(
         label: str,
@@ -817,6 +1550,7 @@ def validate_semantic_fixture_frame(
         minimum_pixels: int,
         reset_tolerance: float,
         motion_tolerance: float,
+        require_velocity_coverage: bool,
     ) -> None:
         mask = object_id == stencil_id
         visible_pixels = int(np.count_nonzero(mask))
@@ -832,13 +1566,27 @@ def validate_semantic_fixture_frame(
         covered = mask & (velocity_coverage == 1.0)
         covered_count = int(np.count_nonzero(covered))
         covered_fraction = covered_count / visible_pixels
+        full_motion_valid = mask & (motion_valid == 1.0)
+        full_motion_valid_count = int(np.count_nonzero(full_motion_valid))
+        full_motion_valid_fraction = full_motion_valid_count / visible_pixels
         expected_is_finite = expected_motion.shape == (2,) and bool(
             np.all(np.isfinite(expected_motion))
         )
         expected_is_moving = expected_is_finite and bool(
             np.max(np.abs(expected_motion)) > reset_tolerance
         )
-        if (not frame.get("reset", False) or intermediate_replay) and expected_is_moving:
+        if not frame.get("reset", False) or intermediate_replay:
+            add_check(
+                checks,
+                f"{prefix}.{label}_full_motion_valid",
+                full_motion_valid_fraction >= 0.75,
+                f"valid={full_motion_valid_count} fraction={full_motion_valid_fraction:.9f}",
+            )
+        if (
+            require_velocity_coverage
+            and (not frame.get("reset", False) or intermediate_replay)
+            and expected_is_moving
+        ):
             add_check(
                 checks,
                 f"{prefix}.{label}_velocity_coverage",
@@ -854,19 +1602,20 @@ def validate_semantic_fixture_frame(
                 f"max_abs={float(np.max(np.abs(reset_motion))):.9g}",
             )
         elif not expected_is_moving:
-            static_motion = pixels["motion_full_current_to_previous"][mask, :2]
+            static_motion = pixels["motion_full_current_to_previous"][full_motion_valid, :2]
             add_check(
                 checks,
                 f"{prefix}.{label}_static_motion_zero",
                 expected_is_finite
+                and bool(static_motion.size)
                 and bool(np.max(np.abs(static_motion)) <= reset_tolerance),
                 f"expected={expected_motion.tolist()} "
-                f"max_abs={float(np.max(np.abs(static_motion))):.9g} "
-                f"covered={covered_count}",
+                f"max_abs={float(np.max(np.abs(static_motion))) if static_motion.size else math.nan:.9g} "
+                f"valid={full_motion_valid_count} covered={covered_count}",
             )
-        elif covered_count:
+        elif full_motion_valid_count:
             measured_motion = np.median(
-                pixels["motion_full_current_to_previous"][covered, :2].astype(np.float64),
+                pixels["motion_full_current_to_previous"][full_motion_valid, :2].astype(np.float64),
                 axis=0,
             )
             error = np.abs(measured_motion - expected_motion)
@@ -888,6 +1637,19 @@ def validate_semantic_fixture_frame(
         8,
         1e-4,
         1.5,
+        object_motion_enabled,
+    )
+    validate_motion_object(
+        "background",
+        int(fixture.get("backgroundObjectId", -1)),
+        np.asarray(
+            fixture.get("expectedBackgroundMotionDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        ),
+        32,
+        1e-4,
+        1.0,
+        False,
     )
     validate_motion_object(
         "skeletal",
@@ -899,6 +1661,7 @@ def validate_semantic_fixture_frame(
         32,
         0.01,
         2.0,
+        object_motion_enabled,
     )
     validate_motion_object(
         "wpo",
@@ -910,6 +1673,7 @@ def validate_semantic_fixture_frame(
         32,
         0.01,
         1.5,
+        object_motion_enabled,
     )
 
     linear_depth = pixels["depth_view_linear_meters"][..., 0]
@@ -982,6 +1746,798 @@ def validate_semantic_fixture_frame(
         )
 
 
+def validate_scene_control_preflight(
+    dataset: Path,
+    manifest: dict[str, Any],
+    job: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> None:
+    enabled = bool(job.get("bRunSceneControlPreflight", False))
+    required = bool(job.get("bRequireSceneControlPreflight", False))
+    manifest_state = manifest.get("sceneControlPreflight", {})
+    contract = manifest.get("determinismContract", {})
+    add_check(
+        checks,
+        "scene_control_preflight.job_contract",
+        not required or enabled,
+        f"enabled={enabled} required={required}",
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.manifest_contract",
+        isinstance(manifest_state, dict)
+        and manifest_state.get("enabled") is enabled
+        and manifest_state.get("required") is required
+        and contract.get("sceneControlPreflightEnabled") is enabled
+        and contract.get("sceneControlPreflightRequired") is required
+        and contract.get("sceneControlPreflightScope")
+        == "registered_ticking_actors_and_components_loaded_niagara_data_interfaces_and_material_time_per_instance_random_particle_random_expressions",
+        json.dumps(manifest_state, sort_keys=True),
+    )
+    if not enabled:
+        return
+
+    relative_report = manifest_state.get("file")
+    try:
+        report_path = safe_dataset_file(dataset, relative_report)
+    except (TypeError, ValueError) as exc:
+        add_check(checks, "scene_control_preflight.safe_path", False, str(exc))
+        return
+    add_check(
+        checks,
+        "scene_control_preflight.file_present",
+        report_path.is_file(),
+        str(report_path),
+    )
+    if not report_path.is_file():
+        return
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        add_check(checks, "scene_control_preflight.json", False, str(exc))
+        return
+
+    add_check(
+        checks,
+        "scene_control_preflight.schema_and_flags",
+        report.get("schemaVersion") == 1
+        and report.get("ran") is True
+        and report.get("required") is required
+        and manifest_state.get("ran") is True,
+        json.dumps(
+            {
+                "schemaVersion": report.get("schemaVersion"),
+                "ran": report.get("ran"),
+                "required": report.get("required"),
+            },
+            sort_keys=True,
+        ),
+    )
+
+    array_fields = (
+        "controlledTickingActors",
+        "allowedTickingActors",
+        "uncontrolledTickingActors",
+        "controlledTickingComponents",
+        "allowedTickingComponents",
+        "uncontrolledTickingComponents",
+        "niagaraDataInterfaces",
+        "allowedNiagaraDataInterfaces",
+        "uncontrolledNiagaraDataInterfaces",
+        "controlledMaterialInputs",
+        "allowedMaterialInputs",
+        "uncontrolledMaterialInputs",
+    )
+    arrays: dict[str, list[str]] = {}
+    arrays_valid = True
+    for field in array_fields:
+        value = report.get(field)
+        valid = (
+            isinstance(value, list)
+            and all(isinstance(item, str) and item for item in value)
+            and value == sorted(value)
+            and len(value) == len(set(value))
+        )
+        arrays_valid = arrays_valid and valid
+        arrays[field] = value if isinstance(value, list) else []
+    add_check(
+        checks,
+        "scene_control_preflight.sorted_unique_records",
+        arrays_valid,
+        json.dumps({field: len(arrays[field]) for field in array_fields}, sort_keys=True),
+    )
+
+    allowlists = report.get("allowlists", {})
+    allowlist_fields = {
+        "tickingActorClassPaths": "sceneControlAllowedTickingActorClassPaths",
+        "tickingComponentClassPaths": "sceneControlAllowedTickingComponentClassPaths",
+        "niagaraDataInterfaceClassPaths": "sceneControlAllowedNiagaraDataInterfaceClassPaths",
+        "materialExpressionClassPaths": "sceneControlAllowedMaterialExpressionClassPaths",
+    }
+    normalized_allowlists: dict[str, list[str]] = {}
+    allowlists_valid = isinstance(allowlists, dict)
+    for report_field, job_field in allowlist_fields.items():
+        value = allowlists.get(report_field, []) if isinstance(allowlists, dict) else []
+        expected = sorted(str(item).strip() for item in job.get(job_field, []))
+        valid = (
+            isinstance(value, list)
+            and all(isinstance(item, str) and item for item in value)
+            and value == sorted(value)
+            and len(value) == len(set(value))
+            and value == expected
+        )
+        allowlists_valid = allowlists_valid and valid
+        normalized_allowlists[report_field] = value if isinstance(value, list) else []
+    add_check(
+        checks,
+        "scene_control_preflight.allowlists_exact",
+        allowlists_valid,
+        json.dumps(normalized_allowlists, sort_keys=True),
+    )
+
+    counts = report.get("counts", {})
+    counts_valid = isinstance(counts, dict) and all(
+        counts.get(field) == len(arrays[field]) for field in array_fields
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.counts_exact",
+        counts_valid,
+        json.dumps(counts, sort_keys=True),
+    )
+
+    canonical_lines = ["schemaVersion=1", f"required={1 if required else 0}"]
+    canonical_allowlist_labels = {
+        "tickingActorClassPaths": "allowedTickingActorClassPath",
+        "tickingComponentClassPaths": "allowedTickingComponentClassPath",
+        "niagaraDataInterfaceClassPaths": "allowedNiagaraDataInterfaceClassPath",
+        "materialExpressionClassPaths": "allowedMaterialExpressionClassPath",
+    }
+    for field, label in canonical_allowlist_labels.items():
+        canonical_lines.extend(f"{label}|{value}" for value in normalized_allowlists[field])
+    canonical_array_labels = {
+        "controlledTickingActors": "controlledTickingActor",
+        "allowedTickingActors": "allowedTickingActor",
+        "uncontrolledTickingActors": "uncontrolledTickingActor",
+        "controlledTickingComponents": "controlledTickingComponent",
+        "allowedTickingComponents": "allowedTickingComponent",
+        "uncontrolledTickingComponents": "uncontrolledTickingComponent",
+        "niagaraDataInterfaces": "niagaraDataInterface",
+        "allowedNiagaraDataInterfaces": "allowedNiagaraDataInterface",
+        "uncontrolledNiagaraDataInterfaces": "uncontrolledNiagaraDataInterface",
+        "controlledMaterialInputs": "controlledMaterialInput",
+        "allowedMaterialInputs": "allowedMaterialInput",
+        "uncontrolledMaterialInputs": "uncontrolledMaterialInput",
+    }
+    for field, label in canonical_array_labels.items():
+        canonical_lines.extend(f"{label}|{value}" for value in arrays[field])
+    calculated_hash = hashlib.sha1("\n".join(canonical_lines).encode("utf-8")).hexdigest().upper()
+    report_hash = str(report.get("sha1", ""))
+    expected_scope = (
+        "schema_required_sorted_allowlist_rules_and_classified_tick_niagara_di_material_input_records"
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.sha1",
+        len(report_hash) == 40
+        and report_hash == calculated_hash
+        and manifest_state.get("sha1") == report_hash
+        and report.get("hashScope") == expected_scope
+        and manifest_state.get("hashScope") == expected_scope,
+        f"reported={report_hash} calculated={calculated_hash}",
+    )
+
+    uncontrolled_fields = (
+        "uncontrolledTickingActors",
+        "uncontrolledTickingComponents",
+        "uncontrolledNiagaraDataInterfaces",
+        "uncontrolledMaterialInputs",
+    )
+    derived_passed = all(not arrays[field] for field in uncontrolled_fields)
+    manifest_count_fields = {
+        "uncontrolledTickingActors": "uncontrolledTickingActorCount",
+        "uncontrolledTickingComponents": "uncontrolledTickingComponentCount",
+        "uncontrolledNiagaraDataInterfaces": "uncontrolledNiagaraDataInterfaceCount",
+        "uncontrolledMaterialInputs": "uncontrolledMaterialInputCount",
+    }
+    manifest_counts_valid = all(
+        manifest_state.get(manifest_count_fields[field]) == len(arrays[field])
+        for field in uncontrolled_fields
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.outcome_consistent",
+        report.get("passed") is derived_passed
+        and manifest_state.get("passed") is derived_passed
+        and contract.get("sceneControlPreflightPassed") is derived_passed
+        and manifest_counts_valid,
+        f"derived={derived_passed} report={report.get('passed')} manifest={manifest_state.get('passed')}",
+    )
+    add_check(
+        checks,
+        "scene_control_preflight.strict_gate",
+        derived_passed,
+        json.dumps({field: len(arrays[field]) for field in uncontrolled_fields}, sort_keys=True),
+        required=required,
+    )
+
+
+def validate_stable_instance_ids(
+    dataset: Path,
+    manifest: dict[str, Any],
+    job: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> tuple[str, set[int]]:
+    enabled = bool(job.get("bAssignStableInstanceIds", False))
+    dynamic = bool(job.get("bAllowDynamicInstanceIdTopology", False))
+    state = manifest.get("stableInstanceIds")
+    contract = manifest.get("determinismContract", {})
+    if not enabled:
+        legacy_or_disabled = state is None or bool(state.get("enabled", False)) is False
+        add_check(
+            checks,
+            "stable_instance_ids.disabled_contract",
+            legacy_or_disabled
+            and bool(contract.get("objectIdInstanceUnique", False)) is False,
+            json.dumps(
+                {
+                    "manifest": state,
+                    "contractInstanceUnique": contract.get("objectIdInstanceUnique"),
+                },
+                sort_keys=True,
+            ),
+        )
+        return "", set()
+
+    add_check(
+        checks,
+        "stable_instance_ids.job_contract",
+        job.get("bCaptureTemporalDiagnostics") is True
+        and job.get("lRMode") == "NativeRender"
+        and job.get("bEnableSemanticValidationFixture") is not True
+        and job.get("bValidateNonFixtureSkeletalAnimation") is not True
+        and job.get("bValidateProjectAnimatedMaterial") is not True
+        and (not dynamic or job.get("bResume") is not True),
+        json.dumps(
+            {
+                key: job.get(key)
+                for key in (
+                    "bCaptureTemporalDiagnostics",
+                    "lRMode",
+                    "bEnableSemanticValidationFixture",
+                    "bValidateNonFixtureSkeletalAnimation",
+                    "bValidateProjectAnimatedMaterial",
+                    "bAllowDynamicInstanceIdTopology",
+                    "bResume",
+                )
+            },
+            sort_keys=True,
+        ),
+    )
+    add_check(
+        checks,
+        "stable_instance_ids.manifest_contract",
+        isinstance(state, dict)
+        and state.get("enabled") is True
+        and state.get("preparedAfterWarmupAndStreaming") is True
+        and state.get("encoding") == "custom_stencil_uint8"
+        and state.get("mappingFile") == "instance_id_map.json"
+        and int(state.get("backgroundId", -1)) == 0
+        and int(state.get("maximumAssignableId", -1)) == 255
+        and state.get("fixedTopologyRequired") is (not dynamic)
+        and bool(state.get("dynamicTopologyAllowed", False)) is dynamic
+        and (
+            state.get("assignmentPolicy")
+            == (
+                "monotonic_uint8_never_reused_discovery_frame_then_component_path"
+                if dynamic
+                else "component_path_sorted_fixed_topology"
+            )
+            or (not dynamic and state.get("assignmentPolicy") is None)
+        )
+        and contract.get("objectIdEncoding")
+        == (
+            "dynamic_topology_component_unique_monotonic_custom_stencil_uint8_with_hashed_mapping_zero_background"
+            if dynamic
+            else "fixed_topology_component_unique_custom_stencil_uint8_with_hashed_mapping_zero_background"
+        )
+        and contract.get("objectIdInstanceUnique") is True
+        and contract.get("objectIdFixedTopologyRequired") is (not dynamic)
+        and bool(contract.get("objectIdDynamicTopologyAllowed", False)) is dynamic
+        and int(contract.get("objectIdMaximumInstances", -1)) == 255,
+        json.dumps(
+            {
+                "manifest": state,
+                "contract": {
+                    key: contract.get(key)
+                    for key in (
+                        "objectIdEncoding",
+                        "objectIdInstanceUnique",
+                        "objectIdFixedTopologyRequired",
+                        "objectIdDynamicTopologyAllowed",
+                        "objectIdMaximumInstances",
+                    )
+                },
+            },
+            sort_keys=True,
+        ),
+    )
+    if not isinstance(state, dict):
+        return "", set()
+    try:
+        mapping_path = safe_dataset_file(dataset, state.get("mappingFile"))
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        mapping_error = ""
+    except Exception as exc:
+        mapping_path = dataset / "__missing_instance_map__"
+        mapping = {}
+        mapping_error = str(exc)
+    add_check(
+        checks,
+        "stable_instance_ids.mapping_file",
+        not mapping_error and mapping_path.is_file(),
+        f"path={state.get('mappingFile')} error={mapping_error}",
+    )
+    if mapping_error or not isinstance(mapping, dict):
+        return "", set()
+
+    instances = mapping.get("instances")
+    if not isinstance(instances, list):
+        instances = []
+    required_fields = (
+        "componentPath",
+        "actorPath",
+        "actorClassPath",
+        "componentClassPath",
+    )
+    records_valid = all(
+        isinstance(record, dict)
+        and isinstance(record.get("instanceId"), int)
+        and (
+            not dynamic
+            or isinstance(record.get("firstSeenLogicalFrame"), int)
+        )
+        and all(
+            isinstance(record.get(field), str)
+            and bool(record.get(field))
+            and not any(character in record.get(field) for character in "\t\r\n")
+            for field in required_fields
+        )
+        for record in instances
+    )
+    ids = [int(record.get("instanceId", -1)) for record in instances if isinstance(record, dict)]
+    component_paths = [
+        str(record.get("componentPath", "")) for record in instances if isinstance(record, dict)
+    ]
+    first_seen_frames = [
+        int(record.get("firstSeenLogicalFrame", -2147483648))
+        for record in instances
+        if isinstance(record, dict)
+    ]
+    expected_ids = list(range(1, len(instances) + 1))
+    schema_valid = bool(
+        mapping.get("schemaVersion") == (2 if dynamic else 1)
+        and mapping.get("encoding") == "custom_stencil_uint8"
+        and int(mapping.get("backgroundId", -1)) == 0
+        and int(mapping.get("maximumAssignableId", -1)) == 255
+        and mapping.get("fixedTopologyRequired") is (not dynamic)
+        and bool(mapping.get("dynamicTopologyAllowed", False)) is dynamic
+        and (
+            mapping.get("assignmentPolicy")
+            == (
+                "monotonic_uint8_never_reused_discovery_frame_then_component_path"
+                if dynamic
+                else "component_path_sorted_fixed_topology"
+            )
+            or (not dynamic and mapping.get("assignmentPolicy") is None)
+        )
+        and 0 < len(instances) <= 255
+        and int(mapping.get("instanceCount", -1)) == len(instances)
+        and records_valid
+        and ids == expected_ids
+        and (dynamic or component_paths == sorted(component_paths))
+        and (not dynamic or first_seen_frames == sorted(first_seen_frames))
+        and len(set(component_paths)) == len(component_paths)
+    )
+    add_check(
+        checks,
+        "stable_instance_ids.mapping_schema",
+        schema_valid,
+        f"instances={len(instances)} ids={ids[:4]}..{ids[-4:] if ids else []}",
+    )
+    canonical = "".join(
+        (
+            f"{record['instanceId']}\t{record['firstSeenLogicalFrame']}\t"
+            f"{record['componentPath']}\t{record['actorPath']}\t"
+            f"{record['actorClassPath']}\t{record['componentClassPath']}\n"
+            if dynamic
+            else f"{record['instanceId']}\t{record['componentPath']}\t"
+            f"{record['actorPath']}\t{record['actorClassPath']}\t"
+            f"{record['componentClassPath']}\n"
+        )
+        for record in instances
+        if isinstance(record, dict)
+        and all(field in record for field in required_fields)
+        and (not dynamic or "firstSeenLogicalFrame" in record)
+    )
+    calculated_hash = hashlib.sha1(canonical.encode("utf-8")).hexdigest().upper()
+    reported_hash = str(mapping.get("sha1", "")).upper()
+    expected_scope = (
+        "instance_id_first_seen_logical_frame_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_instance_id"
+        if dynamic
+        else "instance_id_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_component_path"
+    )
+    hash_valid = bool(
+        schema_valid
+        and len(reported_hash) == 40
+        and reported_hash == calculated_hash
+        and str(state.get("mappingSha1", "")).upper() == reported_hash
+        and int(state.get("instanceCount", -1)) == len(instances)
+        and mapping.get("hashScope") == expected_scope
+    )
+    add_check(
+        checks,
+        "stable_instance_ids.mapping_sha1",
+        hash_valid,
+        f"reported={reported_hash} calculated={calculated_hash}",
+    )
+    return (reported_hash if hash_valid else ""), set(expected_ids if schema_valid else [])
+
+
+def finite_distribution(values: np.ndarray) -> dict[str, float | int | None]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return {
+            "count": 0,
+            "min": None,
+            "p01": None,
+            "p05": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+            "mean": None,
+        }
+    percentiles = np.percentile(finite, (1.0, 5.0, 50.0, 95.0, 99.0))
+    return {
+        "count": int(finite.size),
+        "min": float(np.min(finite)),
+        "p01": float(percentiles[0]),
+        "p05": float(percentiles[1]),
+        "p50": float(percentiles[2]),
+        "p95": float(percentiles[3]),
+        "p99": float(percentiles[4]),
+        "max": float(np.max(finite)),
+        "mean": float(np.mean(finite)),
+    }
+
+
+def camera_motion_metrics(
+    frame: dict[str, Any], previous_frame: dict[str, Any] | None
+) -> dict[str, float | bool | None]:
+    if previous_frame is None or frame.get("reset") is True:
+        return {
+            "hasPreviousSample": False,
+            "translationMeters": 0.0,
+            "translationSpeedMetersPerSecond": 0.0,
+            "rotationDegrees": 0.0,
+            "angularSpeedDegreesPerSecond": 0.0,
+        }
+    camera = frame.get("camera", {})
+    previous_camera = previous_frame.get("camera", {})
+    location = np.asarray(camera.get("locationCm", []), dtype=np.float64)
+    previous_location = np.asarray(
+        previous_camera.get("locationCm", []), dtype=np.float64
+    )
+    rotation = np.asarray(camera.get("rotationDeg", []), dtype=np.float64)
+    previous_rotation = np.asarray(
+        previous_camera.get("rotationDeg", []), dtype=np.float64
+    )
+    time_span = abs(
+        float(frame.get("simulationTimeS", 0.0))
+        - float(previous_frame.get("simulationTimeS", 0.0))
+    )
+    if time_span <= 0.0:
+        time_span = abs(float(frame.get("deltaTimeS", 0.0)))
+    if (
+        location.shape != (3,)
+        or previous_location.shape != (3,)
+        or rotation.shape != (3,)
+        or previous_rotation.shape != (3,)
+        or not np.isfinite(location).all()
+        or not np.isfinite(previous_location).all()
+        or not np.isfinite(rotation).all()
+        or not np.isfinite(previous_rotation).all()
+    ):
+        return {
+            "hasPreviousSample": False,
+            "translationMeters": None,
+            "translationSpeedMetersPerSecond": None,
+            "rotationDegrees": None,
+            "angularSpeedDegreesPerSecond": None,
+        }
+
+    translation_meters = float(np.linalg.norm(location - previous_location) * 0.01)
+    # Profile camera rotation with the shortest wrapped Euler delta. This is
+    # intentionally a distribution diagnostic, not a replacement for the exact
+    # current/previous matrices used by reprojection validation.
+    wrapped_rotation_delta = (rotation - previous_rotation + 180.0) % 360.0 - 180.0
+    rotation_degrees = float(np.linalg.norm(wrapped_rotation_delta))
+    return {
+        "hasPreviousSample": True,
+        "translationMeters": translation_meters,
+        "translationSpeedMetersPerSecond": (
+            translation_meters / time_span if time_span > 0.0 else None
+        ),
+        "rotationDegrees": rotation_degrees,
+        "angularSpeedDegreesPerSecond": (
+            rotation_degrees / time_span if time_span > 0.0 else None
+        ),
+    }
+
+
+def compute_frame_training_profile(
+    frame: dict[str, Any],
+    previous_frame: dict[str, Any] | None,
+    pixels: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    profile: dict[str, Any] = {
+        "logicalFrameId": int(frame.get("logicalFrameId", -1)),
+        "simulationTimeS": float(frame.get("simulationTimeS", math.nan)),
+        "reset": bool(frame.get("reset", False)),
+        "camera": camera_motion_metrics(frame, previous_frame),
+    }
+
+    motion = pixels.get("motion_full_current_to_previous")
+    motion_valid_pixels = pixels.get("motion_valid")
+    velocity_coverage_pixels = pixels.get("velocity_coverage")
+    if motion is not None and motion_valid_pixels is not None:
+        motion_valid = motion_valid_pixels[..., 0] >= 0.5
+        finite_motion = np.isfinite(motion[..., 0]) & np.isfinite(motion[..., 1])
+        usable_motion = motion_valid & finite_motion
+        magnitude = np.hypot(motion[..., 0], motion[..., 1])
+        motion_profile: dict[str, Any] = {
+            "validRatio": float(np.mean(motion_valid)),
+            "finiteValidRatio": float(np.mean(usable_motion)),
+            "magnitudeDisplayPixels": finite_distribution(magnitude[usable_motion]),
+        }
+        if velocity_coverage_pixels is not None:
+            motion_profile["nativeVelocityCoverageRatio"] = float(
+                np.mean(velocity_coverage_pixels[..., 0] >= 0.5)
+            )
+        profile["motion"] = motion_profile
+
+    rejection_pixels = pixels.get(
+        "disocclusion_mask", pixels.get("history_rejection_mask")
+    )
+    rejection_valid_pixels = pixels.get(
+        "disocclusion_valid", pixels.get("history_rejection_valid")
+    )
+    rejection_reason_pixels = pixels.get(
+        "disocclusion_reason", pixels.get("history_rejection_reason")
+    )
+    if rejection_pixels is not None and rejection_valid_pixels is not None:
+        rejection = rejection_pixels[..., 0] >= 0.5
+        rejection_valid = rejection_valid_pixels[..., 0] >= 0.5
+        valid_count = int(np.count_nonzero(rejection_valid))
+        disocclusion_profile: dict[str, Any] = {
+            "validRatio": float(np.mean(rejection_valid)),
+            "rejectRatioAllPixels": float(np.mean(rejection)),
+            "rejectRatioAmongValid": (
+                float(np.mean(rejection[rejection_valid])) if valid_count else None
+            ),
+            "uncertainRejectRatio": float(np.mean(rejection & ~rejection_valid)),
+        }
+        if rejection_reason_pixels is not None:
+            reason = np.rint(rejection_reason_pixels[..., 0]).astype(np.int32)
+            disocclusion_profile["reasonCounts"] = {
+                str(code): int(np.count_nonzero(reason == code)) for code in range(9)
+            }
+        profile["disocclusion"] = disocclusion_profile
+
+    for modality, output_name in (
+        ("reactive_mask", "reactive"),
+        ("transparency_mask", "transparency"),
+    ):
+        mask_pixels = pixels.get(modality)
+        if mask_pixels is None:
+            continue
+        coverage = np.clip(mask_pixels[..., 0], 0.0, 1.0)
+        profile[output_name] = {
+            "coveredPixelRatio": float(np.mean(coverage > 1.0e-4)),
+            "strongPixelRatio": float(np.mean(coverage >= 0.5)),
+            "meanCoverage": float(np.mean(coverage)),
+        }
+
+    depth_pixels = pixels.get("depth_view_linear_meters")
+    depth_valid_pixels = pixels.get("depth_valid")
+    if depth_pixels is not None and depth_valid_pixels is not None:
+        depth = depth_pixels[..., 0]
+        depth_valid = (
+            (depth_valid_pixels[..., 0] >= 0.5)
+            & np.isfinite(depth)
+            & (depth > 0.0)
+        )
+        profile["depth"] = {
+            "validRatio": float(np.mean(depth_valid)),
+            "linearMeters": finite_distribution(depth[depth_valid]),
+        }
+
+    color_pixels = pixels.get("color_lr_scene_hdr")
+    temporal = frame.get("temporalDiagnostics", {})
+    if color_pixels is not None:
+        pre_exposure = float(temporal.get("preExposure", 1.0))
+        exposure = float(temporal.get("exposure", math.nan))
+        radiance = color_pixels[..., :3].astype(np.float64)
+        if math.isfinite(pre_exposure) and pre_exposure > 0.0:
+            radiance = radiance / pre_exposure
+        luminance = (
+            radiance[..., 0] * 0.2126
+            + radiance[..., 1] * 0.7152
+            + radiance[..., 2] * 0.0722
+        )
+        finite_luminance = luminance[np.isfinite(luminance)]
+        luminance_distribution = finite_distribution(finite_luminance)
+        luminance_p95 = luminance_distribution.get("p95")
+        normalization = (
+            max(float(luminance_p95), 1.0e-6)
+            if isinstance(luminance_p95, (int, float))
+            and math.isfinite(float(luminance_p95))
+            else 1.0e-6
+        )
+        normalized_luminance = np.clip(luminance / normalization, 0.0, 1.0)
+        horizontal_gradient = np.abs(np.diff(normalized_luminance, axis=1))
+        vertical_gradient = np.abs(np.diff(normalized_luminance, axis=0))
+        gradient = np.hypot(
+            horizontal_gradient[:-1, :], vertical_gradient[:, :-1]
+        )
+        profile["color"] = {
+            "preExposure": pre_exposure,
+            "exposure": exposure,
+            "negativeLuminanceRatio": float(np.mean(luminance < 0.0)),
+            "luminanceAfterPreExposureRemoval": luminance_distribution,
+            "highFrequencyEnergy": float(np.mean(gradient)),
+            "edgeDensityAtNormalizedGradient005": float(np.mean(gradient >= 0.05)),
+        }
+        if previous_frame is not None and frame.get("reset") is not True:
+            previous_temporal = previous_frame.get("temporalDiagnostics", {})
+            previous_exposure = float(previous_temporal.get("exposure", math.nan))
+            previous_pre_exposure = float(
+                previous_temporal.get("preExposure", math.nan)
+            )
+            profile["color"]["exposureChangeStops"] = (
+                float(math.log2(exposure / previous_exposure))
+                if math.isfinite(exposure)
+                and math.isfinite(previous_exposure)
+                and exposure > 0.0
+                and previous_exposure > 0.0
+                else None
+            )
+            profile["color"]["preExposureChangeStops"] = (
+                float(math.log2(pre_exposure / previous_pre_exposure))
+                if math.isfinite(pre_exposure)
+                and math.isfinite(previous_pre_exposure)
+                and pre_exposure > 0.0
+                and previous_pre_exposure > 0.0
+                else None
+            )
+    return profile
+
+
+def aggregate_training_profile(frame_profiles: list[dict[str, Any]]) -> dict[str, Any]:
+    def metric(
+        path: tuple[str, ...],
+        *,
+        include_reset: bool = True,
+        require_previous_camera_sample: bool = False,
+    ) -> np.ndarray:
+        values: list[float] = []
+        for frame_profile in frame_profiles:
+            if not include_reset and frame_profile.get("reset") is True:
+                continue
+            if require_previous_camera_sample and not bool(
+                frame_profile.get("camera", {}).get("hasPreviousSample", False)
+            ):
+                continue
+            value: Any = frame_profile
+            for key in path:
+                value = value.get(key) if isinstance(value, dict) else None
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                values.append(float(value))
+        return np.asarray(values, dtype=np.float64)
+
+    motion_p95 = metric(
+        ("motion", "magnitudeDisplayPixels", "p95"), include_reset=False
+    )
+    disocclusion_ratio = metric(
+        ("disocclusion", "rejectRatioAmongValid"), include_reset=False
+    )
+    uncertain_ratio = metric(
+        ("disocclusion", "uncertainRejectRatio"), include_reset=False
+    )
+    reactive_ratio = metric(("reactive", "coveredPixelRatio"))
+    transparency_ratio = metric(("transparency", "coveredPixelRatio"))
+    edge_density = metric(("color", "edgeDensityAtNormalizedGradient005"))
+    high_frequency = metric(("color", "highFrequencyEnergy"))
+    luminance_p95 = metric(
+        ("color", "luminanceAfterPreExposureRemoval", "p95")
+    )
+    depth_p05_meters = metric(("depth", "linearMeters", "p05"))
+    depth_p95_meters = metric(("depth", "linearMeters", "p95"))
+    exposure_change_stops = metric(("color", "exposureChangeStops"))
+    camera_translation_speed = metric(
+        ("camera", "translationSpeedMetersPerSecond"),
+        require_previous_camera_sample=True,
+    )
+    camera_angular_speed = metric(
+        ("camera", "angularSpeedDegreesPerSecond"),
+        require_previous_camera_sample=True,
+    )
+
+    motion_bucket_counts = {
+        "static_lt_0_1_px": int(np.count_nonzero(motion_p95 < 0.1)),
+        "slow_0_1_to_2_px": int(
+            np.count_nonzero((motion_p95 >= 0.1) & (motion_p95 < 2.0))
+        ),
+        "medium_2_to_10_px": int(
+            np.count_nonzero((motion_p95 >= 2.0) & (motion_p95 < 10.0))
+        ),
+        "fast_ge_10_px": int(np.count_nonzero(motion_p95 >= 10.0)),
+    }
+    recommendations: list[str] = []
+    if motion_p95.size and motion_bucket_counts["static_lt_0_1_px"] == motion_p95.size:
+        recommendations.append(
+            "All profiled frames are static at motion p95 < 0.1 display pixel; add camera/object motion clips before training."
+        )
+    if disocclusion_ratio.size and float(np.max(disocclusion_ratio)) < 0.01:
+        recommendations.append(
+            "No frame has at least 1% valid rejected-history pixels; add foreground reveal/occlusion clips."
+        )
+    if reactive_ratio.size and float(np.max(reactive_ratio)) < 0.001:
+        recommendations.append(
+            "Reactive coverage is below 0.1% in every frame; add particles/translucency clips if they are in deployment scope."
+        )
+    if camera_angular_speed.size and float(np.max(camera_angular_speed)) < 1.0:
+        recommendations.append(
+            "Camera angular speed never reaches 1 degree/s; add rotation and fast-pan clips."
+        )
+    return {
+        "schemaVersion": 1,
+        "status": "diagnostic_not_a_certification_gate",
+        "frameCount": len(frame_profiles),
+        "temporalDistributionExcludesResetFrames": True,
+        "motionP95DisplayPixelsAcrossFrames": finite_distribution(motion_p95),
+        "motionBucketCounts": motion_bucket_counts,
+        "validDisocclusionRatioAcrossFrames": finite_distribution(
+            disocclusion_ratio
+        ),
+        "uncertainDisocclusionRatioAcrossFrames": finite_distribution(
+            uncertain_ratio
+        ),
+        "reactiveCoveredRatioAcrossFrames": finite_distribution(reactive_ratio),
+        "transparentCoveredRatioAcrossFrames": finite_distribution(
+            transparency_ratio
+        ),
+        "edgeDensityAcrossFrames": finite_distribution(edge_density),
+        "highFrequencyEnergyAcrossFrames": finite_distribution(high_frequency),
+        "luminanceP95AcrossFrames": finite_distribution(luminance_p95),
+        "depthP05MetersAcrossFrames": finite_distribution(depth_p05_meters),
+        "depthP95MetersAcrossFrames": finite_distribution(depth_p95_meters),
+        "exposureChangeStopsAcrossFrames": finite_distribution(
+            exposure_change_stops
+        ),
+        "cameraTranslationSpeedMetersPerSecondAcrossFrames": finite_distribution(
+            camera_translation_speed
+        ),
+        "cameraAngularSpeedDegreesPerSecondAcrossFrames": finite_distribution(
+            camera_angular_speed
+        ),
+        "recommendations": recommendations,
+        "frames": frame_profiles,
+    }
+
+
 def validate(
     dataset: Path,
     compare: Path | None,
@@ -1002,8 +2558,39 @@ def validate(
     hr_size = (int(job.get("hRResolution", {}).get("x", 0)), int(job.get("hRResolution", {}).get("y", 0)))
     lr_size = (int(job.get("lRResolution", {}).get("x", 0)), int(job.get("lRResolution", {}).get("y", 0)))
     temporal_enabled = bool(job.get("bCaptureTemporalDiagnostics", False))
+    history_rejection_v2 = temporal_enabled and any(
+        isinstance(frame.get("temporalDiagnostics"), dict)
+        and frame["temporalDiagnostics"].get("historyRejectionSource")
+        == "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
+        for frame in frames
+    )
+    gbuffer_attributes_v3 = temporal_enabled and any(
+        isinstance(frame.get("temporalDiagnostics"), dict)
+        and frame["temporalDiagnostics"].get("gbufferAttributeSource")
+        == "deferred_main_view_gbuffer_same_pixel_observed_at_after_dof"
+        for frame in frames
+    )
+    active_temporal_modalities = (
+        TEMPORAL_MODALITIES
+        if gbuffer_attributes_v3
+        else TEMPORAL_MODALITIES_V2
+        if history_rejection_v2
+        else TEMPORAL_MODALITIES_V1
+    )
     main_view = bool(job.get("bCaptureMainViewTemporalDiagnostics", False))
+    scene_capture_lr_comparison = bool(
+        job.get("bCaptureSceneCaptureLRComparison", False)
+    )
+    pixel_domain_required = bool(
+        job.get("bValidateMainViewSceneCapturePixelDomain", False)
+    )
     auxiliary_capture_order = str(job.get("auxiliaryCaptureOrder") or "HighResolutionFirst")
+    semantic_motion_scenario = str(
+        job.get("semanticMotionScenario") or "LegacyCameraRelative"
+    )
+    dynamic_instance_ids = bool(
+        job.get("bAllowDynamicInstanceIdTopology", False)
+    )
     add_check(
         checks,
         "capture_order.job_contract",
@@ -1013,6 +2600,12 @@ def validate(
             and job.get("lRMode") != "NativeRender"
         ),
         f"order={auxiliary_capture_order} lrMode={job.get('lRMode')}",
+    )
+    add_check(
+        checks,
+        "semantic_motion.job_contract",
+        semantic_motion_scenario in SEMANTIC_MOTION_SCENARIOS,
+        semantic_motion_scenario,
     )
     replay_role = str(manifest.get("replayPass") or job.get("replayPass") or "Standard")
     job_replay_role = str(job.get("replayPass") or "Standard")
@@ -1079,6 +2672,43 @@ def validate(
             ),
         )
     determinism_contract = manifest.get("determinismContract", {})
+    validate_scene_control_preflight(dataset, manifest, job, checks)
+    stable_instance_mapping_sha1, stable_instance_valid_ids = (
+        validate_stable_instance_ids(dataset, manifest, job, checks)
+    )
+    add_check(
+        checks,
+        "main_view_scene_capture.job_and_contract",
+        bool(determinism_contract.get("sceneCaptureLRComparisonEnabled", False))
+        is scene_capture_lr_comparison
+        and bool(
+            determinism_contract.get(
+                "mainViewSceneCapturePixelDomainValidationRequired", False
+            )
+        )
+        is pixel_domain_required
+        and (
+            scene_capture_lr_comparison
+            is bool(
+                determinism_contract.get(
+                    "sceneCaptureLRComparison", "not_captured"
+                )
+                == "existing_native_lr_scene_capture_after_dof_linear_scene_rgb_paired_without_simulation_advance"
+            )
+        )
+        and (not scene_capture_lr_comparison or (temporal_enabled and main_view)),
+        json.dumps(
+            {
+                key: determinism_contract.get(key)
+                for key in (
+                    "sceneCaptureLRComparisonEnabled",
+                    "mainViewSceneCapturePixelDomainValidationRequired",
+                    "sceneCaptureLRComparison",
+                )
+            },
+            sort_keys=True,
+        ),
+    )
     if job.get("bLockMaterialTimeToLogicalFrame", False):
         add_check(
             checks,
@@ -1223,6 +2853,459 @@ def validate(
             ),
             artifact_hash,
         )
+    state_cache_enabled = bool(job.get("bCacheControllableStatesForReplay", False))
+    state_cache_manifest = manifest.get("controllableStateCache", {})
+    if state_cache_enabled:
+        state_cache_input = str(job.get("controllableStateCacheInputFile") or "")
+        state_cache_output = str(job.get("controllableStateCacheOutputFile") or "")
+        expected_state_cache_mode = (
+            "apply_and_verify" if state_cache_input else "record"
+        )
+        configured_state_cache_path = state_cache_input or state_cache_output
+        state_cache_hash = str(state_cache_manifest.get("artifactSha1") or "").upper()
+        state_cache_path = resolve_state_cache_artifact(
+            dataset, configured_state_cache_path
+        )
+        valid_state_cache_hash = len(state_cache_hash) == 40 and all(
+            character in "0123456789ABCDEF" for character in state_cache_hash
+        )
+        add_check(
+            checks,
+            "controllable_state_cache.root_contract",
+            isinstance(state_cache_manifest, dict)
+            and state_cache_manifest.get("enabled") is True
+            and int(state_cache_manifest.get("schemaVersion", 0)) == 1
+            and state_cache_manifest.get("mode") == expected_state_cache_mode
+            and state_cache_manifest.get("artifactFile")
+            == configured_state_cache_path
+            and state_cache_manifest.get("loadedFromArtifact")
+            is (expected_state_cache_mode == "apply_and_verify")
+            and state_cache_manifest.get("rawCanonicalStateStored") is True
+            and state_cache_manifest.get("actorIdentity")
+            == "world_relative_actor_path_and_exact_class_path"
+            and state_cache_manifest.get("applicationPhase")
+            == "post_actor_tick_before_render_data_submission"
+            and state_cache_manifest.get("verification")
+            == "apply_return_true_then_byte_exact_state_readback"
+            and state_cache_manifest.get("validationFixtureEnabled")
+            is bool(job.get("bValidateControllableStateCache", False)),
+            json.dumps(state_cache_manifest, sort_keys=True),
+        )
+        actual_state_cache_hash = ""
+        if state_cache_path is not None and state_cache_path.is_file():
+            actual_state_cache_hash = sha1(state_cache_path)
+        add_check(
+            checks,
+            "controllable_state_cache.artifact_present_and_hash",
+            state_cache_path is not None
+            and state_cache_path.is_file()
+            and valid_state_cache_hash
+            and actual_state_cache_hash == state_cache_hash
+            and str(provenance.get("controllableStateCacheArtifactSha1", "")).upper()
+            == state_cache_hash,
+            f"path={state_cache_path} manifest={state_cache_hash} actual={actual_state_cache_hash}",
+        )
+        state_cache_artifact: dict[str, Any] = {}
+        artifact_frames_by_id: dict[int, dict[str, Any]] = {}
+        artifact_integrity = False
+        artifact_detail = "artifact unavailable"
+        try:
+            if state_cache_path is None:
+                raise ValueError("project root could not be resolved")
+            state_cache_artifact = json.loads(
+                state_cache_path.read_text(encoding="utf-8")
+            )
+            artifact_frames = state_cache_artifact.get("frames", [])
+            expected_frame_ids = list(
+                range(int(job.get("startFrame", 0)), int(job.get("endFrame", -1)) + 1)
+            )
+            artifact_frame_ids = [
+                int(frame.get("logicalFrame", -1)) for frame in artifact_frames
+            ]
+            header_valid = (
+                int(state_cache_artifact.get("schemaVersion", 0)) == 1
+                and state_cache_artifact.get("engineVersion")
+                == manifest.get("engineVersion")
+                and state_cache_artifact.get("world") == job.get("expectedMap")
+                and int(state_cache_artifact.get("startFrame", -1))
+                == int(job.get("startFrame", -2))
+                and int(state_cache_artifact.get("endFrame", -1))
+                == int(job.get("endFrame", -2))
+                and int(state_cache_artifact.get("captureFrameRateNumerator", 0))
+                == int(job.get("captureFrameRateNumerator", -1))
+                and int(state_cache_artifact.get("captureFrameRateDenominator", 0))
+                == int(job.get("captureFrameRateDenominator", -1))
+                and int(state_cache_artifact.get("randomSeed", -1))
+                == int(job.get("randomSeed", -2))
+                and int(state_cache_artifact.get("frameCount", -1))
+                == len(expected_frame_ids)
+                and state_cache_artifact.get("hashScope")
+                == "logical_frame_and_sorted_world_relative_actor_path_class_state_sha1_utf8_bytes"
+                and artifact_frame_ids == expected_frame_ids
+            )
+            records_valid = header_valid
+            for artifact_frame in artifact_frames:
+                frame_id = int(artifact_frame["logicalFrame"])
+                actors = artifact_frame.get("actors", [])
+                actor_paths = [str(actor.get("actorPath") or "") for actor in actors]
+                frame_valid = (
+                    bool(actors)
+                    and actor_paths == sorted(actor_paths)
+                    and len(actor_paths) == len(set(actor_paths))
+                )
+                for actor in actors:
+                    canonical_state = str(actor.get("canonicalState") or "")
+                    actor_hash = str(actor.get("stateSha1") or "").upper()
+                    frame_valid = frame_valid and bool(
+                        actor.get("actorPath")
+                        and actor.get("actorClassPath")
+                        and canonical_state
+                        and actor_hash == sha1_text(canonical_state)
+                        and int(actor.get("utf8Bytes", -1))
+                        == len(canonical_state.encode("utf-8"))
+                    )
+                calculated_frame_hash = controllable_state_frame_sha1(
+                    artifact_frame
+                )
+                frame_valid = frame_valid and calculated_frame_hash == str(
+                    artifact_frame.get("aggregateSha1") or ""
+                ).upper()
+                records_valid = records_valid and frame_valid
+                artifact_frames_by_id[frame_id] = artifact_frame
+            artifact_integrity = records_valid
+            artifact_detail = json.dumps(
+                {
+                    "headerValid": header_valid,
+                    "frameIds": artifact_frame_ids,
+                    "expectedFrameIds": expected_frame_ids,
+                    "recordsValid": records_valid,
+                },
+                sort_keys=True,
+            )
+        except Exception as exc:
+            artifact_detail = str(exc)
+        add_check(
+            checks,
+            "controllable_state_cache.artifact_schema_and_integrity",
+            artifact_integrity,
+            artifact_detail,
+        )
+        for frame in frames:
+            frame_id = int(frame.get("logicalFrameId", -1))
+            artifact_frame = artifact_frames_by_id.get(frame_id, {})
+            expected_actor_count = len(artifact_frame.get("actors", []))
+            expected_frame_hash = str(
+                artifact_frame.get("aggregateSha1") or ""
+            ).upper()
+            common_frame_contract = (
+                frame.get("controllableStateCacheEnabled") is True
+                and frame.get("controllableStateCacheMode")
+                == expected_state_cache_mode
+                and frame.get("controllableStateCacheApplicationPhase")
+                == "post_actor_tick_before_render_data_submission"
+                and int(frame.get("controllableStateCacheActorCount", -1))
+                == expected_actor_count
+                and expected_actor_count > 0
+                and str(frame.get("controllableStateCacheFrameSha1") or "").upper()
+                == expected_frame_hash
+                and str(frame.get("controllableStateCacheArtifactSha1") or "").upper()
+                == state_cache_hash
+                and frame.get("controllableStateCacheValidationEnabled")
+                is bool(job.get("bValidateControllableStateCache", False))
+            )
+            applied_count = int(
+                frame.get("controllableStateCacheAppliedActorCount", -1)
+            )
+            verified_count = int(
+                frame.get("controllableStateCacheVerifiedActorCount", -1)
+            )
+            changed_count = int(
+                frame.get("controllableStateCacheChangedBeforeApplyActorCount", -1)
+            )
+            if expected_state_cache_mode == "record":
+                mode_contract = (
+                    applied_count == 0
+                    and verified_count == 0
+                    and changed_count == 0
+                )
+            else:
+                mode_contract = (
+                    applied_count == expected_actor_count
+                    and verified_count == expected_actor_count
+                    and (
+                        changed_count > 0
+                        if job.get("bValidateControllableStateCache", False)
+                        else changed_count >= 0
+                    )
+                )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.controllable_state_cache",
+                common_frame_contract and mode_contract,
+                json.dumps(
+                    {
+                        "mode": frame.get("controllableStateCacheMode"),
+                        "actors": expected_actor_count,
+                        "applied": applied_count,
+                        "verified": verified_count,
+                        "changedBeforeApply": changed_count,
+                        "frameSha1": frame.get("controllableStateCacheFrameSha1"),
+                    },
+                    sort_keys=True,
+                ),
+            )
+    niagara_cache_enabled = bool(job.get("bCacheNiagaraSimForReplay", False))
+    niagara_cache_manifest = manifest.get("niagaraSimCache", {})
+    if niagara_cache_enabled:
+        niagara_cache_input = str(job.get("niagaraSimCacheInputFile") or "")
+        niagara_cache_output = str(job.get("niagaraSimCacheOutputFile") or "")
+        expected_niagara_cache_mode = (
+            "apply_and_verify" if niagara_cache_input else "record"
+        )
+        configured_niagara_cache_path = (
+            niagara_cache_input or niagara_cache_output
+        )
+        niagara_cache_hash = str(
+            niagara_cache_manifest.get("artifactSha1") or ""
+        ).upper()
+        niagara_cache_path = resolve_state_cache_artifact(
+            dataset, configured_niagara_cache_path
+        )
+        niagara_components = niagara_cache_manifest.get("components", [])
+        if not isinstance(niagara_components, list):
+            niagara_components = []
+        expected_niagara_frame_count = (
+            int(job.get("endFrame", -1)) - int(job.get("startFrame", 0)) + 1
+        )
+        component_paths = [
+            str(component.get("componentPath") or "")
+            for component in niagara_components
+            if isinstance(component, dict)
+        ]
+        root_cpu_emitters = 0
+        root_gpu_emitters = 0
+        root_cached_particles = 0
+        root_cached_gpu_particles = 0
+        component_records_valid = (
+            bool(niagara_components)
+            and len(component_paths) == len(niagara_components)
+            and component_paths == sorted(component_paths)
+            and len(component_paths) == len(set(component_paths))
+        )
+        for component in niagara_components:
+            if not isinstance(component, dict):
+                component_records_valid = False
+                continue
+            cpu_emitters = int(component.get("cpuEmitterCount", -1))
+            gpu_emitters = int(component.get("gpuEmitterCount", -1))
+            cached_particles = int(component.get("cachedParticleSamples", -1))
+            cached_gpu_particles = int(
+                component.get("cachedGPUParticleSamples", -1)
+            )
+            root_cpu_emitters += max(cpu_emitters, 0)
+            root_gpu_emitters += max(gpu_emitters, 0)
+            root_cached_particles += max(cached_particles, 0)
+            root_cached_gpu_particles += max(cached_gpu_particles, 0)
+            component_records_valid = component_records_valid and bool(
+                component.get("componentPath")
+                and component.get("assetPath")
+                and is_sha1_hex(component.get("serializedSha1"))
+                and int(component.get("frameCount", -1))
+                == expected_niagara_frame_count
+                and cpu_emitters >= 0
+                and gpu_emitters >= 0
+                and cpu_emitters + gpu_emitters > 0
+                and cached_particles > 0
+                and 0 <= cached_gpu_particles <= cached_particles
+                and (gpu_emitters == 0 or cached_gpu_particles > 0)
+                and (gpu_emitters > 0 or cached_gpu_particles == 0)
+                and component.get("writeFinished") is True
+            )
+        if job.get("bValidateNiagaraSimCache", False):
+            component_records_valid = component_records_valid and (
+                root_cpu_emitters > 0
+                and root_gpu_emitters > 0
+                and root_cached_particles > 0
+                and root_cached_gpu_particles > 0
+            )
+        add_check(
+            checks,
+            "niagara_sim_cache.root_contract",
+            isinstance(niagara_cache_manifest, dict)
+            and niagara_cache_manifest.get("enabled") is True
+            and int(niagara_cache_manifest.get("schemaVersion", 0)) == 1
+            and niagara_cache_manifest.get("mode")
+            == expected_niagara_cache_mode
+            and niagara_cache_manifest.get("artifactFile")
+            == configured_niagara_cache_path
+            and niagara_cache_manifest.get("loadedFromArtifact")
+            is (expected_niagara_cache_mode == "apply_and_verify")
+            and int(niagara_cache_manifest.get("componentCount", -1))
+            == len(niagara_components)
+            and niagara_cache_manifest.get("attributeCaptureMode") == "all"
+            and niagara_cache_manifest.get("allowRebasing") is False
+            and niagara_cache_manifest.get("allowInterpolation") is False
+            and niagara_cache_manifest.get("dataInterfaceCaching") is False
+            and niagara_cache_manifest.get("largeCacheBulkDataSerialization")
+            is False
+            and niagara_cache_manifest.get("gpuCaptureReadback")
+            == "UNiagaraSimCache_FNiagaraDataSetReadback_ImmediateReadback"
+            and niagara_cache_manifest.get("identityContract")
+            == "exact_world_relative_component_path_system_asset_emitter_target_and_fixed_topology"
+            and niagara_cache_manifest.get("applicationPhase")
+            == "world_tick_end_after_niagara_finalize_before_dataset_render_submission"
+            and niagara_cache_manifest.get("validationFixtureEnabled")
+            is bool(job.get("bValidateNiagaraSimCache", False)),
+            json.dumps(niagara_cache_manifest, sort_keys=True),
+        )
+        add_check(
+            checks,
+            "niagara_sim_cache.component_records",
+            component_records_valid,
+            json.dumps(
+                {
+                    "componentCount": len(niagara_components),
+                    "componentPaths": component_paths,
+                    "cpuEmitters": root_cpu_emitters,
+                    "gpuEmitters": root_gpu_emitters,
+                    "cachedParticleSamples": root_cached_particles,
+                    "cachedGPUParticleSamples": root_cached_gpu_particles,
+                    "expectedFrameCount": expected_niagara_frame_count,
+                },
+                sort_keys=True,
+            ),
+        )
+        actual_niagara_cache_hash = ""
+        artifact_header_valid = False
+        artifact_header_detail = "artifact unavailable"
+        if niagara_cache_path is not None and niagara_cache_path.is_file():
+            actual_niagara_cache_hash = sha1(niagara_cache_path)
+            try:
+                with niagara_cache_path.open("rb") as stream:
+                    header = stream.read(8)
+                if len(header) == 8:
+                    magic, version = struct.unpack("<II", header)
+                    artifact_header_valid = magic == 0x53524E43 and version == 1
+                    artifact_header_detail = (
+                        f"magic=0x{magic:08X} version={version} bytes="
+                        f"{niagara_cache_path.stat().st_size}"
+                    )
+                else:
+                    artifact_header_detail = f"header_bytes={len(header)}"
+            except OSError as exc:
+                artifact_header_detail = str(exc)
+        add_check(
+            checks,
+            "niagara_sim_cache.artifact_present_header_and_hash",
+            niagara_cache_path is not None
+            and niagara_cache_path.is_file()
+            and is_sha1_hex(niagara_cache_hash)
+            and actual_niagara_cache_hash == niagara_cache_hash
+            and str(
+                provenance.get("niagaraSimCacheArtifactSha1", "")
+            ).upper()
+            == niagara_cache_hash
+            and artifact_header_valid,
+            f"path={niagara_cache_path} manifest={niagara_cache_hash} "
+            f"actual={actual_niagara_cache_hash} {artifact_header_detail}",
+        )
+        frame_cached_particles = 0
+        frame_cached_gpu_particles = 0
+        for frame in frames:
+            frame_id = int(frame.get("logicalFrameId", -1))
+            expected_frame_index = frame_id - int(job.get("startFrame", 0))
+            cached_particles = int(
+                frame.get("niagaraSimCacheCachedParticleCount", -1)
+            )
+            cached_gpu_particles = int(
+                frame.get("niagaraSimCacheCachedGPUParticleCount", -1)
+            )
+            frame_cached_particles += max(cached_particles, 0)
+            frame_cached_gpu_particles += max(cached_gpu_particles, 0)
+            common_frame_contract = (
+                frame.get("niagaraSimCacheEnabled") is True
+                and frame.get("niagaraSimCacheMode")
+                == expected_niagara_cache_mode
+                and frame.get("niagaraSimCacheApplicationPhase")
+                == "world_tick_end_after_niagara_finalize_before_any_dataset_render_submission"
+                and int(frame.get("niagaraSimCacheFrameIndex", -1))
+                == expected_frame_index
+                and int(frame.get("niagaraSimCacheComponentCount", -1))
+                == len(niagara_components)
+                and int(frame.get("niagaraSimCacheCPUEmitterCount", -1))
+                == root_cpu_emitters
+                and int(frame.get("niagaraSimCacheGPUEmitterCount", -1))
+                == root_gpu_emitters
+                and cached_particles > 0
+                and 0 <= cached_gpu_particles <= cached_particles
+                and str(frame.get("niagaraSimCacheArtifactSha1") or "").upper()
+                == niagara_cache_hash
+                and frame.get("niagaraSimCacheValidationEnabled")
+                is bool(job.get("bValidateNiagaraSimCache", False))
+            )
+            recorded_count = int(
+                frame.get("niagaraSimCacheRecordedComponentCount", -1)
+            )
+            applied_count = int(
+                frame.get("niagaraSimCacheAppliedComponentCount", -1)
+            )
+            verified_count = int(
+                frame.get("niagaraSimCacheVerifiedComponentCount", -1)
+            )
+            if expected_niagara_cache_mode == "record":
+                mode_contract = (
+                    recorded_count == len(niagara_components)
+                    and applied_count == 0
+                    and verified_count == 0
+                )
+            else:
+                mode_contract = (
+                    recorded_count == 0
+                    and applied_count == len(niagara_components)
+                    and verified_count == len(niagara_components)
+                )
+            fixture_contract = True
+            if job.get("bValidateNiagaraSimCache", False):
+                cpu_fixture = niagara_fixture_state(frame)
+                gpu_fixture = niagara_gpu_fixture_state(frame)
+                fixture_contract = bool(
+                    cpu_fixture
+                    and int(cpu_fixture.get("cpuEmitterCount", 0)) > 0
+                    and int(cpu_fixture.get("particleCount", 0)) > 0
+                    and gpu_fixture
+                    and int(gpu_fixture.get("gpuEmitterCount", 0)) > 0
+                    and int(gpu_fixture.get("particleCount", 0)) > 0
+                    and cached_gpu_particles > 0
+                )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.niagara_sim_cache",
+                common_frame_contract and mode_contract and fixture_contract,
+                json.dumps(
+                    {
+                        "mode": frame.get("niagaraSimCacheMode"),
+                        "frameIndex": frame.get("niagaraSimCacheFrameIndex"),
+                        "components": len(niagara_components),
+                        "recorded": recorded_count,
+                        "applied": applied_count,
+                        "verified": verified_count,
+                        "cpuEmitters": frame.get("niagaraSimCacheCPUEmitterCount"),
+                        "gpuEmitters": frame.get("niagaraSimCacheGPUEmitterCount"),
+                        "cachedParticles": cached_particles,
+                        "cachedGPUParticles": cached_gpu_particles,
+                        "fixtureContract": fixture_contract,
+                    },
+                    sort_keys=True,
+                ),
+            )
+        add_check(
+            checks,
+            "niagara_sim_cache.aggregate_particle_samples",
+            frame_cached_particles == root_cached_particles
+            and frame_cached_gpu_particles == root_cached_gpu_particles,
+            f"frames={frame_cached_particles}/{frame_cached_gpu_particles} "
+            f"components={root_cached_particles}/{root_cached_gpu_particles}",
+        )
     streaming_hash = str(provenance.get("streamingStateAfterBarrierSha1", ""))
     valid_streaming_hash = len(streaming_hash) == 40 and all(
         character in "0123456789ABCDEFabcdef" for character in streaming_hash
@@ -1334,6 +3417,8 @@ def validate(
     project_animated_material_records: list[
         tuple[int, dict[str, Any], np.ndarray]
     ] = []
+    dataset_profile_frames: list[dict[str, Any]] = []
+    previous_profile_frame: dict[str, Any] | None = None
     all_render_submission_ids: list[int] = []
     for frame in frames:
         frame_id = int(frame["logicalFrameId"])
@@ -1373,13 +3458,27 @@ def validate(
             configured_rotation = job.get(
                 "deterministicCameraRotationDegrees", {}
             )
-            expected_location = np.asarray(
+            configured_translation = job.get(
+                "deterministicCameraTranslationPerLogicalFrameCm", {}
+            )
+            base_location = np.asarray(
                 [
                     configured_location.get("x", math.nan),
                     configured_location.get("y", math.nan),
                     configured_location.get("z", math.nan),
                 ],
                 dtype=np.float64,
+            )
+            translation_per_frame = np.asarray(
+                [
+                    configured_translation.get("x", 0.0),
+                    configured_translation.get("y", 0.0),
+                    configured_translation.get("z", 0.0),
+                ],
+                dtype=np.float64,
+            )
+            expected_location = base_location + translation_per_frame * (
+                frame_id - int(job.get("startFrame", 0))
             )
             expected_rotation = np.asarray(
                 [
@@ -1582,9 +3681,77 @@ def validate(
         niagara_total_spawned = int(frame.get("sceneNiagaraTotalSpawnedParticleCount", -1))
         niagara_states = frame.get("niagaraFrameStates", [])
         controllable_count = int(frame.get("sceneControllableActorCount", -1))
+        controllable_state_count = int(frame.get("sceneControllableStateCount", -1))
         uncontrolled_ticking_count = int(frame.get("sceneUncontrolledTickingActorCount", -1))
         controllable_actors = frame.get("sceneControllableActors", [])
+        controllable_states = frame.get("sceneControllableStates")
+        controllable_without_state = frame.get("sceneControllableActorsWithoutState")
         uncontrolled_ticking_actors = frame.get("sceneUncontrolledTickingActors", [])
+        controllable_state_v1 = isinstance(controllable_states, list) and isinstance(
+            controllable_without_state, list
+        )
+        controllable_paths = {
+            str(record).split("|", 1)[0]
+            for record in controllable_actors
+            if isinstance(record, str)
+        }
+        state_actor_paths = (
+            [str(state.get("actorPath", "")) for state in controllable_states]
+            if controllable_state_v1
+            else []
+        )
+        controllable_state_schema = bool(
+            controllable_state_v1
+            and controllable_state_count == len(controllable_states)
+            and controllable_state_count + len(controllable_without_state)
+            == controllable_count
+            and state_actor_paths == sorted(state_actor_paths)
+            and len(set(state_actor_paths)) == len(state_actor_paths)
+            and set(state_actor_paths).issubset(controllable_paths)
+            and all(
+                isinstance(state, dict)
+                and isinstance(state.get("actorPath"), str)
+                and len(str(state.get("stateSha1", ""))) == 40
+                and all(
+                    character in "0123456789ABCDEFabcdef"
+                    for character in str(state.get("stateSha1", ""))
+                )
+                and int(state.get("utf8Bytes", 0)) > 0
+                for state in controllable_states
+            )
+            and all(
+                isinstance(path, str) and path in controllable_paths
+                for path in controllable_without_state
+            )
+            and len(set(controllable_without_state))
+            == len(controllable_without_state)
+        )
+        add_check(
+            checks,
+            f"frame_{frame_id:06d}.controllable_canonical_state",
+            (
+                controllable_state_schema
+                and (
+                    not job.get("bRequireControllableState", False)
+                    or (
+                        controllable_state_count == controllable_count
+                        and not controllable_without_state
+                    )
+                )
+            )
+            if controllable_state_v1
+            else not job.get("bRequireControllableState", False),
+            json.dumps(
+                {
+                    "enabled": controllable_state_v1,
+                    "required": bool(job.get("bRequireControllableState", False)),
+                    "actorCount": controllable_count,
+                    "stateCount": controllable_state_count,
+                    "withoutState": controllable_without_state,
+                },
+                sort_keys=True,
+            ),
+        )
         add_check(
             checks,
             f"frame_{frame_id:06d}.scene_state_provenance",
@@ -1612,7 +3779,14 @@ def validate(
             and len(uncontrolled_ticking_actors) == uncontrolled_ticking_count
             and len(set(uncontrolled_ticking_actors)) == uncontrolled_ticking_count
             and frame.get("sceneStateHashScope")
-            == "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back",
+            in {
+                "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back",
+                "sorted_actor_component_transforms_visibility_tick_controllable_canonical_state_hashes_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back",
+            }
+            and (
+                not controllable_state_v1
+                or controllable_state_schema
+            ),
             json.dumps(
                 {
                     "sha1": scene_state_hash,
@@ -1628,6 +3802,8 @@ def validate(
                     "niagaraParticles": niagara_particle_count,
                     "niagaraTotalSpawned": niagara_total_spawned,
                     "controllableActors": controllable_count,
+                    "controllableStates": controllable_state_count,
+                    "controllableActorsWithoutState": controllable_without_state,
                     "uncontrolledTickingActors": uncontrolled_ticking_count,
                     "uncontrolledTickingActorPaths": uncontrolled_ticking_actors,
                 },
@@ -1787,6 +3963,7 @@ def validate(
             for metadata_name in (
                 "temporalDiagnostics",
                 "nativeHRDiagnostics",
+                "sceneCaptureLRComparisonDiagnostics",
                 "referenceHRDiagnostics",
                 "hudlessColorDiagnostics",
             ):
@@ -1823,7 +4000,9 @@ def validate(
         frame_pixels: dict[str, np.ndarray] = {}
         required = ["hr", "lr"] + (["depth"] if job.get("bCaptureDepth", False) else [])
         if temporal_enabled:
-            required.extend(TEMPORAL_MODALITIES)
+            required.extend(active_temporal_modalities)
+        if scene_capture_lr_comparison:
+            required.extend(SCENE_CAPTURE_LR_COMPARISON_MODALITIES)
         if job.get("bCaptureReferenceHR", False):
             required.extend(REFERENCE_MODALITIES)
         if job.get("bCaptureMainViewHUDlessColor", False):
@@ -1894,7 +4073,17 @@ def validate(
             pixels = exr_rgba(path)
             frame_pixels[modality] = pixels
             height, width, _ = pixels.shape
-            expected_size = hr_size if modality in HR_TEMPORAL_MODALITIES else (lr_size if modality in TEMPORAL_MODALITIES else hr_size)
+            expected_size = (
+                hr_size
+                if modality in HR_TEMPORAL_MODALITIES
+                else (
+                    lr_size
+                    if modality
+                    in TEMPORAL_MODALITIES
+                    + SCENE_CAPTURE_LR_COMPARISON_MODALITIES
+                    else hr_size
+                )
+            )
             add_check(
                 checks,
                 f"frame_{frame_id:06d}.{modality}.size",
@@ -1991,9 +4180,246 @@ def validate(
                         ),
                     )
 
+                    if (
+                        temporal.get("gbufferReplayComparison")
+                        == "quantized_attribute_numeric_tolerance_v1_with_heatmap"
+                    ):
+                        expected_state_frame_index = (
+                            frame_id + phase_offset
+                        ) & 0xFFFFFFFF
+                        actual_state_frame_index = int(
+                            temporal.get("stateFrameIndex", -1)
+                        )
+                        add_check(
+                            checks,
+                            f"frame_{frame_id:06d}.logical_view_state_frame_index",
+                            temporal.get("viewStateFrameIndexLogicalFrameLocked")
+                            is True
+                            and temporal.get("viewStateFrameIndexSource")
+                            == "scene_view_override_logical_frame_plus_phase_mod_uint32"
+                            and int(
+                                temporal.get(
+                                    "expectedLogicalViewStateFrameIndex", -1
+                                )
+                            )
+                            == expected_state_frame_index
+                            and actual_state_frame_index
+                            == expected_state_frame_index
+                            and int(temporal.get("stateFrameIndexMod8", -1))
+                            == expected_state_frame_index % 8,
+                            json.dumps(
+                                {
+                                    "expected": expected_state_frame_index,
+                                    "actual": temporal.get("stateFrameIndex"),
+                                    "actualMod8": temporal.get(
+                                        "stateFrameIndexMod8"
+                                    ),
+                                    "source": temporal.get(
+                                        "viewStateFrameIndexSource"
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                        )
+
                 validate_temporal_frame(
-                    checks, frame, temporal, frame_pixels, lr_size, hr_size, main_view, cvars
+                    checks,
+                    frame,
+                    temporal,
+                    frame_pixels,
+                    lr_size,
+                    hr_size,
+                    main_view,
+                    scene_capture_lr_comparison,
+                    pixel_domain_required,
+                    cvars,
                 )
+                if job.get("bAssignStableInstanceIds", False):
+                    expected_object_id_source = (
+                        "stable_dynamic_component_unique_custom_stencil_uint8_zero_background"
+                        if dynamic_instance_ids
+                        else "stable_component_unique_custom_stencil_uint8_zero_background"
+                    )
+                    active_metadata_present = (
+                        "stableInstanceIdActiveIds" in frame
+                    )
+                    active_instance_ids_list = frame.get(
+                        "stableInstanceIdActiveIds",
+                        sorted(stable_instance_valid_ids)
+                        if not dynamic_instance_ids
+                        else [],
+                    )
+                    new_instance_ids_list = frame.get(
+                        "stableInstanceIdNewIds", []
+                    )
+                    active_instance_ids = (
+                        set(int(value) for value in active_instance_ids_list)
+                        if isinstance(active_instance_ids_list, list)
+                        else set()
+                    )
+                    new_instance_ids = (
+                        set(int(value) for value in new_instance_ids_list)
+                        if isinstance(new_instance_ids_list, list)
+                        else set()
+                    )
+                    stable_frame_contract = bool(
+                        frame.get("stableInstanceIdsEnabled") is True
+                        and str(frame.get("stableInstanceIdMappingSha1", "")).upper()
+                        == stable_instance_mapping_sha1
+                        and int(frame.get("stableInstanceIdCount", -1))
+                        == len(stable_instance_valid_ids)
+                        and (
+                            frame.get(
+                                "stableInstanceIdFixedTopologyRequired"
+                            )
+                            is (not dynamic_instance_ids)
+                            or (
+                                not dynamic_instance_ids
+                                and "stableInstanceIdFixedTopologyRequired"
+                                not in frame
+                            )
+                        )
+                        and bool(
+                            frame.get(
+                                "stableInstanceIdDynamicTopologyAllowed",
+                                False,
+                            )
+                        )
+                        is dynamic_instance_ids
+                        and isinstance(active_instance_ids_list, list)
+                        and active_instance_ids_list
+                        == sorted(active_instance_ids)
+                        and active_instance_ids.issubset(
+                            stable_instance_valid_ids
+                        )
+                        and isinstance(new_instance_ids_list, list)
+                        and new_instance_ids_list == sorted(new_instance_ids)
+                        and new_instance_ids.issubset(active_instance_ids)
+                        and (not dynamic_instance_ids or active_metadata_present)
+                        and temporal.get("objectIdSource")
+                        == expected_object_id_source
+                        and temporal.get("objectIdInstanceUnique") is True
+                        and bool(
+                            temporal.get("objectIdDynamicTopologyAllowed", False)
+                        )
+                        is dynamic_instance_ids
+                        and str(temporal.get("objectIdMappingSha1", "")).upper()
+                        == stable_instance_mapping_sha1
+                        and int(temporal.get("objectIdInstanceCount", -1))
+                        == len(stable_instance_valid_ids)
+                    )
+                    add_check(
+                        checks,
+                        f"frame_{frame_id:06d}.stable_instance_id_metadata",
+                        stable_frame_contract,
+                        json.dumps(
+                            {
+                                "frameEnabled": frame.get("stableInstanceIdsEnabled"),
+                                "frameHash": frame.get("stableInstanceIdMappingSha1"),
+                                "frameCount": frame.get("stableInstanceIdCount"),
+                                "source": temporal.get("objectIdSource"),
+                                "instanceUnique": temporal.get(
+                                    "objectIdInstanceUnique"
+                                ),
+                                "temporalHash": temporal.get("objectIdMappingSha1"),
+                                "temporalCount": temporal.get(
+                                    "objectIdInstanceCount"
+                                ),
+                                "activeIds": active_instance_ids_list,
+                                "newIds": new_instance_ids_list,
+                                "dynamic": dynamic_instance_ids,
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+                    object_pixels = frame_pixels.get("object_id")
+                    if object_pixels is None:
+                        raster_valid = False
+                        raster_detail = "missing object_id pixels"
+                    else:
+                        values = object_pixels[..., 0]
+                        rounded = np.rint(values)
+                        unique_ids = set(int(value) for value in np.unique(rounded))
+                        nonzero_pixels = int(np.count_nonzero(rounded > 0.0))
+                        raster_valid = bool(
+                            np.allclose(values, rounded, rtol=0.0, atol=1e-6)
+                            and unique_ids.issubset(
+                                active_instance_ids | {0}
+                            )
+                            and nonzero_pixels > 0
+                        )
+                        raster_detail = json.dumps(
+                            {
+                                "uniqueIds": sorted(unique_ids),
+                                "nonzeroPixelCount": nonzero_pixels,
+                                "mappedInstanceCount": len(
+                                    stable_instance_valid_ids
+                                ),
+                            },
+                            sort_keys=True,
+                        )
+                    add_check(
+                        checks,
+                        f"frame_{frame_id:06d}.stable_instance_id_raster",
+                        raster_valid,
+                        raster_detail,
+                    )
+                    if job.get("bValidateDynamicInstanceIdTopology", False):
+                        dynamic_validation = frame.get(
+                            "dynamicInstanceIdValidation", {}
+                        )
+                        if not isinstance(dynamic_validation, dict):
+                            dynamic_validation = {}
+                        spawn_frame = int(job.get("startFrame", 0)) + 1
+                        expected_active = frame_id == spawn_frame
+                        expected_phase = (
+                            "absent_before_spawn"
+                            if frame_id < spawn_frame
+                            else "spawned_visible"
+                            if frame_id == spawn_frame
+                            else "removed_after_spawn"
+                        )
+                        probe_id = int(
+                            dynamic_validation.get("assignedInstanceId", 0)
+                        )
+                        probe_pixels = (
+                            int(np.count_nonzero(rounded == probe_id))
+                            if object_pixels is not None and probe_id > 0
+                            else 0
+                        )
+                        dynamic_fixture_valid = bool(
+                            isinstance(dynamic_validation, dict)
+                            and dynamic_validation.get("enabled") is True
+                            and isinstance(
+                                dynamic_validation.get("componentPath"), str
+                            )
+                            and dynamic_validation.get("componentPath")
+                            and probe_id in stable_instance_valid_ids
+                            and dynamic_validation.get("phase")
+                            == expected_phase
+                            and dynamic_validation.get("expectedActive")
+                            is expected_active
+                            and (probe_id in active_instance_ids)
+                            is expected_active
+                            and (probe_id in new_instance_ids)
+                            is expected_active
+                            and (probe_pixels > 0) is expected_active
+                        )
+                        add_check(
+                            checks,
+                            f"frame_{frame_id:06d}.dynamic_instance_id_fixture",
+                            dynamic_fixture_valid,
+                            json.dumps(
+                                {
+                                    "phase": dynamic_validation.get("phase"),
+                                    "probeId": probe_id,
+                                    "active": probe_id in active_instance_ids,
+                                    "new": probe_id in new_instance_ids,
+                                    "pixels": probe_pixels,
+                                },
+                                sort_keys=True,
+                            ),
+                        )
                 temporal_records.append((frame_id, temporal, bool(frame.get("reset", False))))
                 if job.get("bEnableSemanticValidationFixture", False):
                     fixture = frame.get("semanticValidationFixture")
@@ -2004,6 +4430,29 @@ def validate(
                         "present",
                     )
                     if isinstance(fixture, dict):
+                        add_check(
+                            checks,
+                            f"frame_{frame_id:06d}.semantic_fixture_motion_contract",
+                            fixture.get("motionScenario") == semantic_motion_scenario
+                            and fixture.get("worldAnchored")
+                            is (semantic_motion_scenario != "LegacyCameraRelative")
+                            and fixture.get("objectMotionEnabled")
+                            is (
+                                semantic_motion_scenario
+                                in {"LegacyCameraRelative", "ObjectOnly", "Mixed"}
+                            ),
+                            json.dumps(
+                                {
+                                    "jobScenario": semantic_motion_scenario,
+                                    "fixtureScenario": fixture.get("motionScenario"),
+                                    "worldAnchored": fixture.get("worldAnchored"),
+                                    "objectMotionEnabled": fixture.get(
+                                        "objectMotionEnabled"
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                        )
                         validate_semantic_fixture_frame(checks, frame, fixture, frame_pixels)
                         semantic_records.append((frame_id, fixture, frame_pixels))
                 if job.get("bCaptureReferenceHR", False):
@@ -2377,12 +4826,34 @@ def validate(
                 (frame_id, material_state, receiver_color)
             )
 
+        dataset_profile_frames.append(
+            compute_frame_training_profile(
+                frame,
+                previous_profile_frame,
+                frame_pixels,
+            )
+        )
+        previous_profile_frame = frame
+
     add_check(
         checks,
         "capture_order.submission_ids_global",
         not all_render_submission_ids
         or all_render_submission_ids == list(range(len(all_render_submission_ids))),
         f"count={len(all_render_submission_ids)} first={all_render_submission_ids[:4]} last={all_render_submission_ids[-4:]}",
+    )
+
+    if history_rejection_v2:
+        validate_history_rejection_v2_cross_frame(checks, frames, frame_paths)
+
+    dataset_profile = aggregate_training_profile(dataset_profile_frames)
+    add_check(
+        checks,
+        "dataset_profile.frame_coverage",
+        len(dataset_profile_frames) == len(frames)
+        and [record["logicalFrameId"] for record in dataset_profile_frames]
+        == [int(frame["logicalFrameId"]) for frame in frames],
+        f"profiled={len(dataset_profile_frames)} manifest={len(frames)}",
     )
 
     if job.get("bValidateProjectAnimatedMaterial", False):
@@ -2616,6 +5087,60 @@ def validate(
                 f"expected={expected_span_frames} actual={frame.get('motionTimeSpanFrames')}",
             )
 
+    if job.get("bValidateTemporalJitterSignCoverage", False):
+        sequence_length = int(job.get("temporalJitterSequenceLength", 0))
+        jitter_indices: set[int] = set()
+        jitter_vectors: list[np.ndarray] = []
+        for _, temporal, _ in temporal_records:
+            jitter_indices.add(int(temporal.get("jitterIndex", -1)))
+            vector = np.asarray(
+                temporal.get("jitterCurrentRenderPixel", (math.nan, math.nan)),
+                dtype=np.float64,
+            )
+            if vector.shape == (2,) and np.all(np.isfinite(vector)):
+                jitter_vectors.append(vector)
+        expected_indices = set(range(sequence_length))
+        add_check(
+            checks,
+            "jitter_sign.full_logical_sequence_coverage",
+            sequence_length >= 4
+            and expected_indices.issubset(jitter_indices)
+            and len(jitter_vectors) >= sequence_length,
+            f"sequenceLength={sequence_length} indices={sorted(jitter_indices)} finiteVectors={len(jitter_vectors)}",
+        )
+        if jitter_vectors:
+            jitter_array = np.stack(jitter_vectors, axis=0)
+            epsilon = 1e-6
+            axis_signs = {
+                "xNegative": bool(np.any(jitter_array[:, 0] < -epsilon)),
+                "xPositive": bool(np.any(jitter_array[:, 0] > epsilon)),
+                "yNegative": bool(np.any(jitter_array[:, 1] < -epsilon)),
+                "yPositive": bool(np.any(jitter_array[:, 1] > epsilon)),
+            }
+            quadrants = {
+                (
+                    -1 if vector[0] < -epsilon else 1,
+                    -1 if vector[1] < -epsilon else 1,
+                )
+                for vector in jitter_array
+                if abs(vector[0]) > epsilon and abs(vector[1]) > epsilon
+            }
+            add_check(
+                checks,
+                "jitter_sign.left_right_up_down",
+                all(axis_signs.values()),
+                json.dumps(axis_signs, sort_keys=True),
+            )
+            add_check(
+                checks,
+                "jitter_sign.four_quadrants",
+                quadrants == {(-1, -1), (-1, 1), (1, -1), (1, 1)},
+                f"quadrants={sorted(quadrants)}",
+            )
+        else:
+            add_check(checks, "jitter_sign.left_right_up_down", False, "no finite jitter vectors")
+            add_check(checks, "jitter_sign.four_quadrants", False, "no finite jitter vectors")
+
     # Preserve process order for the same reason as temporal history above.
     if len(semantic_records) > 1:
         semantic_frame_ids = {frame_id for frame_id, _, _ in semantic_records}
@@ -2631,9 +5156,105 @@ def validate(
             f"frames={len(semantic_records)} uniqueSceneStateHashes={len(semantic_scene_hashes)}",
         )
     validated_moving_transitions = 0
+    validated_scenario_transitions = 0
     for index in range(1, len(semantic_records)):
         frame_id, fixture, current_pixels = semantic_records[index]
         _, previous_fixture, previous_pixels = semantic_records[index - 1]
+        expected_moving = np.asarray(
+            fixture.get("expectedMovingMotionDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        expected_background = np.asarray(
+            fixture.get("expectedBackgroundMotionDisplayPixels", (math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        current_camera = np.asarray(
+            fixture.get("currentCameraLocationCm", (math.nan, math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        previous_camera = np.asarray(
+            fixture.get("previousCameraLocationCm", (math.nan, math.nan, math.nan)),
+            dtype=np.float64,
+        )
+        current_right_metadata = float(fixture.get("movingCurrentRightCm", math.nan))
+        previous_right_metadata = float(fixture.get("movingPreviousRightCm", math.nan))
+        finite_contract = bool(
+            expected_moving.shape == (2,)
+            and expected_background.shape == (2,)
+            and current_camera.shape == (3,)
+            and previous_camera.shape == (3,)
+            and np.all(np.isfinite(expected_moving))
+            and np.all(np.isfinite(expected_background))
+            and np.all(np.isfinite(current_camera))
+            and np.all(np.isfinite(previous_camera))
+            and math.isfinite(current_right_metadata)
+            and math.isfinite(previous_right_metadata)
+        )
+        if semantic_motion_scenario != "LegacyCameraRelative":
+            moving_magnitude = (
+                float(np.linalg.norm(expected_moving)) if finite_contract else math.nan
+            )
+            background_magnitude = (
+                float(np.linalg.norm(expected_background)) if finite_contract else math.nan
+            )
+            camera_moved = finite_contract and not np.allclose(
+                current_camera, previous_camera, atol=1e-6, rtol=0.0
+            )
+            object_moved = finite_contract and not math.isclose(
+                current_right_metadata, previous_right_metadata, abs_tol=1e-6
+            )
+            zero_tolerance = 1e-4
+            motion_floor = 0.05
+            scenario_ok = False
+            if semantic_motion_scenario == "Static":
+                scenario_ok = (
+                    finite_contract
+                    and not camera_moved
+                    and not object_moved
+                    and moving_magnitude <= zero_tolerance
+                    and background_magnitude <= zero_tolerance
+                )
+            elif semantic_motion_scenario == "CameraOnly":
+                scenario_ok = (
+                    finite_contract
+                    and camera_moved
+                    and not object_moved
+                    and moving_magnitude >= motion_floor
+                    and background_magnitude >= motion_floor
+                )
+            elif semantic_motion_scenario == "ObjectOnly":
+                scenario_ok = (
+                    finite_contract
+                    and not camera_moved
+                    and object_moved
+                    and moving_magnitude >= motion_floor
+                    and background_magnitude <= zero_tolerance
+                )
+            elif semantic_motion_scenario == "Mixed":
+                scenario_ok = (
+                    finite_contract
+                    and camera_moved
+                    and object_moved
+                    and moving_magnitude >= motion_floor
+                    and background_magnitude >= motion_floor
+                    and float(np.linalg.norm(expected_moving - expected_background))
+                    >= motion_floor
+                )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.semantic_fixture.{semantic_motion_scenario.lower()}_scenario_signature",
+                scenario_ok,
+                json.dumps(
+                    {
+                        "expectedMoving": expected_moving.tolist(),
+                        "expectedBackground": expected_background.tolist(),
+                        "cameraMoved": bool(camera_moved),
+                        "objectMoved": bool(object_moved),
+                    },
+                    sort_keys=True,
+                ),
+            )
+            validated_scenario_transitions += int(scenario_ok)
         current_right_cm = float(fixture.get("movingCurrentRightCm", math.nan))
         previous_right_cm = float(
             previous_fixture.get("movingCurrentRightCm", math.nan)
@@ -2698,11 +5319,30 @@ def validate(
             f"stable_background_kept_valid={stable_kept}",
         )
     if len(semantic_records) > 1:
+        expected_scenario_transitions = (
+            len(semantic_records) - 1
+            if semantic_motion_scenario != "LegacyCameraRelative"
+            else 0
+        )
+        if expected_scenario_transitions:
+            add_check(
+                checks,
+                "semantic_fixture.motion_scenario_transition_coverage",
+                validated_scenario_transitions == expected_scenario_transitions,
+                f"scenario={semantic_motion_scenario} validated={validated_scenario_transitions} expected={expected_scenario_transitions}",
+            )
+        object_motion_expected = semantic_motion_scenario in {
+            "LegacyCameraRelative",
+            "ObjectOnly",
+            "Mixed",
+        }
         add_check(
             checks,
             "semantic_fixture.moving_transition_coverage",
-            validated_moving_transitions >= 1,
-            f"validatedMovingTransitions={validated_moving_transitions}",
+            validated_moving_transitions >= 1
+            if object_motion_expected
+            else validated_moving_transitions == 0,
+            f"scenario={semantic_motion_scenario} validatedMovingTransitions={validated_moving_transitions}",
         )
 
     if compare is not None:
@@ -2818,6 +5458,113 @@ def validate(
                 "material_reverse.provenance_equal_except_config_hash",
                 normalized_provenance_match,
                 "exact after normalization" if normalized_provenance_match else "normalized provenance differs",
+            )
+        elif compare_mode == "state-cache":
+            other_state_cache = other.get("controllableStateCache", {})
+            state_cache_roles_valid = {
+                str(state_cache_manifest.get("mode") or ""),
+                str(other_state_cache.get("mode") or ""),
+            } == {"record", "apply_and_verify"}
+            state_cache_hash_exact = (
+                str(state_cache_manifest.get("artifactSha1") or "").upper()
+                == str(other_state_cache.get("artifactSha1") or "").upper()
+                and len(str(state_cache_manifest.get("artifactSha1") or "")) == 40
+            )
+            normalized_jobs_match = normalized_state_cache_job(
+                job
+            ) == normalized_state_cache_job(other_job)
+            normalized_provenance_match = normalized_state_cache_provenance(
+                provenance
+            ) == normalized_state_cache_provenance(other.get("provenance", {}))
+            add_check(
+                checks,
+                "state_cache.record_apply_roles",
+                state_cache_roles_valid,
+                f"left={state_cache_manifest.get('mode')} right={other_state_cache.get('mode')}",
+            )
+            add_check(
+                checks,
+                "state_cache.artifact_hash_exact",
+                state_cache_hash_exact,
+                f"left={state_cache_manifest.get('artifactSha1')} right={other_state_cache.get('artifactSha1')}",
+            )
+            add_check(
+                checks,
+                "state_cache.jobs_equal_except_identity_output_and_cache_role",
+                normalized_jobs_match,
+                "exact after normalization"
+                if normalized_jobs_match
+                else "normalized jobs differ",
+            )
+            add_check(
+                checks,
+                "state_cache.provenance_equal_except_config_hash",
+                normalized_provenance_match,
+                "exact after normalization"
+                if normalized_provenance_match
+                else "normalized provenance differs",
+            )
+        elif compare_mode == "niagara-cache":
+            other_niagara_cache = other.get("niagaraSimCache", {})
+            niagara_cache_roles_valid = {
+                str(niagara_cache_manifest.get("mode") or ""),
+                str(other_niagara_cache.get("mode") or ""),
+            } == {"record", "apply_and_verify"}
+            niagara_cache_hash_exact = (
+                str(niagara_cache_manifest.get("artifactSha1") or "").upper()
+                == str(other_niagara_cache.get("artifactSha1") or "").upper()
+                and is_sha1_hex(niagara_cache_manifest.get("artifactSha1"))
+            )
+            niagara_cache_components_exact = (
+                niagara_cache_manifest.get("components")
+                == other_niagara_cache.get("components")
+                and bool(niagara_cache_manifest.get("components"))
+            )
+            normalized_jobs_match = normalized_niagara_cache_job(
+                job
+            ) == normalized_niagara_cache_job(other_job)
+            normalized_provenance_match = normalized_niagara_cache_provenance(
+                provenance
+            ) == normalized_niagara_cache_provenance(
+                other.get("provenance", {})
+            )
+            add_check(
+                checks,
+                "niagara_cache.record_apply_roles",
+                niagara_cache_roles_valid,
+                f"left={niagara_cache_manifest.get('mode')} "
+                f"right={other_niagara_cache.get('mode')}",
+            )
+            add_check(
+                checks,
+                "niagara_cache.artifact_hash_exact",
+                niagara_cache_hash_exact,
+                f"left={niagara_cache_manifest.get('artifactSha1')} "
+                f"right={other_niagara_cache.get('artifactSha1')}",
+            )
+            add_check(
+                checks,
+                "niagara_cache.component_payload_metadata_exact",
+                niagara_cache_components_exact,
+                "exact"
+                if niagara_cache_components_exact
+                else "component payload metadata differs",
+            )
+            add_check(
+                checks,
+                "niagara_cache.jobs_equal_except_identity_output_and_cache_role",
+                normalized_jobs_match,
+                "exact after normalization"
+                if normalized_jobs_match
+                else "normalized jobs differ",
+            )
+            add_check(
+                checks,
+                "niagara_cache.provenance_equal_except_config_hash",
+                normalized_provenance_match,
+                "exact after normalization"
+                if normalized_provenance_match
+                else "normalized provenance differs",
             )
         else:
             add_check(
@@ -3372,6 +6119,12 @@ def validate(
                         and float(metrics.get("psnrDb", -math.inf)) >= 45.0
                         and float(metrics.get("meanAbs", math.inf)) <= 2.0 / 255.0
                     )
+            elif modality in GBUFFER_ATTRIBUTE_MODALITIES:
+                limits = GBUFFER_REPLAY_TOLERANCES_V1[modality]
+                within_tolerance = bool(metrics.get("valid")) and all(
+                    float(metrics.get(metric_name, math.inf)) <= limit
+                    for metric_name, limit in limits.items()
+                )
             else:
                 within_tolerance = bool(metrics.get("valid")) and float(metrics.get("maxAbs", math.inf)) <= 1e-6
             add_check(
@@ -3430,9 +6183,63 @@ def validate(
 
     required_checks = [check for check in checks if check["required"]]
     passed = all(check["passed"] for check in required_checks)
+    pixel_domain_checks = [
+        check
+        for check in checks
+        if check["name"].endswith(".main_view_scene_capture_pixel_domain")
+    ]
+    pixel_domain_gate = (
+        "pass"
+        if pixel_domain_required
+        and bool(pixel_domain_checks)
+        and all(check["passed"] for check in pixel_domain_checks)
+        else "fail"
+        if pixel_domain_required
+        else "diagnostic"
+        if scene_capture_lr_comparison
+        else "not_run"
+    )
+    stable_instance_checks = [
+        check
+        for check in checks
+        if check["name"].startswith("stable_instance_ids.")
+        or ".stable_instance_id_" in check["name"]
+    ]
+    stable_instance_gate = (
+        "pass"
+        if bool(job.get("bAssignStableInstanceIds", False))
+        and bool(stable_instance_checks)
+        and all(check["passed"] for check in stable_instance_checks)
+        else "fail"
+        if bool(job.get("bAssignStableInstanceIds", False))
+        else "not_run"
+    )
+    disocclusion_checks = [
+        check
+        for check in checks
+        if ".history_rejection_v2." in check["name"]
+        or ".disocclusion_" in check["name"]
+        or ".history_rejection_reason_" in check["name"]
+    ]
+    disocclusion_gate = (
+        "pass"
+        if history_rejection_v2
+        and bool(disocclusion_checks)
+        and all(check["passed"] for check in disocclusion_checks)
+        else "fail"
+        if history_rejection_v2
+        else "legacy_v1"
+        if temporal_enabled
+        else "not_run"
+    )
     report = {
-        "validatorVersion": 9,
+        "validatorVersion": 20,
         "comparisonMode": compare_mode if compare is not None else "none",
+        "mainViewSceneCapturePixelDomainGate": pixel_domain_gate,
+        "stableInstanceIdGate": stable_instance_gate,
+        "disocclusionGate": disocclusion_gate,
+        "datasetProfileGate": "pass",
+        "datasetDiversityGate": "diagnostic",
         "captureOrderInvarianceGate": (
             "pass" if compare is not None and compare_mode == "capture-order" and passed
             else "fail" if compare is not None and compare_mode == "capture-order"
@@ -3453,6 +6260,16 @@ def validate(
             else "fail" if compare is not None and compare_mode == "material-reverse"
             else "not_run"
         ),
+        "controllableStateCacheReplayGate": (
+            "pass" if compare is not None and compare_mode == "state-cache" and passed
+            else "fail" if compare is not None and compare_mode == "state-cache"
+            else "not_run"
+        ),
+        "niagaraSimCacheReplayGate": (
+            "pass" if compare is not None and compare_mode == "niagara-cache" and passed
+            else "fail" if compare is not None and compare_mode == "niagara-cache"
+            else "not_run"
+        ),
         "dataset": str(dataset.resolve()),
         "contractVersion": manifest.get("contractVersion"),
         "certificationStatus": manifest.get("certificationStatus"),
@@ -3463,8 +6280,9 @@ def validate(
         "informationalChecks": len(checks) - len(required_checks),
         "checks": checks,
         "statistics": stats,
+        "datasetProfile": dataset_profile,
         "replayMetrics": replay_metrics,
-        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU Niagara particle counts and a visible AfterDOF VFX probe. The non-fixture skeletal gate requires a visible project-authored Actor and AnimBP, exact application of the shared cached pose and covered endpoint motion; skeletal-reverse requires exact absolute project poses, camera metadata and object-ID grids, tightly bounded depth-grid differences, and independent directional motion evidence. GPU particle payload readback, arbitrary Niagara data interfaces, non-fixture animated-material/WPO motion, production disocclusion and Main View/reference-HR pixel equivalence remain separate gates.",
+        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. Scene-control preflight evidence inventories and hashes ticking Actors/components, loaded Niagara Data Interfaces and known time/random material inputs; strict jobs reject every unclassified record. The optional Main View/SceneCapture LR gate compares the same AfterDOF linear-HDR stage after independent pre-exposure normalization and metadata-defined subpixel jitter alignment, without an extra render submission or simulation advance. Stable instance-ID jobs finalize a fixed renderable-component topology after warmup/streaming, assign collision-free uint8 Custom Stencil IDs, hash an ID-to-component/Actor/class map, fail on topology or label drift and verify that every nonzero raster value resolves through that map; the uint8/per-component limits remain explicit. Disocclusion v2 independently reconstructs every non-reset reason from current motion/depth/ID plus the previous saved depth/ID buffers; cross-instance and static-depth decisions are valid, while dynamic same-instance or unlabeled motion is conservatively rejected with validity zero. Explicit controllable-state cache jobs store integration-owned canonical payloads by logical frame, apply them after Actor ticks, require byte-exact state readback and compare the restored scene plus images/depth against the recording process; ordinary manifests still persist only state hashes and byte counts. Native Niagara Sim Cache jobs record every attribute for fixed-topology CPU and GPU emitters, perform immediate GPU readback, serialize exact component/system identities and verify record/apply payload metrics plus rendered outputs; custom Niagara Data Interface storage remains disabled and must pass preflight classification. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU/GPU Niagara particle counts and visible AfterDOF VFX probes. Chaos solver cache, dynamic same-instance surface identity and Main View/reference-HR pixel equivalence remain separate gates.",
     }
     return report, passed
 
@@ -3475,7 +6293,7 @@ def main() -> int:
     parser.add_argument("--compare", type=Path, help="Second dataset directory or manifest for deterministic hash comparison")
     parser.add_argument(
         "--compare-mode",
-        choices=("exact-replay", "capture-order", "vfx-reverse", "skeletal-reverse", "material-reverse"),
+        choices=("exact-replay", "capture-order", "vfx-reverse", "skeletal-reverse", "material-reverse", "state-cache", "niagara-cache"),
         default="exact-replay",
         help="Comparison contract. Reverse modes compare forward/reverse endpoint roles at identical absolute times.",
     )
@@ -3487,6 +6305,8 @@ def main() -> int:
         "vfx-reverse",
         "skeletal-reverse",
         "material-reverse",
+        "state-cache",
+        "niagara-cache",
     ) and args.compare is None:
         parser.error(f"--compare-mode {args.compare_mode} requires --compare")
 

@@ -52,6 +52,21 @@ enum class ESRDatasetAuxiliaryCaptureOrder : uint8
 };
 
 /**
+ * Analytic motion contract used by the semantic fixture. LegacyCameraRelative
+ * preserves the original camera-following chart; every other mode anchors the
+ * chart in world space so camera and object motion can be isolated explicitly.
+ */
+UENUM(BlueprintType)
+enum class ESRDatasetSemanticMotionScenario : uint8
+{
+	LegacyCameraRelative,
+	Static,
+	CameraOnly,
+	ObjectOnly,
+	Mixed
+};
+
+/**
  * A serializable capture job. The same struct is accepted by Blueprint and by
  * the -SRDatasetJob=<json-file> command-line entry point.
  */
@@ -95,6 +110,10 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (EditCondition = "bUseDeterministicCameraTransform", ClampMin = "5.0", ClampMax = "170.0"))
 	float DeterministicCameraFOVDegrees = 90.0f;
+
+	/** World-space translation added per logical frame relative to StartFrame. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (EditCondition = "bUseDeterministicCameraTransform"))
+	FVector DeterministicCameraTranslationPerLogicalFrameCm = FVector::ZeroVector;
 
 	/** Inclusive source-frame interval in CaptureFrameRate time. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Frames", meta = (ClampMin = "0"))
@@ -144,6 +163,23 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	bool bCaptureDepth = true;
 
 	/**
+	 * Temporarily assign deterministic, component-unique Custom Stencil IDs.
+	 * ID 0 remains background. The encoding is uint8 and therefore rejects more
+	 * than 255 identities instead of allowing collisions.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
+	bool bAssignStableInstanceIds = false;
+
+	/**
+	 * Permit renderable components to appear or disappear after initial ID
+	 * assignment. New component paths receive monotonically allocated IDs that
+	 * are never reused; surviving or path-stable respawned components retain the
+	 * same ID. The final mapping is propagated to every frame's metadata.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bAssignStableInstanceIds"))
+	bool bAllowDynamicInstanceIdTopology = false;
+
+	/**
 	 * Experimental UE RDG extraction from the native LR view. Writes HDR Color,
 	 * raw/full motion, device/linear depth and validity diagnostics. These files
 	 * are not temporal-training certified until the validation suite passes.
@@ -154,6 +190,22 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	/** Capture diagnostics from the real player Main View instead of the LR SceneCapture. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureTemporalDiagnostics"))
 	bool bCaptureMainViewTemporalDiagnostics = false;
+
+	/**
+	 * Also extract the existing native-LR SceneCapture at the same linear-HDR
+	 * AfterDOF stage. This is an isolated comparison input; it does not submit an
+	 * additional render or replace the real Main View temporal modalities.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCaptureMainViewTemporalDiagnostics"))
+	bool bCaptureSceneCaptureLRComparison = false;
+
+	/**
+	 * Require the validator's jitter-aligned Main View versus SceneCapture LR
+	 * pixel-domain gate. Restricted to the locked static semantic fixture so the
+	 * comparison measures capture-path differences rather than scene motion.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCaptureSceneCaptureLRComparison"))
+	bool bValidateMainViewSceneCapturePixelDomain = false;
 
 	/**
 	 * Render an isolated, non-jittered spatial supersample and downsample it to
@@ -226,6 +278,45 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	bool bLockMaterialTimeToLogicalFrame = true;
 
 	/**
+	 * Scan the prepared world before warmup and write scene_control_preflight.json.
+	 * The report inventories ticking Actors/components, Niagara Data Interfaces,
+	 * and material expressions whose values can vary independently of scene state.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control")
+	bool bRunSceneControlPreflight = true;
+
+	/** Fail the job when the scene-control preflight finds an unclassified source. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	bool bRequireSceneControlPreflight = false;
+
+	/**
+	 * Require every SRDatasetControllable Actor to return a non-empty canonical
+	 * state serialization before each selected capture. This closes the gap
+	 * between receiving logical time and proving opaque internal state.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control")
+	bool bRequireControllableState = false;
+
+	/**
+	 * Audited ticking Actor class paths. Rules are case-sensitive exact class
+	 * paths; a single trailing '*' enables a prefix match.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	TArray<FString> SceneControlAllowedTickingActorClassPaths;
+
+	/** Audited ticking component class paths; the same exact/trailing-'*' rule syntax applies. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	TArray<FString> SceneControlAllowedTickingComponentClassPaths;
+
+	/** Audited Niagara Data Interface class paths; the same exact/trailing-'*' rule syntax applies. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	TArray<FString> SceneControlAllowedNiagaraDataInterfaceClassPaths;
+
+	/** Audited material-expression class paths; the same exact/trailing-'*' rule syntax applies. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control", meta = (EditCondition = "bRunSceneControlPreflight"))
+	TArray<FString> SceneControlAllowedMaterialExpressionClassPaths;
+
+	/**
 	 * Fail before and during capture if any visible registered UWidgetComponent
 	 * exists. Screen-space Slate/UMG is captured separately; world/component UI
 	 * must not silently remain in the HUD-less scene target.
@@ -248,6 +339,39 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	/** Optional shared pose-cache artifact written after the forward warmup bake. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism", meta = (EditCondition = "bCacheSkeletalAnimationPosesForReplay"))
 	FString SkeletalPoseCacheOutputFile;
+
+	/**
+	 * Capture or restore the canonical private state of every
+	 * SRDatasetControllable Actor on every logical frame. The artifact contains
+	 * the raw state strings, not only their hashes, and must therefore be handled
+	 * with the same privacy policy as project gameplay saves.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|State Cache")
+	bool bCacheControllableStatesForReplay = false;
+
+	/** Portable state-cache artifact loaded and applied after Actor ticks. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|State Cache", meta = (EditCondition = "bCacheControllableStatesForReplay"))
+	FString ControllableStateCacheInputFile;
+
+	/** Portable state-cache artifact written after a complete Standard replay. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|State Cache", meta = (EditCondition = "bCacheControllableStatesForReplay"))
+	FString ControllableStateCacheOutputFile;
+
+	/**
+	 * Record or replay every controlled Niagara component through UE's native
+	 * full-attribute Sim Cache. The binary artifact contains particle/system
+	 * buffers, including GPU readback data, and must be treated as project data.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Niagara Sim Cache")
+	bool bCacheNiagaraSimForReplay = false;
+
+	/** Native Niagara Sim Cache bundle loaded before deterministic replay. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Niagara Sim Cache", meta = (EditCondition = "bCacheNiagaraSimForReplay"))
+	FString NiagaraSimCacheInputFile;
+
+	/** Native Niagara Sim Cache bundle written after a complete Standard replay. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Niagara Sim Cache", meta = (EditCondition = "bCacheNiagaraSimForReplay"))
+	FString NiagaraSimCacheOutputFile;
 
 	/**
 	 * Bind the non-shipping Temporal AA/TSR jitter phase to logical frame ID.
@@ -296,6 +420,29 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation")
 	bool bEnableSemanticValidationFixture = false;
+
+	/** Selects the analytic camera/object motion combination exercised by the semantic fixture. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bEnableSemanticValidationFixture"))
+	ESRDatasetSemanticMotionScenario SemanticMotionScenario = ESRDatasetSemanticMotionScenario::LegacyCameraRelative;
+
+	/** Require a full logical jitter cycle with both signs on both axes and all four sign quadrants. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bEnableSemanticValidationFixture"))
+	bool bValidateTemporalJitterSignCoverage = false;
+
+	/** Spawn a renderable component on frame 1 and remove it on frame 2 to prove dynamic ID allocation/release. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bAllowDynamicInstanceIdTopology"))
+	bool bValidateDynamicInstanceIdTopology = false;
+
+	/**
+	 * Spawn a private-state render probe whose process-local state differs before
+	 * cache application, proving that replay restores rather than merely observes.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheControllableStatesForReplay"))
+	bool bValidateControllableStateCache = false;
+
+	/** Spawn CPU and GPU Niagara probes and require native Sim Cache record/apply evidence. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheNiagaraSimForReplay"))
+	bool bValidateNiagaraSimCache = false;
 
 	/** Assign temporary Custom Stencil IDs to non-fixture skeletal components and require their production-scene pose/motion gate. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheSkeletalAnimationPosesForReplay"))

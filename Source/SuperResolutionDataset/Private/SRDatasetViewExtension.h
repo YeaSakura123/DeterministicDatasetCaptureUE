@@ -64,6 +64,9 @@ struct FSRDatasetTemporalCaptureResult
 	TArray<FLinearColor> Depth;
 	TArray<FLinearColor> Translucency;
 	TArray<FLinearColor> ObjectId;
+	TArray<FLinearColor> WorldNormal;
+	TArray<FLinearColor> BaseColor;
+	TArray<FLinearColor> MaterialProperties;
 	FSRDatasetTemporalFrameMetadata Metadata;
 };
 
@@ -78,8 +81,11 @@ public:
 	void CancelCapture();
 	void SetDeterministicViewTime(double CurrentTimeSeconds, float DeltaTimeSeconds);
 	void ClearDeterministicViewTime();
+	void SetDeterministicViewFrameIndex(uint32 FrameIndex);
+	void ClearDeterministicViewFrameIndex();
 
 	virtual void SetupViewFamily(FSceneViewFamily& InViewFamily) override;
+	virtual void SetupView(FSceneViewFamily& InViewFamily, FSceneView& InView) override;
 
 	virtual void SubscribeToPostProcessingPass(
 		EPostProcessingPass Pass,
@@ -98,6 +104,9 @@ private:
 		TUniquePtr<FRHIGPUTextureReadback> Depth;
 		TUniquePtr<FRHIGPUTextureReadback> Translucency;
 		TUniquePtr<FRHIGPUTextureReadback> ObjectId;
+		TUniquePtr<FRHIGPUTextureReadback> WorldNormal;
+		TUniquePtr<FRHIGPUTextureReadback> BaseColor;
+		TUniquePtr<FRHIGPUTextureReadback> MaterialProperties;
 		TUniquePtr<FRHIGPUTextureReadback> Metadata;
 	};
 
@@ -122,6 +131,8 @@ private:
 	bool bDeterministicViewTimeEnabled = false;
 	double DeterministicCurrentTimeSeconds = 0.0;
 	float DeterministicDeltaTimeSeconds = 0.0f;
+	bool bDeterministicViewFrameIndexEnabled = false;
+	uint32 DeterministicViewFrameIndex = 0;
 	TUniquePtr<FPendingReadbacks> PendingReadbacks;
 };
 

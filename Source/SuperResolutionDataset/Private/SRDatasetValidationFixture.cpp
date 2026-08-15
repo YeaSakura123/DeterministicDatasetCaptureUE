@@ -13,6 +13,7 @@
 #include "NiagaraRibbonRendererProperties.h"
 #include "NiagaraSpriteRendererProperties.h"
 #include "NiagaraSystem.h"
+#include "HAL/PlatformTime.h"
 #include "UObject/ConstructorHelpers.h"
 
 namespace SRDataset::ValidationFixture
@@ -39,6 +40,7 @@ namespace SRDataset::ValidationFixture
 	// visible scene pixels rather than disappearing against the white panel.
 	constexpr float NiagaraForwardCm = 400.0f;
 	constexpr float NiagaraRightCm = -300.0f;
+	constexpr float NiagaraGPURightCm = -110.0f;
 	constexpr float NiagaraUpCm = 140.0f;
 	constexpr float NiagaraValidationRadiusAt256Pixels = 34.0f;
 	constexpr float PanelThicknessCm = 2.0f;
@@ -136,7 +138,9 @@ ASRDatasetValidationFixture::ASRDatasetValidationFixture()
 	NiagaraFixture->SetSystemFixedBounds(FBox(FVector(-300.0), FVector(300.0)));
 }
 
-bool ASRDatasetValidationFixture::Configure(FString& OutError)
+bool ASRDatasetValidationFixture::Configure(
+	const bool bEnableGPUNiagaraProbe,
+	FString& OutError)
 {
 	// Loading a Niagara system from the actor CDO constructor can run before the
 	// Niagara runtime module reaches PreDefault in command-line -game sessions.
@@ -144,9 +148,15 @@ bool ASRDatasetValidationFixture::Configure(FString& OutError)
 	NiagaraSystem = LoadObject<UNiagaraSystem>(
 		nullptr,
 		TEXT("/SuperResolutionDataset/Validation/NS_SRDatasetVFXFixture.NS_SRDatasetVFXFixture"));
+	NiagaraGPUSystem = bEnableGPUNiagaraProbe
+		? LoadObject<UNiagaraSystem>(
+			nullptr,
+			TEXT("/SuperResolutionDataset/Validation/NS_SRDatasetGPUVFXFixture.NS_SRDatasetGPUVFXFixture"))
+		: nullptr;
 	if (!MovingCube->GetStaticMesh() || !OpaqueMaterial || !TranslucentMaterial || !WPOBaseMaterial ||
 		!VFXSpriteMaterial ||
 		!SkeletalCube->GetSkinnedAsset() || !NiagaraSystem ||
+		(bEnableGPUNiagaraProbe && !NiagaraGPUSystem) ||
 		SkeletalCube->GetBoneIndex(SRDataset::ValidationFixture::SkeletalRootBoneName) == INDEX_NONE)
 	{
 		OutError = TEXT("Semantic validation fixture could not load its Engine mesh/material assets or plugin WPO/Niagara assets.");
@@ -159,25 +169,56 @@ bool ASRDatasetValidationFixture::Configure(FString& OutError)
 		return false;
 	}
 	WPOCube->SetMaterial(0, WPOMaterial);
-	for (FNiagaraEmitterHandle& EmitterHandle : NiagaraSystem->GetEmitterHandles())
+	const auto ApplyFixtureMaterial = [this](UNiagaraSystem* System)
 	{
-		if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+		for (FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
 		{
-			for (UNiagaraRendererProperties* Renderer : EmitterData->GetRenderers())
+			if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
 			{
-				if (UNiagaraSpriteRendererProperties* Sprite = Cast<UNiagaraSpriteRendererProperties>(Renderer))
+				for (UNiagaraRendererProperties* Renderer : EmitterData->GetRenderers())
 				{
-					Sprite->Material = VFXSpriteMaterial;
-				}
-				else if (UNiagaraRibbonRendererProperties* Ribbon = Cast<UNiagaraRibbonRendererProperties>(Renderer))
-				{
-					Ribbon->Material = VFXSpriteMaterial;
+					if (UNiagaraSpriteRendererProperties* Sprite = Cast<UNiagaraSpriteRendererProperties>(Renderer))
+					{
+						Sprite->Material = VFXSpriteMaterial;
+					}
+					else if (UNiagaraRibbonRendererProperties* Ribbon = Cast<UNiagaraRibbonRendererProperties>(Renderer))
+					{
+						Ribbon->Material = VFXSpriteMaterial;
+					}
 				}
 			}
 		}
-	}
+	};
+	ApplyFixtureMaterial(NiagaraSystem);
 	NiagaraFixture->SetAsset(NiagaraSystem);
 	NiagaraFixture->Activate(true);
+	if (bEnableGPUNiagaraProbe)
+	{
+		ApplyFixtureMaterial(NiagaraGPUSystem);
+		NiagaraGPUFixture = NewObject<UNiagaraComponent>(
+			this,
+			TEXT("NiagaraGPUVFXFixture"),
+			RF_Transient);
+		if (!NiagaraGPUFixture)
+		{
+			OutError = TEXT("Semantic validation fixture could not allocate its GPU Niagara component.");
+			return false;
+		}
+		AddInstanceComponent(NiagaraGPUFixture);
+		NiagaraGPUFixture->SetupAttachment(SceneRoot);
+		NiagaraGPUFixture->SetAutoActivate(false);
+		NiagaraGPUFixture->SetMobility(EComponentMobility::Movable);
+		NiagaraGPUFixture->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		NiagaraGPUFixture->SetGenerateOverlapEvents(false);
+		NiagaraGPUFixture->SetCastShadow(false);
+		NiagaraGPUFixture->SetAllowScalability(false);
+		NiagaraGPUFixture->SetForceLocalPlayerEffect(true);
+		NiagaraGPUFixture->SetRenderingEnabled(true);
+		NiagaraGPUFixture->SetSystemFixedBounds(FBox(FVector(-300.0), FVector(300.0)));
+		NiagaraGPUFixture->SetAsset(NiagaraGPUSystem);
+		NiagaraGPUFixture->RegisterComponent();
+		NiagaraGPUFixture->Activate(true);
+	}
 	OutError.Reset();
 	return true;
 }
@@ -208,15 +249,58 @@ void ASRDatasetValidationFixture::PlaceBox(
 		SizeCm / SRDataset::ValidationFixture::CubeMeshExtentCm));
 }
 
+bool ASRDatasetValidationFixture::ProjectWorldToDisplayPixels(
+	const FVector& WorldPosition,
+	const FMinimalViewInfo& CameraView,
+	const FIntPoint DisplaySize,
+	FVector2f& OutDisplayPixels)
+{
+	const FRotationMatrix CameraBasis(CameraView.Rotation);
+	const FVector Relative = WorldPosition - CameraView.Location;
+	const double ForwardCm = FVector::DotProduct(
+		Relative, CameraBasis.GetScaledAxis(EAxis::X));
+	const double RightCm = FVector::DotProduct(
+		Relative, CameraBasis.GetScaledAxis(EAxis::Y));
+	const double UpCm = FVector::DotProduct(
+		Relative, CameraBasis.GetScaledAxis(EAxis::Z));
+	const double TanHalfFov = FMath::Tan(0.5 * FMath::DegreesToRadians(CameraView.FOV));
+	if (ForwardCm <= UE_SMALL_NUMBER || DisplaySize.X <= 0 || DisplaySize.Y <= 0 ||
+		!FMath::IsFinite(TanHalfFov) || TanHalfFov <= UE_SMALL_NUMBER)
+	{
+		OutDisplayPixels = FVector2f::ZeroVector;
+		return false;
+	}
+
+	const double FocalLengthPixels = 0.5 * static_cast<double>(DisplaySize.X) / TanHalfFov;
+	const double PixelX = 0.5 * static_cast<double>(DisplaySize.X) + RightCm * FocalLengthPixels / ForwardCm;
+	const double PixelY = 0.5 * static_cast<double>(DisplaySize.Y) - UpCm * FocalLengthPixels / ForwardCm;
+	OutDisplayPixels = FVector2f(static_cast<float>(PixelX), static_cast<float>(PixelY));
+	return FMath::IsFinite(PixelX) && FMath::IsFinite(PixelY);
+}
+
 void ASRDatasetValidationFixture::Evaluate(
 	const FMinimalViewInfo& CameraView,
 	const int32 LogicalFrame,
 	const int32 StartFrame,
 	const FIntPoint DisplaySize,
-	const bool bUseLastCapturedEndpointAsPrevious)
+	const bool bUseLastCapturedEndpointAsPrevious,
+	const ESRDatasetSemanticMotionScenario MotionScenario)
 {
 	using namespace SRDataset::ValidationFixture;
-	const float EndpointPhase = FMath::Clamp(0.5f * static_cast<float>(LogicalFrame - StartFrame), 0.0f, 1.0f);
+	const bool bWorldAnchored = MotionScenario != ESRDatasetSemanticMotionScenario::LegacyCameraRelative;
+	const bool bObjectMotionEnabled =
+		MotionScenario == ESRDatasetSemanticMotionScenario::LegacyCameraRelative ||
+		MotionScenario == ESRDatasetSemanticMotionScenario::ObjectOnly ||
+		MotionScenario == ESRDatasetSemanticMotionScenario::Mixed;
+	if (bWorldAnchored && !bHasWorldAnchor)
+	{
+		WorldAnchorCameraView = CameraView;
+		bHasWorldAnchor = true;
+	}
+	const FMinimalViewInfo& PlacementView = bWorldAnchored ? WorldAnchorCameraView : CameraView;
+	const float EndpointPhase = bObjectMotionEnabled
+		? FMath::Clamp(0.5f * static_cast<float>(LogicalFrame - StartFrame), 0.0f, 1.0f)
+		: 0.0f;
 	const float MovingRight = FMath::Lerp(MovingLeftCm, MovingRightCm, EndpointPhase);
 	const float SkeletalRight = FMath::Lerp(SkeletalBoneLeftCm, SkeletalBoneRightCm, EndpointPhase);
 	const float WPORight = FMath::Lerp(WPOLeftCm, WPORightCm, EndpointPhase);
@@ -229,27 +313,33 @@ void ASRDatasetValidationFixture::Evaluate(
 	const float PreviousWPORight = bUseLastCapturedEndpointAsPrevious && bHasCapturedWPORight
 		? LastCapturedWPORightCm
 		: (LastEvaluatedFrame == INDEX_NONE || LastEvaluatedFrame == LogicalFrame ? WPORight : LastWPORightCm);
+	const FMinimalViewInfo& PreviousCameraView =
+		bWorldAnchored && bUseLastCapturedEndpointAsPrevious && bHasCapturedCameraView
+			? LastCapturedCameraView
+			: bWorldAnchored && bHasLastEvaluatedCameraView && LastEvaluatedFrame != LogicalFrame
+				? LastEvaluatedCameraView
+				: CameraView;
 
-	PlaceBox(MovingCube, CameraView, MovingForwardCm, MovingRight, 0.0f, FVector(100.0f));
-	PlaceBox(BackgroundPanel, CameraView, 800.0f, 0.0f, 0.0f, FVector(PanelThicknessCm, 500.0f, 360.0f));
-	PlaceBox(DepthOneMeterPanel, CameraView, 100.0f, -38.0f, 27.0f, FVector(PanelThicknessCm, 14.0f, 14.0f));
-	PlaceBox(DepthTenMetersPanel, CameraView, 1000.0f, 0.0f, 270.0f, FVector(PanelThicknessCm, 140.0f, 140.0f));
-	PlaceBox(DepthHundredMetersPanel, CameraView, 10000.0f, 3800.0f, 2700.0f, FVector(PanelThicknessCm, 1400.0f, 1400.0f));
-	PlaceBox(TranslucentPanel, CameraView, 350.0f, 115.0f, -90.0f, FVector(PanelThicknessCm, 115.0f, 115.0f));
+	PlaceBox(MovingCube, PlacementView, MovingForwardCm, MovingRight, 0.0f, FVector(100.0f));
+	PlaceBox(BackgroundPanel, PlacementView, 800.0f, 0.0f, 0.0f, FVector(PanelThicknessCm, 500.0f, 360.0f));
+	PlaceBox(DepthOneMeterPanel, PlacementView, 100.0f, -38.0f, 27.0f, FVector(PanelThicknessCm, 14.0f, 14.0f));
+	PlaceBox(DepthTenMetersPanel, PlacementView, 1000.0f, 0.0f, 270.0f, FVector(PanelThicknessCm, 140.0f, 140.0f));
+	PlaceBox(DepthHundredMetersPanel, PlacementView, 10000.0f, 3800.0f, 2700.0f, FVector(PanelThicknessCm, 1400.0f, 1400.0f));
+	PlaceBox(TranslucentPanel, PlacementView, 350.0f, 115.0f, -90.0f, FVector(PanelThicknessCm, 115.0f, 115.0f));
 	PlaceBox(
 		WPOCube,
-		CameraView,
+		PlacementView,
 		WPOForwardCm,
 		WPOComponentRightCm,
 		WPOComponentUpCm,
 		FVector(2.0f * WPOHalfExtentCm));
 
-	const FRotationMatrix CameraBasis(CameraView.Rotation);
-	const FVector CameraForward = CameraBasis.GetScaledAxis(EAxis::X);
-	const FVector CameraRight = CameraBasis.GetScaledAxis(EAxis::Y);
-	const FVector CameraUp = CameraBasis.GetScaledAxis(EAxis::Z);
-	const FVector CurrentWPOWorld = CameraRight * WPORight;
-	const FVector PreviousWPOWorld = CameraRight * PreviousWPORight;
+	const FRotationMatrix PlacementBasis(PlacementView.Rotation);
+	const FVector PlacementForward = PlacementBasis.GetScaledAxis(EAxis::X);
+	const FVector PlacementRight = PlacementBasis.GetScaledAxis(EAxis::Y);
+	const FVector PlacementUp = PlacementBasis.GetScaledAxis(EAxis::Z);
+	const FVector CurrentWPOWorld = PlacementRight * WPORight;
+	const FVector PreviousWPOWorld = PlacementRight * PreviousWPORight;
 	WPOMaterial->SetVectorParameterValue(
 		WPOCurrentWorldParameter,
 		FLinearColor(CurrentWPOWorld.X, CurrentWPOWorld.Y, CurrentWPOWorld.Z, 0.0f));
@@ -257,13 +347,20 @@ void ASRDatasetValidationFixture::Evaluate(
 		WPOPreviousWorldParameter,
 		FLinearColor(PreviousWPOWorld.X, PreviousWPOWorld.Y, PreviousWPOWorld.Z, 0.0f));
 	NiagaraFixture->SetWorldTransform(FTransform(
-		CameraView.Rotation,
-		CameraView.Location + CameraForward * NiagaraForwardCm +
-			CameraRight * NiagaraRightCm + CameraUp * NiagaraUpCm));
+		PlacementView.Rotation,
+		PlacementView.Location + PlacementForward * NiagaraForwardCm +
+			PlacementRight * NiagaraRightCm + PlacementUp * NiagaraUpCm));
+	if (NiagaraGPUFixture)
+	{
+		NiagaraGPUFixture->SetWorldTransform(FTransform(
+			PlacementView.Rotation,
+			PlacementView.Location + PlacementForward * NiagaraForwardCm +
+				PlacementRight * NiagaraGPURightCm + PlacementUp * NiagaraUpCm));
+	}
 	SkeletalCube->SetWorldTransform(FTransform(
-		CameraView.Rotation,
-		CameraView.Location + CameraForward * SkeletalForwardCm +
-			CameraRight * SkeletalComponentRightCm + CameraUp * SkeletalComponentUpCm,
+		PlacementView.Rotation,
+		PlacementView.Location + PlacementForward * SkeletalForwardCm +
+			PlacementRight * SkeletalComponentRightCm + PlacementUp * SkeletalComponentUpCm,
 		FVector(SkeletalScale)));
 	const int32 SkeletalRootBoneIndex = SkeletalCube->GetBoneIndex(SkeletalRootBoneName);
 	FTransform SkeletalRootTransform =
@@ -283,42 +380,137 @@ void ASRDatasetValidationFixture::Evaluate(
 	FrameMetadata = FSRDatasetValidationFixtureFrame();
 	FrameMetadata.bValid = true;
 	FrameMetadata.LogicalFrame = LogicalFrame;
+	FrameMetadata.MotionScenario = MotionScenario;
+	FrameMetadata.bWorldAnchored = bWorldAnchored;
+	FrameMetadata.bObjectMotionEnabled = bObjectMotionEnabled;
+	FrameMetadata.CurrentCameraLocationCm = CameraView.Location;
+	FrameMetadata.PreviousCameraLocationCm = PreviousCameraView.Location;
 	FrameMetadata.MovingCurrentRightCm = MovingRight;
 	FrameMetadata.MovingPreviousRightCm = PreviousRight;
-	FrameMetadata.ExpectedMovingMotionDisplayPixels = FVector2f(
-		(PreviousRight - MovingRight) * PixelsPerRightCm,
-		0.0f);
+	if (!bWorldAnchored)
+	{
+		FrameMetadata.ExpectedMovingMotionDisplayPixels = FVector2f(
+			(PreviousRight - MovingRight) * PixelsPerRightCm,
+			0.0f);
+		FrameMetadata.ExpectedBackgroundMotionDisplayPixels = FVector2f::ZeroVector;
+	}
+	else
+	{
+		const FVector MovingSurfaceCurrent = PlacementView.Location +
+			PlacementForward * MovingSurfaceForwardCm + PlacementRight * MovingRight;
+		const FVector MovingSurfacePrevious = PlacementView.Location +
+			PlacementForward * MovingSurfaceForwardCm + PlacementRight * PreviousRight;
+		const FVector BackgroundSurface = PlacementView.Location +
+			PlacementForward * (800.0f - 0.5f * PanelThicknessCm);
+		FVector2f MovingCurrentPixels = FVector2f::ZeroVector;
+		FVector2f MovingPreviousPixels = FVector2f::ZeroVector;
+		FVector2f BackgroundCurrentPixels = FVector2f::ZeroVector;
+		FVector2f BackgroundPreviousPixels = FVector2f::ZeroVector;
+		const bool bProjectionValid =
+			ProjectWorldToDisplayPixels(MovingSurfaceCurrent, CameraView, DisplaySize, MovingCurrentPixels) &&
+			ProjectWorldToDisplayPixels(MovingSurfacePrevious, PreviousCameraView, DisplaySize, MovingPreviousPixels) &&
+			ProjectWorldToDisplayPixels(BackgroundSurface, CameraView, DisplaySize, BackgroundCurrentPixels) &&
+			ProjectWorldToDisplayPixels(BackgroundSurface, PreviousCameraView, DisplaySize, BackgroundPreviousPixels);
+		FrameMetadata.bValid &= bProjectionValid;
+		FrameMetadata.ExpectedMovingMotionDisplayPixels = MovingPreviousPixels - MovingCurrentPixels;
+		FrameMetadata.ExpectedBackgroundMotionDisplayPixels = BackgroundPreviousPixels - BackgroundCurrentPixels;
+	}
 	const float SkeletalSurfaceForwardCm = SkeletalForwardCm - SkeletalScale * SkeletalMeshHalfExtentCm;
 	const float SkeletalPixelsPerRightCm = 0.5f * static_cast<float>(DisplaySize.X) /
 		(SkeletalSurfaceForwardCm * FMath::Tan(0.5f * HorizontalFovRadians));
 	FrameMetadata.SkeletalCurrentRightCm = SkeletalRight;
 	FrameMetadata.SkeletalPreviousRightCm = PreviousSkeletalRight;
-	FrameMetadata.ExpectedSkeletalMotionDisplayPixels = FVector2f(
-		(PreviousSkeletalRight - SkeletalRight) * SkeletalScale * SkeletalPixelsPerRightCm,
-		0.0f);
+	if (!bWorldAnchored)
+	{
+		FrameMetadata.ExpectedSkeletalMotionDisplayPixels = FVector2f(
+			(PreviousSkeletalRight - SkeletalRight) * SkeletalScale * SkeletalPixelsPerRightCm,
+			0.0f);
+	}
+	else
+	{
+		const FVector SkeletalSurfaceCurrent = PlacementView.Location +
+			PlacementForward * SkeletalSurfaceForwardCm +
+			PlacementRight * (SkeletalComponentRightCm + SkeletalRight * SkeletalScale) +
+			PlacementUp * SkeletalComponentUpCm;
+		const FVector SkeletalSurfacePrevious = PlacementView.Location +
+			PlacementForward * SkeletalSurfaceForwardCm +
+			PlacementRight * (SkeletalComponentRightCm + PreviousSkeletalRight * SkeletalScale) +
+			PlacementUp * SkeletalComponentUpCm;
+		FVector2f CurrentPixels = FVector2f::ZeroVector;
+		FVector2f PreviousPixels = FVector2f::ZeroVector;
+		FrameMetadata.bValid &=
+			ProjectWorldToDisplayPixels(SkeletalSurfaceCurrent, CameraView, DisplaySize, CurrentPixels) &&
+			ProjectWorldToDisplayPixels(SkeletalSurfacePrevious, PreviousCameraView, DisplaySize, PreviousPixels);
+		FrameMetadata.ExpectedSkeletalMotionDisplayPixels = PreviousPixels - CurrentPixels;
+	}
 	const float WPOSurfaceForwardCm = WPOForwardCm - WPOHalfExtentCm;
 	const float WPOPixelsPerRightCm = 0.5f * static_cast<float>(DisplaySize.X) /
 		(WPOSurfaceForwardCm * FMath::Tan(0.5f * HorizontalFovRadians));
 	FrameMetadata.WPOCurrentRightCm = WPORight;
 	FrameMetadata.WPOPreviousRightCm = PreviousWPORight;
-	FrameMetadata.ExpectedWPOMotionDisplayPixels = FVector2f(
-		(PreviousWPORight - WPORight) * WPOPixelsPerRightCm,
-		0.0f);
-	const float CameraFocalLengthPixels = 0.5f * static_cast<float>(DisplaySize.X) /
-		FMath::Tan(0.5f * HorizontalFovRadians);
-	FrameMetadata.NiagaraAnchorDisplayPixels = FVector2f(
-		0.5f * static_cast<float>(DisplaySize.X) +
-			NiagaraRightCm * CameraFocalLengthPixels / NiagaraForwardCm,
-		0.5f * static_cast<float>(DisplaySize.Y) -
-			NiagaraUpCm * CameraFocalLengthPixels / NiagaraForwardCm);
+	if (!bWorldAnchored)
+	{
+		FrameMetadata.ExpectedWPOMotionDisplayPixels = FVector2f(
+			(PreviousWPORight - WPORight) * WPOPixelsPerRightCm,
+			0.0f);
+	}
+	else
+	{
+		const FVector WPOSurfaceCurrent = PlacementView.Location +
+			PlacementForward * WPOSurfaceForwardCm +
+			PlacementRight * (WPOComponentRightCm + WPORight) +
+			PlacementUp * WPOComponentUpCm;
+		const FVector WPOSurfacePrevious = PlacementView.Location +
+			PlacementForward * WPOSurfaceForwardCm +
+			PlacementRight * (WPOComponentRightCm + PreviousWPORight) +
+			PlacementUp * WPOComponentUpCm;
+		FVector2f CurrentPixels = FVector2f::ZeroVector;
+		FVector2f PreviousPixels = FVector2f::ZeroVector;
+		FrameMetadata.bValid &=
+			ProjectWorldToDisplayPixels(WPOSurfaceCurrent, CameraView, DisplaySize, CurrentPixels) &&
+			ProjectWorldToDisplayPixels(WPOSurfacePrevious, PreviousCameraView, DisplaySize, PreviousPixels);
+		FrameMetadata.ExpectedWPOMotionDisplayPixels = PreviousPixels - CurrentPixels;
+	}
+	const FVector NiagaraWorldPosition = PlacementView.Location +
+		PlacementForward * NiagaraForwardCm + PlacementRight * NiagaraRightCm + PlacementUp * NiagaraUpCm;
+	FrameMetadata.bValid &= ProjectWorldToDisplayPixels(
+		NiagaraWorldPosition,
+		CameraView,
+		DisplaySize,
+		FrameMetadata.NiagaraAnchorDisplayPixels);
 	FrameMetadata.NiagaraValidationRadiusDisplayPixels =
 		NiagaraValidationRadiusAt256Pixels * static_cast<float>(DisplaySize.X) / 256.0f;
-	FrameMetadata.bNiagaraVisibleProbeExpected = LogicalFrame - StartFrame >= 15;
-	FrameMetadata.ExpectedFrontDepthMeters.Add(DepthOneMeterObjectId, (100.0f - 0.5f * PanelThicknessCm) * 0.01f);
-	FrameMetadata.ExpectedFrontDepthMeters.Add(DepthTenMetersObjectId, (1000.0f - 0.5f * PanelThicknessCm) * 0.01f);
-	FrameMetadata.ExpectedFrontDepthMeters.Add(DepthHundredMetersObjectId, (10000.0f - 0.5f * PanelThicknessCm) * 0.01f);
+	FrameMetadata.bNiagaraVisibleProbeExpected = LogicalFrame >= 15;
+	if (NiagaraGPUFixture)
+	{
+		const FVector NiagaraGPUWorldPosition = PlacementView.Location +
+			PlacementForward * NiagaraForwardCm + PlacementRight * NiagaraGPURightCm +
+			PlacementUp * NiagaraUpCm;
+		FrameMetadata.bValid &= ProjectWorldToDisplayPixels(
+			NiagaraGPUWorldPosition,
+			CameraView,
+			DisplaySize,
+			FrameMetadata.NiagaraGPUAnchorDisplayPixels);
+		FrameMetadata.bNiagaraGPUVisibleProbeExpected = LogicalFrame >= 15;
+	}
+	const FRotationMatrix CurrentCameraBasis(CameraView.Rotation);
+	const FVector CurrentCameraForward = CurrentCameraBasis.GetScaledAxis(EAxis::X);
+	const auto FrontDepthMeters = [&](const float ForwardCm, const float RightCm, const float UpCm)
+	{
+		const FVector FrontSurfaceWorld = PlacementView.Location +
+			PlacementForward * (ForwardCm - 0.5f * PanelThicknessCm) +
+			PlacementRight * RightCm + PlacementUp * UpCm;
+		return static_cast<float>(FVector::DotProduct(
+			FrontSurfaceWorld - CameraView.Location,
+			CurrentCameraForward) * 0.01);
+	};
+	FrameMetadata.ExpectedFrontDepthMeters.Add(DepthOneMeterObjectId, FrontDepthMeters(100.0f, -38.0f, 27.0f));
+	FrameMetadata.ExpectedFrontDepthMeters.Add(DepthTenMetersObjectId, FrontDepthMeters(1000.0f, 0.0f, 270.0f));
+	FrameMetadata.ExpectedFrontDepthMeters.Add(DepthHundredMetersObjectId, FrontDepthMeters(10000.0f, 3800.0f, 2700.0f));
 
 	LastEvaluatedFrame = LogicalFrame;
+	bHasLastEvaluatedCameraView = true;
+	LastEvaluatedCameraView = CameraView;
 	LastMovingRightCm = MovingRight;
 	LastSkeletalRightCm = SkeletalRight;
 	LastWPORightCm = WPORight;
@@ -326,10 +518,155 @@ void ASRDatasetValidationFixture::Evaluate(
 
 void ASRDatasetValidationFixture::CommitCapturedFrame()
 {
+	bHasCapturedCameraView = bHasLastEvaluatedCameraView;
+	LastCapturedCameraView = LastEvaluatedCameraView;
 	bHasCapturedMovingRight = true;
 	LastCapturedMovingRightCm = LastMovingRightCm;
 	bHasCapturedSkeletalRight = true;
 	LastCapturedSkeletalRightCm = LastSkeletalRightCm;
 	bHasCapturedWPORight = true;
 	LastCapturedWPORightCm = LastWPORightCm;
+}
+
+FString ASRDatasetValidationFixture::DatasetGetDeterministicState_Implementation()
+{
+	return FString::Printf(
+		TEXT("schema=1|logicalFrame=%d|scenario=%d|worldAnchored=%d|objectMotion=%d|gpuNiagara=%d|camera=%.17g,%.17g,%.17g|previousCamera=%.17g,%.17g,%.17g|moving=%.17g,%.17g|skeletal=%.17g,%.17g|wpo=%.17g,%.17g|lastEvaluated=%d"),
+		FrameMetadata.LogicalFrame,
+		static_cast<int32>(FrameMetadata.MotionScenario),
+		FrameMetadata.bWorldAnchored ? 1 : 0,
+		FrameMetadata.bObjectMotionEnabled ? 1 : 0,
+		NiagaraGPUFixture ? 1 : 0,
+		FrameMetadata.CurrentCameraLocationCm.X,
+		FrameMetadata.CurrentCameraLocationCm.Y,
+		FrameMetadata.CurrentCameraLocationCm.Z,
+		FrameMetadata.PreviousCameraLocationCm.X,
+		FrameMetadata.PreviousCameraLocationCm.Y,
+		FrameMetadata.PreviousCameraLocationCm.Z,
+		FrameMetadata.MovingCurrentRightCm,
+		FrameMetadata.MovingPreviousRightCm,
+		FrameMetadata.SkeletalCurrentRightCm,
+		FrameMetadata.SkeletalPreviousRightCm,
+		FrameMetadata.WPOCurrentRightCm,
+		FrameMetadata.WPOPreviousRightCm,
+		LastEvaluatedFrame);
+}
+
+ASRDatasetStateCacheValidationActor::ASRDatasetStateCacheValidationActor()
+{
+	PrimaryActorTick.bCanEverTick = false;
+	SetActorEnableCollision(false);
+
+	StateCacheRoot = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+	SetRootComponent(StateCacheRoot);
+	StateCacheProbe = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("OpaqueStateProbe"));
+	StateCacheProbe->SetupAttachment(StateCacheRoot);
+	StateCacheProbe->SetMobility(EComponentMobility::Movable);
+	StateCacheProbe->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	StateCacheProbe->SetGenerateOverlapEvents(false);
+	StateCacheProbe->SetCastShadow(false);
+	StateCacheProbe->SetReceivesDecals(false);
+	StateCacheProbe->SetRelativeScale3D(FVector(0.5));
+
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeMeshFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> MaterialFinder(
+		TEXT("/Engine/BasicShapes/BasicShapeMaterial_Inst.BasicShapeMaterial_Inst"));
+	StateCacheProbe->SetStaticMesh(CubeMeshFinder.Object);
+	StateCacheProbe->SetMaterial(0, MaterialFinder.Object);
+}
+
+bool ASRDatasetStateCacheValidationActor::Configure(
+	const FMinimalViewInfo& CameraView,
+	FString& OutError)
+{
+	if (!StateCacheProbe || !StateCacheProbe->GetStaticMesh() || !StateCacheProbe->GetMaterial(0))
+	{
+		OutError = TEXT("Controllable state-cache validation assets are unavailable.");
+		return false;
+	}
+	OriginalTransform = GetActorTransform();
+	const FRotationMatrix CameraBasis(CameraView.Rotation);
+	CameraRight = CameraBasis.GetScaledAxis(EAxis::Y).GetSafeNormal();
+	const FVector CameraForward = CameraBasis.GetScaledAxis(EAxis::X).GetSafeNormal();
+	const FVector CameraUp = CameraBasis.GetScaledAxis(EAxis::Z).GetSafeNormal();
+	BaseLocationCm = CameraView.Location + CameraForward * 350.0 + CameraUp * -25.0;
+	SetActorLocation(BaseLocationCm, false, nullptr, ETeleportType::TeleportPhysics);
+	bConfigured = true;
+	return true;
+}
+
+void ASRDatasetStateCacheValidationActor::DatasetPrepare_Implementation(
+	const int32 RandomSeed,
+	const float FixedDeltaSeconds)
+{
+	ProcessNonce = FPlatformTime::Cycles64() ^ static_cast<uint64>(reinterpret_cast<UPTRINT>(this));
+	ProcessNonce ^= static_cast<uint64>(static_cast<uint32>(RandomSeed)) << 32;
+	ProcessNonce ^= static_cast<uint64>(FMath::RoundToInt(FixedDeltaSeconds * 1000000000.0f));
+}
+
+void ASRDatasetStateCacheValidationActor::DatasetEvaluateFrame_Implementation(
+	const int32 FrameNumber,
+	const float TimeSeconds)
+{
+	if (!bConfigured)
+	{
+		return;
+	}
+	LogicalFrame = FrameNumber;
+	PrivateValue = HashCombineFast(
+		static_cast<uint32>(ProcessNonce ^ (ProcessNonce >> 32)),
+		HashCombineFast(static_cast<uint32>(FrameNumber), GetTypeHash(TimeSeconds)));
+	const float OffsetCm = static_cast<float>(static_cast<int32>(PrivateValue % 101u) - 50);
+	SetActorLocation(BaseLocationCm + CameraRight * OffsetCm, false, nullptr, ETeleportType::TeleportPhysics);
+}
+
+FString ASRDatasetStateCacheValidationActor::DatasetGetDeterministicState_Implementation()
+{
+	const FVector Location = GetActorLocation();
+	return FString::Printf(
+		TEXT("schema=1|logicalFrame=%d|privateValue=%u|location=%.17g,%.17g,%.17g"),
+		LogicalFrame,
+		PrivateValue,
+		Location.X,
+		Location.Y,
+		Location.Z);
+}
+
+bool ASRDatasetStateCacheValidationActor::DatasetApplyDeterministicState_Implementation(
+	const FString& CanonicalState)
+{
+	TArray<FString> Fields;
+	CanonicalState.ParseIntoArray(Fields, TEXT("|"), true);
+	if (Fields.Num() != 4 || Fields[0] != TEXT("schema=1") ||
+		!Fields[1].StartsWith(TEXT("logicalFrame=")) ||
+		!Fields[2].StartsWith(TEXT("privateValue=")) ||
+		!Fields[3].StartsWith(TEXT("location=")))
+	{
+		return false;
+	}
+	const int32 ParsedFrame = FCString::Atoi(*Fields[1].Mid(13));
+	const uint32 ParsedValue = static_cast<uint32>(FCString::Strtoui64(*Fields[2].Mid(13), nullptr, 10));
+	TArray<FString> Coordinates;
+	Fields[3].Mid(9).ParseIntoArray(Coordinates, TEXT(","), false);
+	if (Coordinates.Num() != 3)
+	{
+		return false;
+	}
+	const FVector ParsedLocation(
+		FCString::Atod(*Coordinates[0]),
+		FCString::Atod(*Coordinates[1]),
+		FCString::Atod(*Coordinates[2]));
+	if (ParsedLocation.ContainsNaN())
+	{
+		return false;
+	}
+	LogicalFrame = ParsedFrame;
+	PrivateValue = ParsedValue;
+	SetActorLocation(ParsedLocation, false, nullptr, ETeleportType::TeleportPhysics);
+	return DatasetGetDeterministicState_Implementation() == CanonicalState;
+}
+
+void ASRDatasetStateCacheValidationActor::DatasetRestore_Implementation()
+{
+	SetActorTransform(OriginalTransform, false, nullptr, ETeleportType::TeleportPhysics);
 }

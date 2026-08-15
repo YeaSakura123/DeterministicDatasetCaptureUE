@@ -22,6 +22,22 @@ public:
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "SR Dataset")
 	void DatasetEvaluateFrame(int32 FrameNumber, float TimeSeconds);
 
+	/**
+	 * Return a canonical, deterministic serialization of any opaque state that
+	 * affects rendering but is not visible through Actor/component transforms.
+	 * The plugin stores only its SHA-1 and UTF-8 byte count in frame metadata.
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "SR Dataset")
+	FString DatasetGetDeterministicState();
+
+	/**
+	 * Restore a canonical state previously returned by
+	 * DatasetGetDeterministicState. Returning false rejects the replay before
+	 * rendering; the plugin also reads the state back and requires byte equality.
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "SR Dataset")
+	bool DatasetApplyDeterministicState(const FString& CanonicalState);
+
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "SR Dataset")
 	void DatasetRestore();
 };
