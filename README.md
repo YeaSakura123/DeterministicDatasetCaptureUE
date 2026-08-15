@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.12.0-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.13.0-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,7 +11,7 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.12.0 deliberately separates implemented output from certified training contracts:
+Version 0.13.0 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
@@ -97,7 +97,7 @@ The experimental v2 history-rejection/disocclusion policy first compares motion-
 - Actual GPU View Uniform Mip bias for Main View, native HR, reference HR and HUD-less color; the validator independently reproduces UE's quantized automatic-bias formula.
 - A per-frame scene-state SHA-1 over sorted Actor/component transforms, visibility/tick state, skeletal component-space bones, Niagara component time/seed controls and Cascade component state. The manifest also lists actors that tick without implementing `SRDatasetControllable`.
 - A pre-warmup scene-control preflight that inventories every registered ticking Actor/component, loaded Niagara Data Interface, and known time/per-instance/particle-random material input. It writes a canonical SHA-1 report and can reject any unclassified record before frame zero.
-- Optional fixed-topology stable instance IDs finalized after warmup and the streaming barrier. The plugin assigns collision-free Custom Stencil IDs in sorted component-path order, writes a hashed ID→component/Actor/class map, fails on later topology/label drift and restores every prior stencil state. The v1 encoding rejects more than 255 instances.
+- Optional stable instance IDs finalized after warmup and the streaming barrier. Fixed mode assigns collision-free Custom Stencil IDs in sorted component-path order and fails on topology drift. Dynamic mode monotonically allocates never-reused IDs to newly registered component paths, permits removal/path-stable respawn, retains a final hashed ID→component/Actor/class/first-seen map and publishes per-frame active/new ID sets. Both modes restore every prior stencil state and reject more than 255 identities.
 
 “Absolute control” is an explicit protocol, not a claim that arbitrary live input becomes deterministic automatically. The plugin can cache and reapply evaluated skeletal poses, lock ordinary game-time material expressions to the logical frame, and explicitly drive supported Niagara systems. Network traffic, audio-driven state, nondeterministic third-party data interfaces, custom async work, AnimBP logic that consumes external state, Material Parameter Collections and project-authored WPO without an explicit previous-frame contract still require an adapter, cache or project-specific validation. The included fixtures and project-asset probes prove the declared paths, not every possible asset.
 
@@ -221,7 +221,13 @@ The supplied validation job deliberately uses `512x288` HR and `256x144` LR for 
 
 Set `bAssignStableInstanceIds=true` on a native temporal job to replace ambiguous scene-authored stencil reuse with component-unique IDs for a fixed loaded topology. Assignment occurs only after renderer warmup and the streaming barrier. ID `0` is reserved for background; IDs `1..N` follow case-sensitive sorted component paths. `instance_id_map.json` records the component path, owner Actor path, Actor class and component class for every ID, plus a canonical SHA-1 that the validator independently reconstructs.
 
-[`Config/job.stable-instance-id-validation.json`](Config/job.stable-instance-id-validation.json) exercises this mode. It intentionally fails if the renderable component set changes after assignment, if another system changes a stencil, or if more than 255 components require labels. It cannot be combined with validation fixtures that reserve stencil values. This closes collisions between mapped components. Dynamic same-component self-occlusion is now conservatively invalid instead of silently trusted, but production-valid supervision for those pixels and dynamic spawn/despawn topology still need a per-surface/wider encoding.
+[`Config/job.stable-instance-id-validation.json`](Config/job.stable-instance-id-validation.json) exercises this mode. It intentionally fails if the renderable component set changes after assignment, if another system changes a stencil, or if more than 255 components require labels. It cannot be combined with validation fixtures that reserve stencil values. This closes collisions between mapped components. Dynamic same-component self-occlusion is now conservatively invalid instead of silently trusted. Dynamic spawn/despawn topology is supported by the mode below, but production-valid self-occlusion still needs a per-surface/wider encoding.
+
+### Dynamic instance-ID topology gate
+
+Set `bAllowDynamicInstanceIdTopology=true` together with `bAssignStableInstanceIds=true` when controlled gameplay may register or remove renderable components. Initial components keep path-sorted IDs. Each newly observed component path receives the next ID in discovery-frame/path order; IDs are never recycled, and a path-stable respawn retains its ID. Resume is deliberately rejected until the allocator has a persistent journal. `instance_id_map.json` schema v2 records `firstSeenLogicalFrame`, the final map hash is propagated to every frame, and each frame records `stableInstanceIdActiveIds` plus `stableInstanceIdNewIds`.
+
+[`Config/job.dynamic-instance-id-validation.json`](Config/job.dynamic-instance-id-validation.json) creates a real `UStaticMeshComponent` on logical frame 1 and destroys it on frame 2. The checked run expanded the map from 60 to 61 identities and recorded active counts `60 -> 61 -> 60`, new-ID sets `[] -> [61] -> []`, and visible ID-61 pixels only on the middle frame. It passed 694/694 standalone and 1099/1099 two-process replay checks. The mode is dynamic component identity, not triangle/surface identity, and remains limited to 255 never-reused IDs per job.
 
 ### Capture-order invariance gate
 
@@ -316,6 +322,8 @@ Actors spawned during capture are discovered and prepared before their first eva
 `color_hr_reference_scene_hdr` first renders at `HRResolution * ReferenceHRScale`, then downsamples to the fixed non-jittered HR grid. For example, a 1920x1080 HR target with scale 2 renders internally at 3840x2160 but still writes a 1920x1080 EXR.
 
 ## Verified release evidence
+
+Version 0.13.0 adds monotonic dynamic-topology component identity. A three-frame runtime fixture registered a visible component, assigned final ID 61, then destroyed it without reusing the ID; the final schema-v2 mapping hash and per-frame active/new sets were identical in two clean UE processes. Validator v18 passed 694/694 standalone and 1099/1099 replay checks. Fixed-topology v0.13 capture remained at 474/474, and retained v0.8 data still passed 379/379.
 
 Version 0.12.0 adds same-pixel deferred Main View GBuffer supervision and logical View State frame locking. The AfterDOF extraction now writes world normal, linear material Base Color, roughness/metallic/specular and an exact opaque-validity raster from the same input pixel used by HDR, depth, motion and IDs; temporal jobs reject Forward Shading because those attributes are unavailable under that renderer contract. Validator v17 checks every attribute alpha against `gbuffer_valid`, requires validity to equal `depth_valid`, enforces unit world normals and finite `[0,1]` material ranges, and records heatmaps for cross-process differences. UE compilation and the 1/1 job-validation automation passed. The stable-ID job passed 474/474 standalone checks and 735/735 two-process replay checks; the moving/VFX semantic fixture passed 583/583, strict controllable-state preflight passed 508/508, and the fixture-free `1920x1080`/`960x540` strict job passed 517/517. Both replay runs reported logical View State indices `0,1`; all GBuffer/depth validity pixels were exact, while sparse quantized attribute-boundary differences stayed below the independently enforced per-modality limits. Validator-v17 backward compatibility retained the v0.8 dataset at 379/379.
 

@@ -156,6 +156,11 @@ REPLAY_METADATA_FIELDS = (
     "stableInstanceIdsEnabled",
     "stableInstanceIdMappingSha1",
     "stableInstanceIdCount",
+    "stableInstanceIdFixedTopologyRequired",
+    "stableInstanceIdDynamicTopologyAllowed",
+    "stableInstanceIdActiveIds",
+    "stableInstanceIdNewIds",
+    "dynamicInstanceIdValidation",
     "sceneActorCount",
     "sceneComponentCount",
     "sceneSkeletalComponentCount",
@@ -1078,6 +1083,7 @@ def validate_temporal_frame(
         in {
             "custom_stencil_uint8_zero_unlabeled",
             "stable_component_unique_custom_stencil_uint8_zero_background",
+            "stable_dynamic_component_unique_custom_stencil_uint8_zero_background",
         },
         str(temporal.get("objectIdSource")),
     )
@@ -1863,6 +1869,7 @@ def validate_stable_instance_ids(
     checks: list[dict[str, Any]],
 ) -> tuple[str, set[int]]:
     enabled = bool(job.get("bAssignStableInstanceIds", False))
+    dynamic = bool(job.get("bAllowDynamicInstanceIdTopology", False))
     state = manifest.get("stableInstanceIds")
     contract = manifest.get("determinismContract", {})
     if not enabled:
@@ -1889,7 +1896,8 @@ def validate_stable_instance_ids(
         and job.get("lRMode") == "NativeRender"
         and job.get("bEnableSemanticValidationFixture") is not True
         and job.get("bValidateNonFixtureSkeletalAnimation") is not True
-        and job.get("bValidateProjectAnimatedMaterial") is not True,
+        and job.get("bValidateProjectAnimatedMaterial") is not True
+        and (not dynamic or job.get("bResume") is not True),
         json.dumps(
             {
                 key: job.get(key)
@@ -1899,6 +1907,8 @@ def validate_stable_instance_ids(
                     "bEnableSemanticValidationFixture",
                     "bValidateNonFixtureSkeletalAnimation",
                     "bValidateProjectAnimatedMaterial",
+                    "bAllowDynamicInstanceIdTopology",
+                    "bResume",
                 )
             },
             sort_keys=True,
@@ -1914,11 +1924,26 @@ def validate_stable_instance_ids(
         and state.get("mappingFile") == "instance_id_map.json"
         and int(state.get("backgroundId", -1)) == 0
         and int(state.get("maximumAssignableId", -1)) == 255
-        and state.get("fixedTopologyRequired") is True
+        and state.get("fixedTopologyRequired") is (not dynamic)
+        and bool(state.get("dynamicTopologyAllowed", False)) is dynamic
+        and (
+            state.get("assignmentPolicy")
+            == (
+                "monotonic_uint8_never_reused_discovery_frame_then_component_path"
+                if dynamic
+                else "component_path_sorted_fixed_topology"
+            )
+            or (not dynamic and state.get("assignmentPolicy") is None)
+        )
         and contract.get("objectIdEncoding")
-        == "fixed_topology_component_unique_custom_stencil_uint8_with_hashed_mapping_zero_background"
+        == (
+            "dynamic_topology_component_unique_monotonic_custom_stencil_uint8_with_hashed_mapping_zero_background"
+            if dynamic
+            else "fixed_topology_component_unique_custom_stencil_uint8_with_hashed_mapping_zero_background"
+        )
         and contract.get("objectIdInstanceUnique") is True
-        and contract.get("objectIdFixedTopologyRequired") is True
+        and contract.get("objectIdFixedTopologyRequired") is (not dynamic)
+        and bool(contract.get("objectIdDynamicTopologyAllowed", False)) is dynamic
         and int(contract.get("objectIdMaximumInstances", -1)) == 255,
         json.dumps(
             {
@@ -1929,6 +1954,7 @@ def validate_stable_instance_ids(
                         "objectIdEncoding",
                         "objectIdInstanceUnique",
                         "objectIdFixedTopologyRequired",
+                        "objectIdDynamicTopologyAllowed",
                         "objectIdMaximumInstances",
                     )
                 },
@@ -1967,6 +1993,10 @@ def validate_stable_instance_ids(
     records_valid = all(
         isinstance(record, dict)
         and isinstance(record.get("instanceId"), int)
+        and (
+            not dynamic
+            or isinstance(record.get("firstSeenLogicalFrame"), int)
+        )
         and all(
             isinstance(record.get(field), str)
             and bool(record.get(field))
@@ -1979,18 +2009,34 @@ def validate_stable_instance_ids(
     component_paths = [
         str(record.get("componentPath", "")) for record in instances if isinstance(record, dict)
     ]
+    first_seen_frames = [
+        int(record.get("firstSeenLogicalFrame", -2147483648))
+        for record in instances
+        if isinstance(record, dict)
+    ]
     expected_ids = list(range(1, len(instances) + 1))
     schema_valid = bool(
-        mapping.get("schemaVersion") == 1
+        mapping.get("schemaVersion") == (2 if dynamic else 1)
         and mapping.get("encoding") == "custom_stencil_uint8"
         and int(mapping.get("backgroundId", -1)) == 0
         and int(mapping.get("maximumAssignableId", -1)) == 255
-        and mapping.get("fixedTopologyRequired") is True
+        and mapping.get("fixedTopologyRequired") is (not dynamic)
+        and bool(mapping.get("dynamicTopologyAllowed", False)) is dynamic
+        and (
+            mapping.get("assignmentPolicy")
+            == (
+                "monotonic_uint8_never_reused_discovery_frame_then_component_path"
+                if dynamic
+                else "component_path_sorted_fixed_topology"
+            )
+            or (not dynamic and mapping.get("assignmentPolicy") is None)
+        )
         and 0 < len(instances) <= 255
         and int(mapping.get("instanceCount", -1)) == len(instances)
         and records_valid
         and ids == expected_ids
-        and component_paths == sorted(component_paths)
+        and (dynamic or component_paths == sorted(component_paths))
+        and (not dynamic or first_seen_frames == sorted(first_seen_frames))
         and len(set(component_paths)) == len(component_paths)
     )
     add_check(
@@ -2000,15 +2046,26 @@ def validate_stable_instance_ids(
         f"instances={len(instances)} ids={ids[:4]}..{ids[-4:] if ids else []}",
     )
     canonical = "".join(
-        f"{record['instanceId']}\t{record['componentPath']}\t{record['actorPath']}\t"
-        f"{record['actorClassPath']}\t{record['componentClassPath']}\n"
+        (
+            f"{record['instanceId']}\t{record['firstSeenLogicalFrame']}\t"
+            f"{record['componentPath']}\t{record['actorPath']}\t"
+            f"{record['actorClassPath']}\t{record['componentClassPath']}\n"
+            if dynamic
+            else f"{record['instanceId']}\t{record['componentPath']}\t"
+            f"{record['actorPath']}\t{record['actorClassPath']}\t"
+            f"{record['componentClassPath']}\n"
+        )
         for record in instances
-        if isinstance(record, dict) and all(field in record for field in required_fields)
+        if isinstance(record, dict)
+        and all(field in record for field in required_fields)
+        and (not dynamic or "firstSeenLogicalFrame" in record)
     )
     calculated_hash = hashlib.sha1(canonical.encode("utf-8")).hexdigest().upper()
     reported_hash = str(mapping.get("sha1", "")).upper()
     expected_scope = (
-        "instance_id_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_component_path"
+        "instance_id_first_seen_logical_frame_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_instance_id"
+        if dynamic
+        else "instance_id_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_component_path"
     )
     hash_valid = bool(
         schema_valid
@@ -2430,6 +2487,9 @@ def validate(
     auxiliary_capture_order = str(job.get("auxiliaryCaptureOrder") or "HighResolutionFirst")
     semantic_motion_scenario = str(
         job.get("semanticMotionScenario") or "LegacyCameraRelative"
+    )
+    dynamic_instance_ids = bool(
+        job.get("bAllowDynamicInstanceIdTopology", False)
     )
     add_check(
         checks,
@@ -3622,15 +3682,74 @@ def validate(
                     cvars,
                 )
                 if job.get("bAssignStableInstanceIds", False):
+                    expected_object_id_source = (
+                        "stable_dynamic_component_unique_custom_stencil_uint8_zero_background"
+                        if dynamic_instance_ids
+                        else "stable_component_unique_custom_stencil_uint8_zero_background"
+                    )
+                    active_metadata_present = (
+                        "stableInstanceIdActiveIds" in frame
+                    )
+                    active_instance_ids_list = frame.get(
+                        "stableInstanceIdActiveIds",
+                        sorted(stable_instance_valid_ids)
+                        if not dynamic_instance_ids
+                        else [],
+                    )
+                    new_instance_ids_list = frame.get(
+                        "stableInstanceIdNewIds", []
+                    )
+                    active_instance_ids = (
+                        set(int(value) for value in active_instance_ids_list)
+                        if isinstance(active_instance_ids_list, list)
+                        else set()
+                    )
+                    new_instance_ids = (
+                        set(int(value) for value in new_instance_ids_list)
+                        if isinstance(new_instance_ids_list, list)
+                        else set()
+                    )
                     stable_frame_contract = bool(
                         frame.get("stableInstanceIdsEnabled") is True
                         and str(frame.get("stableInstanceIdMappingSha1", "")).upper()
                         == stable_instance_mapping_sha1
                         and int(frame.get("stableInstanceIdCount", -1))
                         == len(stable_instance_valid_ids)
+                        and (
+                            frame.get(
+                                "stableInstanceIdFixedTopologyRequired"
+                            )
+                            is (not dynamic_instance_ids)
+                            or (
+                                not dynamic_instance_ids
+                                and "stableInstanceIdFixedTopologyRequired"
+                                not in frame
+                            )
+                        )
+                        and bool(
+                            frame.get(
+                                "stableInstanceIdDynamicTopologyAllowed",
+                                False,
+                            )
+                        )
+                        is dynamic_instance_ids
+                        and isinstance(active_instance_ids_list, list)
+                        and active_instance_ids_list
+                        == sorted(active_instance_ids)
+                        and active_instance_ids.issubset(
+                            stable_instance_valid_ids
+                        )
+                        and isinstance(new_instance_ids_list, list)
+                        and new_instance_ids_list == sorted(new_instance_ids)
+                        and new_instance_ids.issubset(active_instance_ids)
+                        and (not dynamic_instance_ids or active_metadata_present)
                         and temporal.get("objectIdSource")
-                        == "stable_component_unique_custom_stencil_uint8_zero_background"
+                        == expected_object_id_source
                         and temporal.get("objectIdInstanceUnique") is True
+                        and bool(
+                            temporal.get("objectIdDynamicTopologyAllowed", False)
+                        )
+                        is dynamic_instance_ids
                         and str(temporal.get("objectIdMappingSha1", "")).upper()
                         == stable_instance_mapping_sha1
                         and int(temporal.get("objectIdInstanceCount", -1))
@@ -3653,6 +3772,9 @@ def validate(
                                 "temporalCount": temporal.get(
                                     "objectIdInstanceCount"
                                 ),
+                                "activeIds": active_instance_ids_list,
+                                "newIds": new_instance_ids_list,
+                                "dynamic": dynamic_instance_ids,
                             },
                             sort_keys=True,
                         ),
@@ -3669,7 +3791,7 @@ def validate(
                         raster_valid = bool(
                             np.allclose(values, rounded, rtol=0.0, atol=1e-6)
                             and unique_ids.issubset(
-                                stable_instance_valid_ids | {0}
+                                active_instance_ids | {0}
                             )
                             and nonzero_pixels > 0
                         )
@@ -3689,6 +3811,62 @@ def validate(
                         raster_valid,
                         raster_detail,
                     )
+                    if job.get("bValidateDynamicInstanceIdTopology", False):
+                        dynamic_validation = frame.get(
+                            "dynamicInstanceIdValidation", {}
+                        )
+                        if not isinstance(dynamic_validation, dict):
+                            dynamic_validation = {}
+                        spawn_frame = int(job.get("startFrame", 0)) + 1
+                        expected_active = frame_id == spawn_frame
+                        expected_phase = (
+                            "absent_before_spawn"
+                            if frame_id < spawn_frame
+                            else "spawned_visible"
+                            if frame_id == spawn_frame
+                            else "removed_after_spawn"
+                        )
+                        probe_id = int(
+                            dynamic_validation.get("assignedInstanceId", 0)
+                        )
+                        probe_pixels = (
+                            int(np.count_nonzero(rounded == probe_id))
+                            if object_pixels is not None and probe_id > 0
+                            else 0
+                        )
+                        dynamic_fixture_valid = bool(
+                            isinstance(dynamic_validation, dict)
+                            and dynamic_validation.get("enabled") is True
+                            and isinstance(
+                                dynamic_validation.get("componentPath"), str
+                            )
+                            and dynamic_validation.get("componentPath")
+                            and probe_id in stable_instance_valid_ids
+                            and dynamic_validation.get("phase")
+                            == expected_phase
+                            and dynamic_validation.get("expectedActive")
+                            is expected_active
+                            and (probe_id in active_instance_ids)
+                            is expected_active
+                            and (probe_id in new_instance_ids)
+                            is expected_active
+                            and (probe_pixels > 0) is expected_active
+                        )
+                        add_check(
+                            checks,
+                            f"frame_{frame_id:06d}.dynamic_instance_id_fixture",
+                            dynamic_fixture_valid,
+                            json.dumps(
+                                {
+                                    "phase": dynamic_validation.get("phase"),
+                                    "probeId": probe_id,
+                                    "active": probe_id in active_instance_ids,
+                                    "new": probe_id in new_instance_ids,
+                                    "pixels": probe_pixels,
+                                },
+                                sort_keys=True,
+                            ),
+                        )
                 temporal_records.append((frame_id, temporal, bool(frame.get("reset", False))))
                 if job.get("bEnableSemanticValidationFixture", False):
                     fixture = frame.get("semanticValidationFixture")
@@ -5395,7 +5573,7 @@ def validate(
         else "not_run"
     )
     report = {
-        "validatorVersion": 17,
+        "validatorVersion": 18,
         "comparisonMode": compare_mode if compare is not None else "none",
         "mainViewSceneCapturePixelDomainGate": pixel_domain_gate,
         "stableInstanceIdGate": stable_instance_gate,

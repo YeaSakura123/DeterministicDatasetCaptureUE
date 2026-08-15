@@ -29,7 +29,8 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Record the GPU View Uniform Mip bias, fixed LOD/scalability CVar profile, streaming barrier and resident-texture state hash.
 - [x] Export experimental motion-reprojected history rejection/disocclusion mask, validity and reason codes, with independent reset/ID/static-depth reconstruction and conservative dynamic uncertainty.
 - [x] Export deferred Main View world normal, linear Base Color, roughness, metallic, specular and exact GBuffer validity at the same pixel as temporal inputs.
-- [ ] Upgrade conservative dynamic disocclusion and fixed-topology uint8 instance identity to production per-surface/wide dynamic identity; add material and semantic IDs.
+- [x] Add monotonic uint8 component IDs for controlled dynamic spawn/remove topology with per-frame active/new sets and a schema-v2 first-seen mapping.
+- [ ] Upgrade conservative dynamic disocclusion and uint8 component identity to production per-surface/wide identity; add material and semantic IDs.
 - [ ] Add Movie Render Graph for temporal/spatial samples, path tracing and tiled ultra-high-resolution output.
 - [ ] Add configurable camera calibration export and pluggable degradation chains.
 
@@ -51,7 +52,8 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Validate labeled project-skeletal reveal/occlusion evidence in both endpoint directions.
 - [x] Validate Niagara and translucency fixture playback at endpoints and intermediate time.
 - [ ] Validate a project-authored WPO asset with explicit current/previous endpoint motion; the checked project contains no suitable asset.
-- [ ] Add per-surface/wider dynamic identity so same-component moving, WPO and animated-material disocclusion can be valid rather than conservatively rejected.
+- [x] Add deterministic dynamic component topology within the uint8 ceiling; IDs are never reused and path-stable respawns retain identity.
+- [ ] Add per-surface/wider identity so same-component moving, WPO and animated-material disocclusion can be valid rather than conservatively rejected.
 - [x] Add static/camera-only/object-only/mixed-motion and four-quadrant jitter-sign fixtures.
 - [x] Add a hashed strict preflight scanner for every registered ticking Actor/component, loaded Niagara Data Interface and known time/per-instance/particle-random material input.
 - [x] Let every `SRDatasetControllable` contribute a canonical opaque-state digest; strict jobs reject empty state before the selected render and include hashes in scene replay provenance.
@@ -198,3 +200,11 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - A second clean process passed 735/735 replay checks. Depth/ID/masks/GBuffer validity remained exact; known sparse deferred quantization/raster boundary changes were bounded independently per attribute and produced heatmaps whenever encoded hashes differed.
 - The moving/VFX semantic fixture passed 583/583, strict controllable-state preflight passed 508/508, the fixture-free `1920x1080`/`960x540` strict job passed 517/517, and validator-v17 retained v0.8 compatibility at 379/379.
 - Dynamic per-surface identity, material/semantic IDs, Main View/reference-HR pixel-domain proof and automatic Niagara/Chaos/gameplay caches remain open; temporal certification is still disabled.
+
+## Version 0.13.0 dynamic component-topology snapshot
+
+- `bAllowDynamicInstanceIdTopology` keeps initial path-sorted IDs, assigns new component paths monotonically in discovery-frame/path order, never reuses removed IDs and rejects resume until an allocator journal exists.
+- Schema-v2 `instance_id_map.json` adds `firstSeenLogicalFrame`, dynamic assignment policy and a final canonical SHA-1. Map growth retroactively updates every in-memory frame's global mapping reference, while frame-local active/new ID arrays remain immutable evidence.
+- A real transient `UStaticMeshComponent` appeared on frame 1 and was destroyed on frame 2. The map grew from 60 to 61; active counts were `60 -> 61 -> 60`, new IDs were `[] -> [61] -> []`, and ID 61 appeared in the raster only while active.
+- Validator v18 passed 694/694 standalone and 1099/1099 two-process replay checks. Fixed-topology regression remained 474/474 and retained v0.8 data passed 379/379.
+- The carrier remains uint8 and component-scoped. More than 255 lifetime identities and same-component per-surface self-occlusion remain explicit open requirements.

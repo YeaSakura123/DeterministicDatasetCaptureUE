@@ -140,6 +140,23 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("bAssignStableInstanceIds requires temporal diagnostics so the labeled object_id raster is captured.");
 		return false;
 	}
+	if (bAllowDynamicInstanceIdTopology && !bAssignStableInstanceIds)
+	{
+		OutError = TEXT("bAllowDynamicInstanceIdTopology requires bAssignStableInstanceIds=true.");
+		return false;
+	}
+	if (bAllowDynamicInstanceIdTopology && bResume)
+	{
+		OutError = TEXT("Dynamic instance-ID topology does not yet support resume because the monotonic allocator journal must be rebuilt by replay.");
+		return false;
+	}
+	if (bValidateDynamicInstanceIdTopology &&
+		(!bAllowDynamicInstanceIdTopology || ReplayPass != ESRDatasetReplayPass::Standard ||
+		 FrameStep != 1 || CaptureFrameOffset != 0 || EndFrame - StartFrame < 2))
+	{
+		OutError = TEXT("Dynamic instance-ID validation requires dynamic IDs, Standard replay, three consecutive selected frames and offset zero.");
+		return false;
+	}
 	if (bAssignStableInstanceIds &&
 		(bEnableSemanticValidationFixture || bValidateNonFixtureSkeletalAnimation ||
 		 bValidateProjectAnimatedMaterial))

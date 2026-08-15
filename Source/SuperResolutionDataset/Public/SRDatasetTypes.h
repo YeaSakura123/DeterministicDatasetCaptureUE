@@ -163,13 +163,21 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	bool bCaptureDepth = true;
 
 	/**
-	 * Temporarily assign deterministic, component-unique Custom Stencil IDs to
-	 * the fixed set of registered renderable primitive components. ID 0 remains
-	 * background. The v1 encoding is uint8 and therefore rejects more than 255
-	 * instances instead of allowing collisions.
+	 * Temporarily assign deterministic, component-unique Custom Stencil IDs.
+	 * ID 0 remains background. The encoding is uint8 and therefore rejects more
+	 * than 255 identities instead of allowing collisions.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
 	bool bAssignStableInstanceIds = false;
+
+	/**
+	 * Permit renderable components to appear or disappear after initial ID
+	 * assignment. New component paths receive monotonically allocated IDs that
+	 * are never reused; surviving or path-stable respawned components retain the
+	 * same ID. The final mapping is propagated to every frame's metadata.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bAssignStableInstanceIds"))
+	bool bAllowDynamicInstanceIdTopology = false;
 
 	/**
 	 * Experimental UE RDG extraction from the native LR view. Writes HDR Color,
@@ -387,6 +395,10 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	/** Require a full logical jitter cycle with both signs on both axes and all four sign quadrants. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bEnableSemanticValidationFixture"))
 	bool bValidateTemporalJitterSignCoverage = false;
+
+	/** Spawn a renderable component on frame 1 and remove it on frame 2 to prove dynamic ID allocation/release. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bAllowDynamicInstanceIdTopology"))
+	bool bValidateDynamicInstanceIdTopology = false;
 
 	/** Assign temporary Custom Stencil IDs to non-fixture skeletal components and require their production-scene pose/motion gate. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheSkeletalAnimationPosesForReplay"))

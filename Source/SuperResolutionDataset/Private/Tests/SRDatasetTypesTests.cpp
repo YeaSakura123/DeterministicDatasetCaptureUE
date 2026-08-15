@@ -83,6 +83,21 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("Stable instance IDs reject fixtures that reserve Custom Stencil values"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
+	Job.bAllowDynamicInstanceIdTopology = true;
+	TestFalse(TEXT("Dynamic instance topology requires stable instance IDs"), Job.Validate(Error));
+	Job.LRMode = ESRDatasetLRMode::NativeRender;
+	Job.bCaptureTemporalDiagnostics = true;
+	Job.bAssignStableInstanceIds = true;
+	Job.bResume = true;
+	TestFalse(TEXT("Dynamic instance topology rejects resume without an allocator journal"), Job.Validate(Error));
+	Job.bResume = false;
+	Job.bValidateDynamicInstanceIdTopology = true;
+	Job.EndFrame = Job.StartFrame;
+	TestFalse(TEXT("Dynamic instance validation requires three selected frames"), Job.Validate(Error));
+	Job.EndFrame = Job.StartFrame + 2;
+	TestTrue(TEXT("Dynamic instance validation accepts three consecutive stable-ID frames"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
 	Job.bValidateMainViewSceneCapturePixelDomain = true;
 	TestFalse(TEXT("Pixel-domain validation cannot be enabled without the paired SceneCapture extraction"), Job.Validate(Error));
 

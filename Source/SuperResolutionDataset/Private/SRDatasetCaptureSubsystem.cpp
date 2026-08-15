@@ -302,8 +302,14 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 	NonFixtureHiddenActorStates.Reset();
 	StableInstanceStencilStates.Reset();
 	StableInstanceIdRecords.Reset();
+	StableInstanceIdByComponentPath.Reset();
+	StableInstanceActiveIds.Reset();
+	StableInstanceNewIds.Reset();
 	StableInstanceIdMappingSha1.Reset();
 	bStableInstanceIdsPrepared = false;
+	DynamicInstanceIdValidationActor = nullptr;
+	DynamicInstanceIdValidationComponent = nullptr;
+	DynamicInstanceIdValidationComponentPath.Reset();
 	WarmupPoseCacheFrame = INDEX_NONE;
 	AppliedCachedSkeletalPoseComponentCount = 0;
 	AppliedCachedSkeletalPoseBoneCount = 0;
@@ -439,6 +445,10 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 		return false;
 	}
 	if (!PrepareProjectAnimatedMaterialValidation(OutError))
+	{
+		return false;
+	}
+	if (!PrepareDynamicInstanceIdValidation(OutError))
 	{
 		return false;
 	}
@@ -892,6 +902,120 @@ void USRDatasetCaptureSubsystem::RestoreProjectAnimatedMaterialValidation()
 	}
 }
 
+bool USRDatasetCaptureSubsystem::PrepareDynamicInstanceIdValidation(FString& OutError)
+{
+	if (!ActiveJob.bValidateDynamicInstanceIdTopology)
+	{
+		return true;
+	}
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		OutError = TEXT("Dynamic instance-ID validation requires a world.");
+		return false;
+	}
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Name = MakeUniqueObjectName(
+		World,
+		AActor::StaticClass(),
+		TEXT("SRDatasetDynamicInstanceValidationActor"));
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	DynamicInstanceIdValidationActor = World->SpawnActor<AActor>(AActor::StaticClass(), FTransform::Identity, SpawnParameters);
+	if (!DynamicInstanceIdValidationActor)
+	{
+		OutError = TEXT("Could not spawn the dynamic instance-ID validation Actor.");
+		return false;
+	}
+	DynamicInstanceIdValidationActor->SetActorTickEnabled(false);
+	DynamicInstanceIdValidationComponentPath = FString::Printf(
+		TEXT("%s.DynamicInstanceProbe"),
+		*DynamicInstanceIdValidationActor->GetPathName());
+	return true;
+}
+
+bool USRDatasetCaptureSubsystem::UpdateDynamicInstanceIdValidation(
+	const int32 FrameNumber,
+	FString& OutError)
+{
+	if (!ActiveJob.bValidateDynamicInstanceIdTopology)
+	{
+		return true;
+	}
+	if (!DynamicInstanceIdValidationActor)
+	{
+		OutError = TEXT("Dynamic instance-ID validation Actor disappeared before evaluation.");
+		return false;
+	}
+	const int32 SpawnFrame = ActiveJob.StartFrame + 1;
+	const int32 RemoveFrame = ActiveJob.StartFrame + 2;
+	if (FrameNumber == SpawnFrame && !DynamicInstanceIdValidationComponent)
+	{
+		UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		if (!Cube)
+		{
+			OutError = TEXT("Could not load /Engine/BasicShapes/Cube for dynamic instance-ID validation.");
+			return false;
+		}
+		DynamicInstanceIdValidationComponent = NewObject<UStaticMeshComponent>(
+			DynamicInstanceIdValidationActor,
+			TEXT("DynamicInstanceProbe"));
+		if (!DynamicInstanceIdValidationComponent)
+		{
+			OutError = TEXT("Could not allocate the dynamic instance-ID validation component.");
+			return false;
+		}
+		DynamicInstanceIdValidationActor->AddInstanceComponent(DynamicInstanceIdValidationComponent);
+		DynamicInstanceIdValidationActor->SetRootComponent(DynamicInstanceIdValidationComponent);
+		DynamicInstanceIdValidationComponent->SetMobility(EComponentMobility::Movable);
+		DynamicInstanceIdValidationComponent->SetStaticMesh(Cube);
+		DynamicInstanceIdValidationComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		DynamicInstanceIdValidationComponent->SetCastShadow(false);
+		DynamicInstanceIdValidationComponent->RegisterComponent();
+
+		FVector CameraLocation = ActiveJob.DeterministicCameraLocationCm;
+		FRotator CameraRotation = ActiveJob.DeterministicCameraRotationDegrees;
+		if (!ActiveJob.bUseDeterministicCameraTransform)
+		{
+			const UWorld* World = GetWorld();
+			const APlayerController* Controller = World ? World->GetFirstPlayerController() : nullptr;
+			const APlayerCameraManager* CameraManager = Controller ? Controller->PlayerCameraManager : nullptr;
+			if (!CameraManager)
+			{
+				OutError = TEXT("Dynamic instance-ID validation could not resolve the player camera.");
+				return false;
+			}
+			CameraLocation = CameraManager->GetCameraLocation();
+			CameraRotation = CameraManager->GetCameraRotation();
+		}
+		DynamicInstanceIdValidationActor->SetActorLocationAndRotation(
+			CameraLocation + CameraRotation.Vector() * 200.0,
+			CameraRotation,
+			false,
+			nullptr,
+			ETeleportType::TeleportPhysics);
+		DynamicInstanceIdValidationActor->SetActorScale3D(FVector(0.5));
+		DynamicInstanceIdValidationComponentPath = DynamicInstanceIdValidationComponent->GetPathName();
+	}
+	else if (FrameNumber >= RemoveFrame && DynamicInstanceIdValidationComponent)
+	{
+		DynamicInstanceIdValidationActor->RemoveInstanceComponent(DynamicInstanceIdValidationComponent);
+		DynamicInstanceIdValidationComponent->DestroyComponent();
+		DynamicInstanceIdValidationComponent = nullptr;
+		DynamicInstanceIdValidationActor->SetRootComponent(nullptr);
+	}
+	return true;
+}
+
+void USRDatasetCaptureSubsystem::RestoreDynamicInstanceIdValidation()
+{
+	DynamicInstanceIdValidationComponent = nullptr;
+	if (DynamicInstanceIdValidationActor)
+	{
+		DynamicInstanceIdValidationActor->Destroy();
+		DynamicInstanceIdValidationActor = nullptr;
+	}
+}
+
 TArray<UPrimitiveComponent*> USRDatasetCaptureSubsystem::CollectStableInstanceComponents() const
 {
 	TArray<UPrimitiveComponent*> Components;
@@ -926,10 +1050,162 @@ TArray<UPrimitiveComponent*> USRDatasetCaptureSubsystem::CollectStableInstanceCo
 	return Components;
 }
 
+bool USRDatasetCaptureSubsystem::RegisterStableInstanceComponent(
+	UPrimitiveComponent* Component,
+	const int32 FirstSeenLogicalFrame,
+	FString& OutError)
+{
+	if (!IsValid(Component))
+	{
+		OutError = TEXT("Cannot register an invalid stable instance component.");
+		return false;
+	}
+	AActor* Owner = Component->GetOwner();
+	const FString ComponentPath = Component->GetPathName();
+	const FString ActorPath = Owner ? Owner->GetPathName() : TEXT("none");
+	const FString ActorClassPath = Owner ? Owner->GetClass()->GetPathName() : TEXT("none");
+	const FString ComponentClassPath = Component->GetClass()->GetPathName();
+	for (const FString* Value : {
+		&ComponentPath, &ActorPath, &ActorClassPath, &ComponentClassPath })
+	{
+		if (Value->Contains(TEXT("\t")) || Value->Contains(TEXT("\n")) || Value->Contains(TEXT("\r")))
+		{
+			OutError = FString::Printf(TEXT("Stable instance-ID path contains a forbidden tab/newline: %s"), **Value);
+			return false;
+		}
+	}
+
+	int32 InstanceId = StableInstanceIdByComponentPath.FindRef(ComponentPath);
+	if (InstanceId == 0)
+	{
+		if (StableInstanceIdRecords.Num() >= 255)
+		{
+			OutError = FString::Printf(
+				TEXT("Stable instance-ID uint8 allocator exhausted after 255 identities while discovering %s."),
+				*ComponentPath);
+			return false;
+		}
+		InstanceId = StableInstanceIdRecords.Num() + 1;
+		FStableInstanceIdRecord Record;
+		Record.InstanceId = InstanceId;
+		Record.FirstSeenLogicalFrame = FirstSeenLogicalFrame;
+		Record.ComponentPath = ComponentPath;
+		Record.ActorPath = ActorPath;
+		Record.ActorClassPath = ActorClassPath;
+		Record.ComponentClassPath = ComponentClassPath;
+		StableInstanceIdRecords.Add(Record);
+		StableInstanceIdByComponentPath.Add(ComponentPath, InstanceId);
+		StableInstanceNewIds.Add(InstanceId);
+	}
+	else
+	{
+		if (!StableInstanceIdRecords.IsValidIndex(InstanceId - 1))
+		{
+			OutError = FString::Printf(TEXT("Stable instance allocator map contains invalid ID %d for %s."), InstanceId, *ComponentPath);
+			return false;
+		}
+		const FStableInstanceIdRecord& Record = StableInstanceIdRecords[InstanceId - 1];
+		if (Record.ComponentPath != ComponentPath || Record.ActorPath != ActorPath ||
+			Record.ActorClassPath != ActorClassPath || Record.ComponentClassPath != ComponentClassPath)
+		{
+			OutError = FString::Printf(
+				TEXT("Stable instance path was reused with incompatible identity metadata: id=%d path=%s."),
+				InstanceId,
+				*ComponentPath);
+			return false;
+		}
+	}
+
+	if (StableInstanceStencilStates.Contains(Component))
+	{
+		if (!Component->bRenderCustomDepth || Component->CustomDepthStencilValue != InstanceId ||
+			Component->CustomDepthStencilWriteMask != ERendererStencilMask::ERSM_Default)
+		{
+			OutError = FString::Printf(
+				TEXT("Stable instance label drift at ID %d: path=%s stencil=%d enabled=%s."),
+				InstanceId,
+				*ComponentPath,
+				Component->CustomDepthStencilValue,
+				Component->bRenderCustomDepth ? TEXT("true") : TEXT("false"));
+			return false;
+		}
+	}
+	else
+	{
+		FPrimitiveStencilState State;
+		State.bRenderCustomDepth = Component->bRenderCustomDepth;
+		State.CustomDepthStencilValue = static_cast<uint8>(Component->CustomDepthStencilValue);
+		State.CustomDepthStencilWriteMask = static_cast<uint8>(Component->CustomDepthStencilWriteMask);
+		StableInstanceStencilStates.Add(Component, State);
+		Component->SetRenderCustomDepth(true);
+		Component->SetCustomDepthStencilWriteMask(ERendererStencilMask::ERSM_Default);
+		Component->SetCustomDepthStencilValue(InstanceId);
+	}
+	return true;
+}
+
+void USRDatasetCaptureSubsystem::UpdateStableInstanceMappingManifestReferences()
+{
+	for (const TSharedPtr<FJsonValue>& FrameValue : ManifestFrames)
+	{
+		const TSharedPtr<FJsonObject> Frame = FrameValue.IsValid() ? FrameValue->AsObject() : nullptr;
+		if (!Frame)
+		{
+			continue;
+		}
+		Frame->SetStringField(TEXT("stableInstanceIdMappingSha1"), StableInstanceIdMappingSha1);
+		Frame->SetNumberField(TEXT("stableInstanceIdCount"), StableInstanceIdRecords.Num());
+		const TSharedPtr<FJsonObject>* Temporal = nullptr;
+		if (Frame->TryGetObjectField(TEXT("temporalDiagnostics"), Temporal) && Temporal && Temporal->IsValid())
+		{
+			(*Temporal)->SetStringField(TEXT("objectIdMappingSha1"), StableInstanceIdMappingSha1);
+			(*Temporal)->SetNumberField(TEXT("objectIdInstanceCount"), StableInstanceIdRecords.Num());
+		}
+		const TSharedPtr<FJsonObject>* DynamicValidation = nullptr;
+		if (Frame->TryGetObjectField(TEXT("dynamicInstanceIdValidation"), DynamicValidation) &&
+			DynamicValidation && DynamicValidation->IsValid())
+		{
+			(*DynamicValidation)->SetNumberField(
+				TEXT("assignedInstanceId"),
+				StableInstanceIdByComponentPath.FindRef(DynamicInstanceIdValidationComponentPath));
+		}
+	}
+}
+
+bool USRDatasetCaptureSubsystem::RefreshStableInstanceIdMapping(FString& OutError)
+{
+	FString Canonical;
+	for (const FStableInstanceIdRecord& Record : StableInstanceIdRecords)
+	{
+		Canonical += ActiveJob.bAllowDynamicInstanceIdTopology
+			? FString::Printf(
+				TEXT("%d\t%d\t%s\t%s\t%s\t%s\n"),
+				Record.InstanceId,
+				Record.FirstSeenLogicalFrame,
+				*Record.ComponentPath,
+				*Record.ActorPath,
+				*Record.ActorClassPath,
+				*Record.ComponentClassPath)
+			: FString::Printf(
+				TEXT("%d\t%s\t%s\t%s\t%s\n"),
+				Record.InstanceId,
+				*Record.ComponentPath,
+				*Record.ActorPath,
+				*Record.ActorClassPath,
+				*Record.ComponentClassPath);
+	}
+	StableInstanceIdMappingSha1 = HashString(Canonical);
+	UpdateStableInstanceMappingManifestReferences();
+	return WriteStableInstanceIdMap(OutError);
+}
+
 bool USRDatasetCaptureSubsystem::PrepareStableInstanceIds(FString& OutError)
 {
 	StableInstanceStencilStates.Reset();
 	StableInstanceIdRecords.Reset();
+	StableInstanceIdByComponentPath.Reset();
+	StableInstanceActiveIds.Reset();
+	StableInstanceNewIds.Reset();
 	StableInstanceIdMappingSha1.Reset();
 	bStableInstanceIdsPrepared = false;
 	if (!ActiveJob.bAssignStableInstanceIds)
@@ -951,58 +1227,28 @@ bool USRDatasetCaptureSubsystem::PrepareStableInstanceIds(FString& OutError)
 		return false;
 	}
 
-	FString Canonical;
-	for (int32 Index = 0; Index < Components.Num(); ++Index)
+	for (UPrimitiveComponent* Component : Components)
 	{
-		UPrimitiveComponent* Component = Components[Index];
-		AActor* Owner = Component->GetOwner();
-		const int32 InstanceId = Index + 1;
-		FPrimitiveStencilState State;
-		State.bRenderCustomDepth = Component->bRenderCustomDepth;
-		State.CustomDepthStencilValue = static_cast<uint8>(Component->CustomDepthStencilValue);
-		State.CustomDepthStencilWriteMask = static_cast<uint8>(Component->CustomDepthStencilWriteMask);
-		StableInstanceStencilStates.Add(Component, State);
-
-		FStableInstanceIdRecord Record;
-		Record.InstanceId = InstanceId;
-		Record.ComponentPath = Component->GetPathName();
-		Record.ActorPath = Owner ? Owner->GetPathName() : TEXT("none");
-		Record.ActorClassPath = Owner ? Owner->GetClass()->GetPathName() : TEXT("none");
-		Record.ComponentClassPath = Component->GetClass()->GetPathName();
-		for (const FString* Value : {
-			&Record.ComponentPath, &Record.ActorPath, &Record.ActorClassPath, &Record.ComponentClassPath })
+		if (!RegisterStableInstanceComponent(Component, GetFirstCapturedFrame(), OutError))
 		{
-			if (Value->Contains(TEXT("\t")) || Value->Contains(TEXT("\n")) || Value->Contains(TEXT("\r")))
-			{
-				OutError = FString::Printf(TEXT("Stable instance-ID path contains a forbidden tab/newline: %s"), **Value);
-				RestoreStableInstanceIds();
-				return false;
-			}
+			RestoreStableInstanceIds();
+			return false;
 		}
-		StableInstanceIdRecords.Add(Record);
-		Canonical += FString::Printf(
-			TEXT("%d\t%s\t%s\t%s\t%s\n"),
-			Record.InstanceId,
-			*Record.ComponentPath,
-			*Record.ActorPath,
-			*Record.ActorClassPath,
-			*Record.ComponentClassPath);
-
-		Component->SetRenderCustomDepth(true);
-		Component->SetCustomDepthStencilWriteMask(ERendererStencilMask::ERSM_Default);
-		Component->SetCustomDepthStencilValue(InstanceId);
+		StableInstanceActiveIds.Add(StableInstanceIdByComponentPath.FindRef(Component->GetPathName()));
 	}
-	StableInstanceIdMappingSha1 = HashString(Canonical);
-	if (!WriteStableInstanceIdMap(OutError))
+	StableInstanceActiveIds.Sort();
+	if (!RefreshStableInstanceIdMapping(OutError))
 	{
 		RestoreStableInstanceIds();
 		return false;
 	}
+	// Initial topology is the allocator baseline, not a dynamic per-frame event.
+	StableInstanceNewIds.Reset();
 	bStableInstanceIdsPrepared = true;
 	return true;
 }
 
-bool USRDatasetCaptureSubsystem::ValidateStableInstanceIds(FString& OutError) const
+bool USRDatasetCaptureSubsystem::ValidateStableInstanceIds(FString& OutError)
 {
 	if (!ActiveJob.bAssignStableInstanceIds)
 	{
@@ -1014,7 +1260,7 @@ bool USRDatasetCaptureSubsystem::ValidateStableInstanceIds(FString& OutError) co
 		return false;
 	}
 	const TArray<UPrimitiveComponent*> Components = CollectStableInstanceComponents();
-	if (Components.Num() != StableInstanceIdRecords.Num())
+	if (!ActiveJob.bAllowDynamicInstanceIdTopology && Components.Num() != StableInstanceIdRecords.Num())
 	{
 		TSet<FString> PreparedPaths;
 		TSet<FString> CurrentPaths;
@@ -1052,24 +1298,39 @@ bool USRDatasetCaptureSubsystem::ValidateStableInstanceIds(FString& OutError) co
 			*FString::Join(Removed, TEXT(",")));
 		return false;
 	}
+
+	StableInstanceActiveIds.Reset();
+	StableInstanceNewIds.Reset();
+	bool bMappingChanged = false;
 	for (int32 Index = 0; Index < Components.Num(); ++Index)
 	{
-		const UPrimitiveComponent* Component = Components[Index];
-		const FStableInstanceIdRecord& Record = StableInstanceIdRecords[Index];
-		if (Component->GetPathName() != Record.ComponentPath ||
-			!Component->bRenderCustomDepth ||
-			Component->CustomDepthStencilValue != Record.InstanceId ||
-			Component->CustomDepthStencilWriteMask != ERendererStencilMask::ERSM_Default)
+		UPrimitiveComponent* Component = Components[Index];
+		if (!ActiveJob.bAllowDynamicInstanceIdTopology &&
+			(!StableInstanceIdRecords.IsValidIndex(Index) ||
+			 Component->GetPathName() != StableInstanceIdRecords[Index].ComponentPath))
 		{
 			OutError = FString::Printf(
-				TEXT("Stable instance topology/label drift at ID %d: expected=%s current=%s stencil=%d enabled=%s."),
-				Record.InstanceId,
-				*Record.ComponentPath,
-				*Component->GetPathName(),
-				Component->CustomDepthStencilValue,
-				Component->bRenderCustomDepth ? TEXT("true") : TEXT("false"));
+				TEXT("Stable instance topology order drift at index %d: expected=%s current=%s."),
+				Index,
+				StableInstanceIdRecords.IsValidIndex(Index)
+					? *StableInstanceIdRecords[Index].ComponentPath
+					: TEXT("missing"),
+				*Component->GetPathName());
 			return false;
 		}
+		const int32 PreviousRecordCount = StableInstanceIdRecords.Num();
+		if (!RegisterStableInstanceComponent(Component, Status.CurrentFrame, OutError))
+		{
+			return false;
+		}
+		bMappingChanged |= StableInstanceIdRecords.Num() != PreviousRecordCount;
+		StableInstanceActiveIds.Add(StableInstanceIdByComponentPath.FindRef(Component->GetPathName()));
+	}
+	StableInstanceActiveIds.Sort();
+	StableInstanceNewIds.Sort();
+	if (bMappingChanged && !RefreshStableInstanceIdMapping(OutError))
+	{
+		return false;
 	}
 	return true;
 }
@@ -1081,15 +1342,23 @@ bool USRDatasetCaptureSubsystem::WriteStableInstanceIdMap(FString& OutError) con
 		return true;
 	}
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
-	Root->SetNumberField(TEXT("schemaVersion"), 1);
+	Root->SetNumberField(TEXT("schemaVersion"), ActiveJob.bAllowDynamicInstanceIdTopology ? 2 : 1);
 	Root->SetStringField(TEXT("encoding"), TEXT("custom_stencil_uint8"));
 	Root->SetNumberField(TEXT("backgroundId"), 0);
 	Root->SetNumberField(TEXT("maximumAssignableId"), 255);
-	Root->SetBoolField(TEXT("fixedTopologyRequired"), true);
+	Root->SetBoolField(TEXT("fixedTopologyRequired"), !ActiveJob.bAllowDynamicInstanceIdTopology);
+	Root->SetBoolField(TEXT("dynamicTopologyAllowed"), ActiveJob.bAllowDynamicInstanceIdTopology);
+	Root->SetStringField(
+		TEXT("assignmentPolicy"),
+		ActiveJob.bAllowDynamicInstanceIdTopology
+			? TEXT("monotonic_uint8_never_reused_discovery_frame_then_component_path")
+			: TEXT("component_path_sorted_fixed_topology"));
 	Root->SetNumberField(TEXT("instanceCount"), StableInstanceIdRecords.Num());
 	Root->SetStringField(
 		TEXT("hashScope"),
-		TEXT("instance_id_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_component_path"));
+		ActiveJob.bAllowDynamicInstanceIdTopology
+			? TEXT("instance_id_first_seen_logical_frame_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_instance_id")
+			: TEXT("instance_id_component_actor_actor_class_component_class_tab_lf_utf8_sorted_by_component_path"));
 	Root->SetStringField(TEXT("sha1"), StableInstanceIdMappingSha1);
 	TArray<TSharedPtr<FJsonValue>> Instances;
 	Instances.Reserve(StableInstanceIdRecords.Num());
@@ -1097,6 +1366,10 @@ bool USRDatasetCaptureSubsystem::WriteStableInstanceIdMap(FString& OutError) con
 	{
 		TSharedRef<FJsonObject> Instance = MakeShared<FJsonObject>();
 		Instance->SetNumberField(TEXT("instanceId"), Record.InstanceId);
+		if (ActiveJob.bAllowDynamicInstanceIdTopology)
+		{
+			Instance->SetNumberField(TEXT("firstSeenLogicalFrame"), Record.FirstSeenLogicalFrame);
+		}
 		Instance->SetStringField(TEXT("componentPath"), Record.ComponentPath);
 		Instance->SetStringField(TEXT("actorPath"), Record.ActorPath);
 		Instance->SetStringField(TEXT("actorClassPath"), Record.ActorClassPath);
@@ -2797,7 +3070,7 @@ bool USRDatasetCaptureSubsystem::WriteSceneControlPreflightReport(FString& OutEr
 	};
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 1);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.12.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.13.0"));
 	Root->SetBoolField(TEXT("ran"), SceneControlPreflight.bRan);
 	Root->SetBoolField(TEXT("required"), ActiveJob.bRequireSceneControlPreflight);
 	Root->SetBoolField(TEXT("passed"), SceneControlPreflight.bPassed);
@@ -2915,6 +3188,11 @@ void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTi
 	ApplyLogicalTemporalJitter(EvaluationFrame);
 	FString Error;
 	if (!EvaluateSequence(EvaluationFrame, Error))
+	{
+		FinishCapture(ESRDatasetCaptureState::Failed, Error);
+		return;
+	}
+	if (!UpdateDynamicInstanceIdValidation(EvaluationFrame, Error))
 	{
 		FinishCapture(ESRDatasetCaptureState::Failed, Error);
 		return;
@@ -3956,6 +4234,43 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	Frame->SetNumberField(
 		TEXT("stableInstanceIdCount"),
 		ActiveJob.bAssignStableInstanceIds ? StableInstanceIdRecords.Num() : 0);
+	Frame->SetBoolField(
+		TEXT("stableInstanceIdFixedTopologyRequired"),
+		ActiveJob.bAssignStableInstanceIds && !ActiveJob.bAllowDynamicInstanceIdTopology);
+	Frame->SetBoolField(
+		TEXT("stableInstanceIdDynamicTopologyAllowed"),
+		ActiveJob.bAssignStableInstanceIds && ActiveJob.bAllowDynamicInstanceIdTopology);
+	TArray<TSharedPtr<FJsonValue>> ActiveInstanceIdsJson;
+	for (const int32 InstanceId : StableInstanceActiveIds)
+	{
+		ActiveInstanceIdsJson.Add(MakeShared<FJsonValueNumber>(InstanceId));
+	}
+	Frame->SetArrayField(TEXT("stableInstanceIdActiveIds"), ActiveInstanceIdsJson);
+	TArray<TSharedPtr<FJsonValue>> NewInstanceIdsJson;
+	for (const int32 InstanceId : StableInstanceNewIds)
+	{
+		NewInstanceIdsJson.Add(MakeShared<FJsonValueNumber>(InstanceId));
+	}
+	Frame->SetArrayField(TEXT("stableInstanceIdNewIds"), NewInstanceIdsJson);
+	if (ActiveJob.bValidateDynamicInstanceIdTopology)
+	{
+		TSharedRef<FJsonObject> DynamicValidation = MakeShared<FJsonObject>();
+		const int32 SpawnFrame = ActiveJob.StartFrame + 1;
+		DynamicValidation->SetBoolField(TEXT("enabled"), true);
+		DynamicValidation->SetStringField(TEXT("componentPath"), DynamicInstanceIdValidationComponentPath);
+		DynamicValidation->SetNumberField(
+			TEXT("assignedInstanceId"),
+			StableInstanceIdByComponentPath.FindRef(DynamicInstanceIdValidationComponentPath));
+		DynamicValidation->SetBoolField(TEXT("expectedActive"), FrameNumber == SpawnFrame);
+		DynamicValidation->SetStringField(
+			TEXT("phase"),
+			FrameNumber < SpawnFrame
+				? TEXT("absent_before_spawn")
+				: FrameNumber == SpawnFrame
+					? TEXT("spawned_visible")
+					: TEXT("removed_after_spawn"));
+		Frame->SetObjectField(TEXT("dynamicInstanceIdValidation"), DynamicValidation);
+	}
 	Frame->SetNumberField(TEXT("sceneActorCount"), SceneState.ActorCount);
 	Frame->SetNumberField(TEXT("sceneComponentCount"), SceneState.ComponentCount);
 	Frame->SetNumberField(TEXT("sceneSkeletalComponentCount"), SceneState.SkeletalComponentCount);
@@ -4616,9 +4931,14 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 			Temporal->SetStringField(
 				TEXT("objectIdSource"),
 				ActiveJob.bAssignStableInstanceIds
-					? TEXT("stable_component_unique_custom_stencil_uint8_zero_background")
+					? ActiveJob.bAllowDynamicInstanceIdTopology
+						? TEXT("stable_dynamic_component_unique_custom_stencil_uint8_zero_background")
+						: TEXT("stable_component_unique_custom_stencil_uint8_zero_background")
 					: TEXT("custom_stencil_uint8_zero_unlabeled"));
 			Temporal->SetBoolField(TEXT("objectIdInstanceUnique"), ActiveJob.bAssignStableInstanceIds);
+			Temporal->SetBoolField(
+				TEXT("objectIdDynamicTopologyAllowed"),
+				ActiveJob.bAssignStableInstanceIds && ActiveJob.bAllowDynamicInstanceIdTopology);
 			Temporal->SetStringField(
 				TEXT("objectIdMappingSha1"),
 				ActiveJob.bAssignStableInstanceIds ? StableInstanceIdMappingSha1 : TEXT("not_used"));
@@ -4828,7 +5148,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.12.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.13.0"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -4890,7 +5210,19 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		ActiveJob.bAssignStableInstanceIds ? StableInstanceIdRecords.Num() : 0);
 	StableIds->SetNumberField(TEXT("backgroundId"), 0);
 	StableIds->SetNumberField(TEXT("maximumAssignableId"), 255);
-	StableIds->SetBoolField(TEXT("fixedTopologyRequired"), ActiveJob.bAssignStableInstanceIds);
+	StableIds->SetBoolField(
+		TEXT("fixedTopologyRequired"),
+		ActiveJob.bAssignStableInstanceIds && !ActiveJob.bAllowDynamicInstanceIdTopology);
+	StableIds->SetBoolField(
+		TEXT("dynamicTopologyAllowed"),
+		ActiveJob.bAssignStableInstanceIds && ActiveJob.bAllowDynamicInstanceIdTopology);
+	StableIds->SetStringField(
+		TEXT("assignmentPolicy"),
+		ActiveJob.bAssignStableInstanceIds
+			? ActiveJob.bAllowDynamicInstanceIdTopology
+				? TEXT("monotonic_uint8_never_reused_discovery_frame_then_component_path")
+				: TEXT("component_path_sorted_fixed_topology")
+			: TEXT("not_used"));
 	Root->SetObjectField(TEXT("stableInstanceIds"), StableIds);
 
 	TSharedRef<FJsonObject> Provenance = MakeShared<FJsonObject>();
@@ -4967,10 +5299,17 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Contract->SetStringField(
 		TEXT("objectIdEncoding"),
 		ActiveJob.bAssignStableInstanceIds
-			? TEXT("fixed_topology_component_unique_custom_stencil_uint8_with_hashed_mapping_zero_background")
+			? ActiveJob.bAllowDynamicInstanceIdTopology
+				? TEXT("dynamic_topology_component_unique_monotonic_custom_stencil_uint8_with_hashed_mapping_zero_background")
+				: TEXT("fixed_topology_component_unique_custom_stencil_uint8_with_hashed_mapping_zero_background")
 			: TEXT("scene_authored_custom_stencil_uint8_zero_unlabeled"));
 	Contract->SetBoolField(TEXT("objectIdInstanceUnique"), ActiveJob.bAssignStableInstanceIds);
-	Contract->SetBoolField(TEXT("objectIdFixedTopologyRequired"), ActiveJob.bAssignStableInstanceIds);
+	Contract->SetBoolField(
+		TEXT("objectIdFixedTopologyRequired"),
+		ActiveJob.bAssignStableInstanceIds && !ActiveJob.bAllowDynamicInstanceIdTopology);
+	Contract->SetBoolField(
+		TEXT("objectIdDynamicTopologyAllowed"),
+		ActiveJob.bAssignStableInstanceIds && ActiveJob.bAllowDynamicInstanceIdTopology);
 	Contract->SetNumberField(TEXT("objectIdMaximumInstances"), ActiveJob.bAssignStableInstanceIds ? 255 : 0);
 	Contract->SetStringField(
 		TEXT("worldSpaceWidgetPolicy"),
@@ -5216,6 +5555,7 @@ void USRDatasetCaptureSubsystem::FinishCapture(const ESRDatasetCaptureState Fina
 		NonFixtureSkeletalValidationActor = nullptr;
 	}
 	RestoreStableInstanceIds();
+	RestoreDynamicInstanceIdValidation();
 	RestoreProjectAnimatedMaterialValidation();
 	RestoreDeterministicCamera();
 

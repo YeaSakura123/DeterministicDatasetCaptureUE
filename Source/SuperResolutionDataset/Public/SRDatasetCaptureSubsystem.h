@@ -168,6 +168,7 @@ private:
 	struct FStableInstanceIdRecord
 	{
 		int32 InstanceId = 0;
+		int32 FirstSeenLogicalFrame = 0;
 		FString ComponentPath;
 		FString ActorPath;
 		FString ActorClassPath;
@@ -202,8 +203,14 @@ private:
 	bool PrepareProjectAnimatedMaterialValidation(FString& OutError);
 	void PositionProjectAnimatedMaterialValidationReceiver();
 	void RestoreProjectAnimatedMaterialValidation();
+	bool PrepareDynamicInstanceIdValidation(FString& OutError);
+	bool UpdateDynamicInstanceIdValidation(int32 FrameNumber, FString& OutError);
+	void RestoreDynamicInstanceIdValidation();
 	bool PrepareStableInstanceIds(FString& OutError);
-	bool ValidateStableInstanceIds(FString& OutError) const;
+	bool ValidateStableInstanceIds(FString& OutError);
+	bool RegisterStableInstanceComponent(class UPrimitiveComponent* Component, int32 FirstSeenLogicalFrame, FString& OutError);
+	bool RefreshStableInstanceIdMapping(FString& OutError);
+	void UpdateStableInstanceMappingManifestReferences();
 	bool WriteStableInstanceIdMap(FString& OutError) const;
 	void RestoreStableInstanceIds();
 	TArray<class UPrimitiveComponent*> CollectStableInstanceComponents() const;
@@ -319,6 +326,14 @@ private:
 	FString ProjectAnimatedMaterialValidationBasePath;
 
 	UPROPERTY(Transient)
+	TObjectPtr<AActor> DynamicInstanceIdValidationActor;
+
+	UPROPERTY(Transient)
+	TObjectPtr<class UStaticMeshComponent> DynamicInstanceIdValidationComponent;
+
+	FString DynamicInstanceIdValidationComponentPath;
+
+	UPROPERTY(Transient)
 	TObjectPtr<ACameraActor> DeterministicCameraActor;
 
 	TWeakObjectPtr<APlayerController> DeterministicCameraPlayerController;
@@ -338,6 +353,9 @@ private:
 	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FPrimitiveStencilState> NonFixtureSkeletalStencilStates;
 	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FPrimitiveStencilState> StableInstanceStencilStates;
 	TArray<FStableInstanceIdRecord> StableInstanceIdRecords;
+	TMap<FString, int32> StableInstanceIdByComponentPath;
+	TArray<int32> StableInstanceActiveIds;
+	TArray<int32> StableInstanceNewIds;
 	FString StableInstanceIdMappingSha1;
 	bool bStableInstanceIdsPrepared = false;
 	TMap<TWeakObjectPtr<AActor>, bool> NonFixtureHiddenActorStates;
