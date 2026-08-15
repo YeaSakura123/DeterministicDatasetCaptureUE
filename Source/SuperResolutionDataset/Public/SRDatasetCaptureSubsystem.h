@@ -186,6 +186,7 @@ private:
 	int32 GetFirstCapturedFrame() const;
 	int32 GetPreviouslyCapturedFrame(int32 FrameNumber) const;
 	int32 GetTemporalJitterOverrideIndex(int32 FrameNumber) const;
+	uint32 GetLogicalViewStateFrameIndex(int32 FrameNumber) const;
 	bool IsPastEvaluationRange(int32 FrameNumber) const;
 	bool ShouldCaptureFrame(int32 FrameNumber) const;
 	void ApplyLastCapturedEndpointTransforms();
@@ -211,6 +212,7 @@ private:
 	void RestoreDeterministicCamera();
 	void ApplyDeterministicRuntimeState();
 	void ApplyLogicalTemporalJitter(int32 FrameNumber);
+	void ClearLogicalViewStateFrameIndex();
 	void ApplyLogicalMaterialTime(int32 FrameNumber);
 	void ClearLogicalMaterialTime();
 	TArray<FString> GetActiveWidgetComponentPaths() const;

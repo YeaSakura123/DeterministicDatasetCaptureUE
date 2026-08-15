@@ -104,7 +104,11 @@ namespace SRDataset::Private
 		TEXT("translucency_after_dof_raw"),
 		TEXT("transparency_mask"),
 		TEXT("reactive_mask"),
-		TEXT("object_id")
+		TEXT("object_id"),
+		TEXT("normal_world"),
+		TEXT("base_color_linear"),
+		TEXT("material_properties"),
+		TEXT("gbuffer_valid")
 	};
 	constexpr const TCHAR* SceneCaptureLRComparisonModality = TEXT("color_lr_scene_capture_hdr");
 	constexpr const TCHAR* ReferenceHRModality = TEXT("color_hr_reference_scene_hdr");
@@ -327,6 +331,16 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 		OutError = TEXT("Dataset capture requires a Game or PIE world.");
 		return false;
 	}
+	if (ActiveJob.bCaptureTemporalDiagnostics)
+	{
+		const IConsoleVariable* ForwardShading =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("r.ForwardShading"));
+		if (ForwardShading && ForwardShading->GetInt() != 0)
+		{
+			OutError = TEXT("Temporal GBuffer diagnostics require deferred shading (r.ForwardShading=0).");
+			return false;
+		}
+	}
 
 	if (!ActiveJob.ExpectedMap.IsEmpty())
 	{
@@ -503,6 +517,15 @@ int32 USRDatasetCaptureSubsystem::GetTemporalJitterOverrideIndex(const int32 Fra
 	const int32 SequenceLength = FMath::Max(1, ActiveJob.TemporalJitterSequenceLength);
 	const int32 Unnormalized = FrameNumber + ActiveJob.TemporalJitterPhaseOffset;
 	return ((Unnormalized % SequenceLength) + SequenceLength) % SequenceLength;
+}
+
+uint32 USRDatasetCaptureSubsystem::GetLogicalViewStateFrameIndex(const int32 FrameNumber) const
+{
+	// Unsigned addition defines negative logical frames modulo 2^32 without
+	// signed overflow. Mod8 remains the signed logical frame plus phase, while
+	// every replay process receives the same full renderer state index.
+	return static_cast<uint32>(FrameNumber) +
+		static_cast<uint32>(ActiveJob.TemporalJitterPhaseOffset);
 }
 
 bool USRDatasetCaptureSubsystem::IsPastEvaluationRange(const int32 FrameNumber) const
@@ -1716,6 +1739,7 @@ void USRDatasetCaptureSubsystem::RestoreDeterministicRuntimeState()
 	}
 	PreviousTemporalJitterOverrideIndex = -1;
 	bOverrodeTemporalJitterIndex = false;
+	ClearLogicalViewStateFrameIndex();
 	if (bOverrodeWorldRendering)
 	{
 		UGameplayStatics::SetEnableWorldRendering(this, bPreviousWorldRenderingEnabled);
@@ -1762,6 +1786,31 @@ void USRDatasetCaptureSubsystem::ApplyLogicalTemporalJitter(const int32 FrameNum
 		TEXT("r.TemporalAA.Debug.OverrideTemporalIndex")))
 	{
 		Variable->Set(GetTemporalJitterOverrideIndex(FrameNumber), ECVF_SetByCode);
+	}
+	const uint32 ViewStateFrameIndex = GetLogicalViewStateFrameIndex(FrameNumber);
+	if (const TSharedPtr<FSRDatasetViewExtension, ESPMode::ThreadSafe> ViewExtension =
+		GetSRDatasetViewExtension())
+	{
+		ViewExtension->SetDeterministicViewFrameIndex(ViewStateFrameIndex);
+	}
+	if (const TSharedPtr<FSRDatasetViewExtension, ESPMode::ThreadSafe> TonemapExtension =
+		GetSRDatasetTonemapViewExtension())
+	{
+		TonemapExtension->SetDeterministicViewFrameIndex(ViewStateFrameIndex);
+	}
+}
+
+void USRDatasetCaptureSubsystem::ClearLogicalViewStateFrameIndex()
+{
+	if (const TSharedPtr<FSRDatasetViewExtension, ESPMode::ThreadSafe> ViewExtension =
+		GetSRDatasetViewExtension())
+	{
+		ViewExtension->ClearDeterministicViewFrameIndex();
+	}
+	if (const TSharedPtr<FSRDatasetViewExtension, ESPMode::ThreadSafe> TonemapExtension =
+		GetSRDatasetTonemapViewExtension())
+	{
+		TonemapExtension->ClearDeterministicViewFrameIndex();
 	}
 }
 
@@ -1884,6 +1933,7 @@ void USRDatasetCaptureSubsystem::SnapshotProvenance()
 		TEXT("r.CustomDepth"),
 		TEXT("r.DynamicRes.OperationMode"),
 		TEXT("r.EyeAdaptationQuality"),
+		TEXT("r.ForwardShading"),
 		TEXT("r.GPUScene.ParallelUpdate"),
 		TEXT("r.HDR.Display.ColorGamut"),
 		TEXT("r.HDR.Display.OutputDevice"),
@@ -2747,7 +2797,7 @@ bool USRDatasetCaptureSubsystem::WriteSceneControlPreflightReport(FString& OutEr
 	};
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 1);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.11.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.12.0"));
 	Root->SetBoolField(TEXT("ran"), SceneControlPreflight.bRan);
 	Root->SetBoolField(TEXT("required"), ActiveJob.bRequireSceneControlPreflight);
 	Root->SetBoolField(TEXT("passed"), SceneControlPreflight.bPassed);
@@ -4422,6 +4472,19 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 			Temporal->SetNumberField(TEXT("renderFrameNumber"), Metadata.RenderFrameNumber);
 			Temporal->SetNumberField(TEXT("stateFrameIndex"), Metadata.StateFrameIndex);
 			Temporal->SetNumberField(TEXT("stateFrameIndexMod8"), Metadata.StateFrameIndexMod8);
+			Temporal->SetBoolField(
+				TEXT("viewStateFrameIndexLogicalFrameLocked"),
+				ActiveJob.bLockTemporalJitterToLogicalFrame);
+			Temporal->SetNumberField(
+				TEXT("expectedLogicalViewStateFrameIndex"),
+				ActiveJob.bLockTemporalJitterToLogicalFrame
+					? static_cast<double>(GetLogicalViewStateFrameIndex(FrameNumber))
+					: static_cast<double>(Metadata.StateFrameIndex));
+			Temporal->SetStringField(
+				TEXT("viewStateFrameIndexSource"),
+				ActiveJob.bLockTemporalJitterToLogicalFrame
+					? TEXT("scene_view_override_logical_frame_plus_phase_mod_uint32")
+					: TEXT("engine_view_state_submission_order"));
 			Temporal->SetArrayField(TEXT("jitterCurrentNDC"), Vector2Array(Metadata.JitterCurrentNDC));
 			Temporal->SetArrayField(TEXT("jitterPreviousNDC"), Vector2Array(Metadata.JitterPreviousNDC));
 			const FVector2f CurrentRenderPixels(
@@ -4533,6 +4596,23 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 			Temporal->SetStringField(TEXT("transparencyMaskSource"), TEXT("one_minus_post_dof_separate_translucency_transmittance"));
 			Temporal->SetStringField(TEXT("reactiveMaskSource"), TEXT("conservative_post_dof_transparency_coverage_v1"));
 			Temporal->SetBoolField(TEXT("reactiveMaskIncludesOpaqueAnimation"), false);
+			Temporal->SetStringField(
+				TEXT("gbufferAttributeSource"),
+				TEXT("deferred_main_view_gbuffer_same_pixel_observed_at_after_dof"));
+			Temporal->SetStringField(TEXT("worldNormalSpace"), TEXT("unreal_world_left_handed_xyz_unit_vector"));
+			Temporal->SetStringField(TEXT("baseColorSpace"), TEXT("linear_material_base_color_rgb"));
+			Temporal->SetStringField(
+				TEXT("materialPropertiesChannels"),
+				TEXT("R_roughness_G_metallic_B_specular_A_valid"));
+			Temporal->SetStringField(
+				TEXT("gbufferValidity"),
+				TEXT("one_for_finite_positive_scene_depth_zero_for_sky_or_no_opaque_surface"));
+			Temporal->SetStringField(
+				TEXT("gbufferReplayComparison"),
+				TEXT("quantized_attribute_numeric_tolerance_v1_with_heatmap"));
+			Temporal->SetStringField(
+				TEXT("gbufferReplayKnownLimit"),
+				TEXT("sparse_raster_and_material_quantization_boundary_pixels_are_not_promised_byte_exact"));
 			Temporal->SetStringField(
 				TEXT("objectIdSource"),
 				ActiveJob.bAssignStableInstanceIds
@@ -4748,7 +4828,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.11.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.12.0"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -4993,7 +5073,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Contract->SetStringField(
 		TEXT("temporalJitterPhasePolicy"),
 		ActiveJob.bLockTemporalJitterToLogicalFrame
-			? TEXT("logical_frame_plus_phase_offset_mod_sequence_length_non_shipping_debug_override")
+			? TEXT("logical_frame_plus_phase_offset_mod_sequence_length_non_shipping_debug_override_and_scene_view_state_frame_override")
 			: TEXT("engine_view_state_submission_order"));
 	Contract->SetBoolField(TEXT("uncapturedMainViewSuppressed"), ActiveJob.bSuppressMainViewOnUncapturedFrames);
 	Contract->SetStringField(
@@ -5018,6 +5098,12 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 			TEXT("aliases_history_rejection_mask_valid_reason;cross_instance_and_static_depth_exact;dynamic_same_instance_conservative_invalid"));
 		Contract->SetStringField(TEXT("temporalDiagnosticsStatus"), TEXT("experimental_uncertified"));
 		Contract->SetStringField(TEXT("temporalDiagnosticsStage"), TEXT("after_dof_before_temporal_upscaler"));
+		Contract->SetStringField(
+			TEXT("gbufferAttributes"),
+			TEXT("deferred_main_view_world_normal_base_color_roughness_metallic_specular_with_validity"));
+		Contract->SetStringField(
+			TEXT("gbufferReplayComparison"),
+			TEXT("quantized_attribute_numeric_tolerance_v1_with_heatmap"));
 		Contract->SetStringField(TEXT("nativeHRColor"), TEXT("isolated_hr_scene_capture_after_dof_linear_scene_rgb_pre_exposed"));
 		Contract->SetStringField(
 			TEXT("referenceHRColor"),
@@ -5044,6 +5130,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		Contract->SetStringField(TEXT("jitterAndMatrices"), TEXT("not_captured"));
 		Contract->SetStringField(TEXT("historyRejection"), TEXT("not_captured"));
 		Contract->SetStringField(TEXT("disocclusion"), TEXT("not_captured"));
+		Contract->SetStringField(TEXT("gbufferAttributes"), TEXT("not_captured"));
 	}
 	Contract->SetStringField(TEXT("pairing"), TEXT("All modalities are captured after the same world tick; LR downsampling never advances the world."));
 	Contract->SetStringField(

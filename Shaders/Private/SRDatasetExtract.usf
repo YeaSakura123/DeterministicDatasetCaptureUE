@@ -1,4 +1,5 @@
 #include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
 
 Texture2D<float4> InputSceneColor;
 Texture2D<float4> InputVelocity;
@@ -13,6 +14,9 @@ RWTexture2D<float4> OutMotionFull;
 RWTexture2D<float4> OutDepth;
 RWTexture2D<float4> OutTranslucency;
 RWTexture2D<float4> OutObjectId;
+RWTexture2D<float4> OutWorldNormal;
+RWTexture2D<float4> OutBaseColor;
+RWTexture2D<float4> OutMaterialProperties;
 RWTexture2D<float4> OutMetadata;
 
 int2 InputViewRectMin;
@@ -136,6 +140,24 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		// source. Zero is reserved for unlabeled/background pixels.
 		uint CustomStencil = InputCustomStencil.Load(int3(InputPixel, 0)) STENCIL_COMPONENT_SWIZZLE;
 		OutObjectId[Pixel] = float4(float(CustomStencil), 0.0f, 0.0f, 1.0f);
+
+		// Decode material/geometry attributes from the exact Main View GBuffer
+		// pixel used by color, motion and depth. Alpha is the opaque GBuffer
+		// validity contract; sky/no-depth pixels remain explicitly invalid.
+		float2 BufferUV = (float2(InputPixel) + 0.5f) * View.BufferSizeAndInvSize.zw;
+		FGBufferData GBuffer = GetGBufferData(BufferUV, true, false);
+		float GBufferValid = ValidDepth ? 1.0f : 0.0f;
+		OutWorldNormal[Pixel] = float4(
+			GBufferValid > 0.0f ? GBuffer.WorldNormal : 0.0f,
+			GBufferValid);
+		OutBaseColor[Pixel] = float4(
+			GBufferValid > 0.0f ? saturate(GBuffer.BaseColor) : 0.0f,
+			GBufferValid);
+		OutMaterialProperties[Pixel] = float4(
+			GBufferValid > 0.0f ? saturate(GBuffer.Roughness) : 0.0f,
+			GBufferValid > 0.0f ? saturate(GBuffer.Metallic) : 0.0f,
+			GBufferValid > 0.0f ? saturate(GBuffer.Specular) : 0.0f,
+			GBufferValid);
 	}
 
 	if (Pixel.x < 4 && Pixel.y < 21)

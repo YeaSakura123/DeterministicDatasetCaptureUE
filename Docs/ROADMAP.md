@@ -28,7 +28,8 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Prove auxiliary capture-order invariance with actual reversed submissions and a paired-process hard gate.
 - [x] Record the GPU View Uniform Mip bias, fixed LOD/scalability CVar profile, streaming barrier and resident-texture state hash.
 - [x] Export experimental motion-reprojected history rejection/disocclusion mask, validity and reason codes, with independent reset/ID/static-depth reconstruction and conservative dynamic uncertainty.
-- [ ] Export production disocclusion, instance ID, normals, albedo and material/semantic IDs.
+- [x] Export deferred Main View world normal, linear Base Color, roughness, metallic, specular and exact GBuffer validity at the same pixel as temporal inputs.
+- [ ] Upgrade conservative dynamic disocclusion and fixed-topology uint8 instance identity to production per-surface/wide dynamic identity; add material and semantic IDs.
 - [ ] Add Movie Render Graph for temporal/spatial samples, path tracing and tiled ultra-high-resolution output.
 - [ ] Add configurable camera calibration export and pluggable degradation chains.
 
@@ -188,3 +189,12 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - The semantic fixture emits deterministic frame-varying state. The strict scene-control capture passed validator-v16 462/462 with one controllable, one digest record, zero missing records and different hashes at the two logical frames.
 - The fixture-free strict `1920x1080`/`960x540` capture passed 469/469 with zero uncontrolled preflight records and a valid empty controllable-state set.
 - This closes adapter-provided opaque-state provenance, not automatic Niagara Sim Cache, Chaos cache or arbitrary gameplay serialization.
+
+## Version 0.12.0 same-pixel GBuffer and logical View-frame snapshot
+
+- The AfterDOF Main View extraction writes world normal, linear material Base Color, roughness/metallic/specular and GBuffer validity from the exact same deferred input pixel used by HDR, motion, depth and identity. Forward Shading is rejected for temporal jobs.
+- Logical jitter locking now uses UE's sequence-rendering `FSceneView::OverrideFrameIndexValue` and `OverrideOutputFrameIndexValue`; the GPU metadata proved indices `0,1` for logical frames `0,1` in two fresh processes instead of inheriting the 18/19 warmup submission count.
+- Validator v17 requires GBuffer alpha/validity to match `depth_valid`, unit world normals, zero invalid samples and finite `[0,1]` Base Color/material attributes. UE compilation and 1/1 automation passed; stable-ID capture passed 474/474 standalone checks.
+- A second clean process passed 735/735 replay checks. Depth/ID/masks/GBuffer validity remained exact; known sparse deferred quantization/raster boundary changes were bounded independently per attribute and produced heatmaps whenever encoded hashes differed.
+- The moving/VFX semantic fixture passed 583/583, strict controllable-state preflight passed 508/508, the fixture-free `1920x1080`/`960x540` strict job passed 517/517, and validator-v17 retained v0.8 compatibility at 379/379.
+- Dynamic per-surface identity, material/semantic IDs, Main View/reference-HR pixel-domain proof and automatic Niagara/Chaos/gameplay caches remain open; temporal certification is still disabled.

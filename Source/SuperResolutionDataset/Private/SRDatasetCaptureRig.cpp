@@ -647,6 +647,8 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 	if (PixelCount <= 0 || Result.SceneColor.Num() != PixelCount || Result.VelocityRaw.Num() != PixelCount ||
 		Result.MotionFull.Num() != PixelCount || Result.Depth.Num() != PixelCount ||
 		Result.Translucency.Num() != PixelCount || Result.ObjectId.Num() != PixelCount ||
+		Result.WorldNormal.Num() != PixelCount || Result.BaseColor.Num() != PixelCount ||
+		Result.MaterialProperties.Num() != PixelCount ||
 		!Result.Metadata.bValid)
 	{
 		OutError = TEXT("RDG temporal diagnostic buffers have inconsistent dimensions or missing metadata.");
@@ -845,6 +847,10 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 	// excluded in metadata until a dedicated material/stencil signal is added.
 	Outputs.Add({ TEXT("reactive_mask"), MakeTransparencyMask() });
 	Outputs.Add({ TEXT("object_id"), MakeScalarImage(Result.ObjectId, 0) });
+	Outputs.Add({ TEXT("normal_world"), MakeImage(Result.WorldNormal) });
+	Outputs.Add({ TEXT("base_color_linear"), MakeImage(Result.BaseColor) });
+	Outputs.Add({ TEXT("material_properties"), MakeImage(Result.MaterialProperties) });
+	Outputs.Add({ TEXT("gbuffer_valid"), MakeScalarImage(Result.WorldNormal, 3) });
 
 	for (const FOutput& Output : Outputs)
 	{

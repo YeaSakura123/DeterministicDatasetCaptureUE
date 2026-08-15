@@ -22,6 +22,7 @@ namespace
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+			SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSceneTextureUniformParameters, SceneTexturesStruct)
 			SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputSceneColor)
 			SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputVelocity)
 			SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputDepth)
@@ -34,6 +35,9 @@ namespace
 			SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutDepth)
 			SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutTranslucency)
 			SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutObjectId)
+			SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutWorldNormal)
+			SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutBaseColor)
+			SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutMaterialProperties)
 			SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutMetadata)
 			SHADER_PARAMETER(FIntPoint, InputViewRectMin)
 			SHADER_PARAMETER(FIntPoint, OutputSize)
@@ -100,6 +104,20 @@ void FSRDatasetViewExtension::ClearDeterministicViewTime()
 	DeterministicDeltaTimeSeconds = 0.0f;
 }
 
+void FSRDatasetViewExtension::SetDeterministicViewFrameIndex(const uint32 FrameIndex)
+{
+	FScopeLock Lock(&StateMutex);
+	bDeterministicViewFrameIndexEnabled = true;
+	DeterministicViewFrameIndex = FrameIndex;
+}
+
+void FSRDatasetViewExtension::ClearDeterministicViewFrameIndex()
+{
+	FScopeLock Lock(&StateMutex);
+	bDeterministicViewFrameIndexEnabled = false;
+	DeterministicViewFrameIndex = 0;
+}
+
 void FSRDatasetViewExtension::SetupViewFamily(FSceneViewFamily& InViewFamily)
 {
 	FScopeLock Lock(&StateMutex);
@@ -114,6 +132,19 @@ void FSRDatasetViewExtension::SetupViewFamily(FSceneViewFamily& InViewFamily)
 			0.0f,
 			DeterministicCurrentTimeSeconds,
 			DeterministicDeltaTimeSeconds);
+	}
+}
+
+void FSRDatasetViewExtension::SetupView(FSceneViewFamily& InViewFamily, FSceneView& InView)
+{
+	FScopeLock Lock(&StateMutex);
+	if (bDeterministicViewFrameIndexEnabled)
+	{
+		// This renderer-supported sequence hook is consumed before visibility and
+		// the base pass. Temporal material dithering and other stochastic view
+		// consumers therefore follow logical-frame identity, not process uptime.
+		InView.OverrideFrameIndexValue = DeterministicViewFrameIndex;
+		InView.OverrideOutputFrameIndexValue = DeterministicViewFrameIndex;
 	}
 }
 
@@ -313,10 +344,14 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterDOF_RenderThread(
 	FRDGTextureRef DepthOutput = GraphBuilder.CreateTexture(OutputDesc, TEXT("SRDataset.Depth"));
 	FRDGTextureRef TranslucencyOutput = GraphBuilder.CreateTexture(OutputDesc, TEXT("SRDataset.Translucency"));
 	FRDGTextureRef ObjectIdOutput = GraphBuilder.CreateTexture(OutputDesc, TEXT("SRDataset.ObjectId"));
+	FRDGTextureRef WorldNormalOutput = GraphBuilder.CreateTexture(OutputDesc, TEXT("SRDataset.WorldNormal"));
+	FRDGTextureRef BaseColorOutput = GraphBuilder.CreateTexture(OutputDesc, TEXT("SRDataset.BaseColor"));
+	FRDGTextureRef MaterialPropertiesOutput = GraphBuilder.CreateTexture(OutputDesc, TEXT("SRDataset.MaterialProperties"));
 	FRDGTextureRef MetadataOutput = GraphBuilder.CreateTexture(MetadataDesc, TEXT("SRDataset.Metadata"));
 
 	FSRDatasetExtractCS::FParameters* Parameters = GraphBuilder.AllocParameters<FSRDatasetExtractCS::FParameters>();
 	Parameters->View = View.ViewUniformBuffer;
+	Parameters->SceneTexturesStruct = Inputs.SceneTextures.SceneTextures;
 	Parameters->InputSceneColor = SceneColor.Texture;
 	Parameters->InputVelocity = SceneTextures.GBufferVelocityTexture;
 	Parameters->InputDepth = SceneTextures.SceneDepthTexture;
@@ -333,6 +368,9 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterDOF_RenderThread(
 	Parameters->OutDepth = GraphBuilder.CreateUAV(DepthOutput);
 	Parameters->OutTranslucency = GraphBuilder.CreateUAV(TranslucencyOutput);
 	Parameters->OutObjectId = GraphBuilder.CreateUAV(ObjectIdOutput);
+	Parameters->OutWorldNormal = GraphBuilder.CreateUAV(WorldNormalOutput);
+	Parameters->OutBaseColor = GraphBuilder.CreateUAV(BaseColorOutput);
+	Parameters->OutMaterialProperties = GraphBuilder.CreateUAV(MaterialPropertiesOutput);
 	Parameters->OutMetadata = GraphBuilder.CreateUAV(MetadataOutput);
 	Parameters->InputViewRectMin = SceneColor.ViewRect.Min;
 	Parameters->OutputSize = OutputSize;
@@ -363,6 +401,9 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterDOF_RenderThread(
 	NewReadbacks->Depth = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetDepth"));
 	NewReadbacks->Translucency = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetTranslucency"));
 	NewReadbacks->ObjectId = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetObjectId"));
+	NewReadbacks->WorldNormal = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetWorldNormal"));
+	NewReadbacks->BaseColor = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetBaseColor"));
+	NewReadbacks->MaterialProperties = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetMaterialProperties"));
 	NewReadbacks->Metadata = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetMetadata"));
 
 	AddEnqueueCopyPass(GraphBuilder, NewReadbacks->SceneColor.Get(), SceneColorOutput);
@@ -371,6 +412,9 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterDOF_RenderThread(
 	AddEnqueueCopyPass(GraphBuilder, NewReadbacks->Depth.Get(), DepthOutput);
 	AddEnqueueCopyPass(GraphBuilder, NewReadbacks->Translucency.Get(), TranslucencyOutput);
 	AddEnqueueCopyPass(GraphBuilder, NewReadbacks->ObjectId.Get(), ObjectIdOutput);
+	AddEnqueueCopyPass(GraphBuilder, NewReadbacks->WorldNormal.Get(), WorldNormalOutput);
+	AddEnqueueCopyPass(GraphBuilder, NewReadbacks->BaseColor.Get(), BaseColorOutput);
+	AddEnqueueCopyPass(GraphBuilder, NewReadbacks->MaterialProperties.Get(), MaterialPropertiesOutput);
 	AddEnqueueCopyPass(GraphBuilder, NewReadbacks->Metadata.Get(), MetadataOutput);
 
 	{
@@ -410,6 +454,9 @@ bool FSRDatasetViewExtension::WaitAndTakeCapture(FSRDatasetTemporalCaptureResult
 				ReadFloatTexture(*Readbacks->Depth, Readbacks->Size, Result->Depth);
 				ReadFloatTexture(*Readbacks->Translucency, Readbacks->Size, Result->Translucency);
 				ReadFloatTexture(*Readbacks->ObjectId, Readbacks->Size, Result->ObjectId);
+				ReadFloatTexture(*Readbacks->WorldNormal, Readbacks->Size, Result->WorldNormal);
+				ReadFloatTexture(*Readbacks->BaseColor, Readbacks->Size, Result->BaseColor);
+				ReadFloatTexture(*Readbacks->MaterialProperties, Readbacks->Size, Result->MaterialProperties);
 			}
 			TArray<FLinearColor> MetadataPixels;
 			ReadFloatTexture(*Readbacks->Metadata, FIntPoint(4, 21), MetadataPixels);

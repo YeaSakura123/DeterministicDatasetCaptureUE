@@ -47,7 +47,41 @@ DISOCCLUSION_MODALITIES_V2 = (
     "disocclusion_valid",
     "disocclusion_reason",
 )
-TEMPORAL_MODALITIES = TEMPORAL_MODALITIES_V1 + DISOCCLUSION_MODALITIES_V2
+TEMPORAL_MODALITIES_V2 = TEMPORAL_MODALITIES_V1 + DISOCCLUSION_MODALITIES_V2
+GBUFFER_MODALITIES_V3 = (
+    "normal_world",
+    "base_color_linear",
+    "material_properties",
+    "gbuffer_valid",
+)
+GBUFFER_ATTRIBUTE_MODALITIES = frozenset(
+    modality for modality in GBUFFER_MODALITIES_V3 if modality != "gbuffer_valid"
+)
+# UE's deferred GBuffer is quantized and sparse pixels on shared raster/material
+# boundaries can select an adjacent representable value across process launches.
+# The contract remains exact for validity and all non-GBuffer structural rasters;
+# these narrow bounds make the known quantization edge visible and auditable.
+GBUFFER_REPLAY_TOLERANCES_V1 = {
+    "normal_world": {
+        "changedPixelFraction": 2.5e-4,
+        "meanAbs": 1.0e-5,
+        "p99Abs": 1.0e-6,
+        "maxAbs": 8.0e-2,
+    },
+    "base_color_linear": {
+        "changedPixelFraction": 2.0e-3,
+        "meanAbs": 5.0e-5,
+        "p99Abs": 1.0e-6,
+        "maxAbs": 2.5e-2,
+    },
+    "material_properties": {
+        "changedPixelFraction": 2.5e-3,
+        "meanAbs": 5.0e-6,
+        "p99Abs": 1.0e-6,
+        "maxAbs": 4.0e-3,
+    },
+}
+TEMPORAL_MODALITIES = TEMPORAL_MODALITIES_V2 + GBUFFER_MODALITIES_V3
 REFERENCE_MODALITIES = ("color_hr_reference_scene_hdr",)
 SCENE_CAPTURE_LR_COMPARISON_MODALITIES = ("color_lr_scene_capture_hdr",)
 HUDLESS_MODALITIES = ("color_main_view_hudless_after_tonemap",)
@@ -60,6 +94,7 @@ MASK_MODALITIES = {
     "history_rejection_valid",
     "disocclusion_mask",
     "disocclusion_valid",
+    "gbuffer_valid",
 }
 
 HISTORY_REJECTION_REASON_CODES_V2 = {
@@ -1046,6 +1081,115 @@ def validate_temporal_frame(
         },
         str(temporal.get("objectIdSource")),
     )
+
+    gbuffer_v3 = (
+        temporal.get("gbufferAttributeSource")
+        == "deferred_main_view_gbuffer_same_pixel_observed_at_after_dof"
+    )
+    if gbuffer_v3:
+        gbuffer_present = set(GBUFFER_MODALITIES_V3).issubset(pixels)
+        add_check(
+            checks,
+            f"{prefix}.gbuffer_modalities",
+            gbuffer_present,
+            "world normal, base color, material properties and validity",
+        )
+        if gbuffer_present:
+            normal = pixels["normal_world"]
+            base_color = pixels["base_color_linear"]
+            material = pixels["material_properties"]
+            gbuffer_valid = pixels["gbuffer_valid"][..., 0]
+            valid_gbuffer = gbuffer_valid == 1.0
+            invalid_gbuffer = ~valid_gbuffer
+            normal_length = np.linalg.norm(normal[..., :3], axis=-1)
+            has_valid_gbuffer = bool(np.any(valid_gbuffer))
+            normal_unit_error = (
+                float(np.max(np.abs(normal_length[valid_gbuffer] - 1.0)))
+                if has_valid_gbuffer
+                else math.inf
+            )
+            add_check(
+                checks,
+                f"{prefix}.gbuffer_contract",
+                bool(
+                    cvars.get("r.ForwardShading") == "0"
+                    and temporal.get("worldNormalSpace")
+                    == "unreal_world_left_handed_xyz_unit_vector"
+                    and temporal.get("baseColorSpace")
+                    == "linear_material_base_color_rgb"
+                    and temporal.get("materialPropertiesChannels")
+                    == "R_roughness_G_metallic_B_specular_A_valid"
+                    and temporal.get("gbufferValidity")
+                    == "one_for_finite_positive_scene_depth_zero_for_sky_or_no_opaque_surface"
+                    and temporal.get("gbufferReplayComparison")
+                    == "quantized_attribute_numeric_tolerance_v1_with_heatmap"
+                    and temporal.get("gbufferReplayKnownLimit")
+                    == "sparse_raster_and_material_quantization_boundary_pixels_are_not_promised_byte_exact"
+                ),
+                json.dumps(
+                    {
+                        key: temporal.get(key)
+                        for key in (
+                            "gbufferAttributeSource",
+                            "worldNormalSpace",
+                            "baseColorSpace",
+                            "materialPropertiesChannels",
+                            "gbufferValidity",
+                            "gbufferReplayComparison",
+                            "gbufferReplayKnownLimit",
+                        )
+                    },
+                    sort_keys=True,
+                ),
+            )
+            add_check(
+                checks,
+                f"{prefix}.gbuffer_validity_channels",
+                bool(
+                    np.array_equal(gbuffer_valid, depth_valid)
+                    and np.array_equal(normal[..., 3], gbuffer_valid)
+                    and np.array_equal(base_color[..., 3], gbuffer_valid)
+                    and np.array_equal(material[..., 3], gbuffer_valid)
+                    and has_valid_gbuffer
+                ),
+                f"valid_fraction={float(np.mean(valid_gbuffer)):.9g}",
+            )
+            add_check(
+                checks,
+                f"{prefix}.world_normal_unit_length",
+                bool(
+                    has_valid_gbuffer
+                    and normal_unit_error <= 1.0e-3
+                    and np.all(normal[..., :3][invalid_gbuffer] == 0.0)
+                ),
+                f"max_unit_error={normal_unit_error:.9g}",
+            )
+            add_check(
+                checks,
+                f"{prefix}.base_color_range",
+                bool(
+                    has_valid_gbuffer
+                    and np.all(
+                        (base_color[..., :3][valid_gbuffer] >= 0.0)
+                        & (base_color[..., :3][valid_gbuffer] <= 1.0)
+                    )
+                    and np.all(base_color[..., :3][invalid_gbuffer] == 0.0)
+                ),
+                f"min={float(np.min(base_color[..., :3][valid_gbuffer])) if has_valid_gbuffer else math.nan:.9g} max={float(np.max(base_color[..., :3][valid_gbuffer])) if has_valid_gbuffer else math.nan:.9g}",
+            )
+            add_check(
+                checks,
+                f"{prefix}.material_properties_range",
+                bool(
+                    has_valid_gbuffer
+                    and np.all(
+                        (material[..., :3][valid_gbuffer] >= 0.0)
+                        & (material[..., :3][valid_gbuffer] <= 1.0)
+                    )
+                    and np.all(material[..., :3][invalid_gbuffer] == 0.0)
+                ),
+                f"valid_pixels={int(np.count_nonzero(valid_gbuffer))}",
+            )
 
     valid = (depth_valid == 1.0) & (depth_device > 0.0)
     add_check(checks, f"{prefix}.valid_depth_present", bool(np.any(valid)), f"valid_fraction={float(np.mean(valid)):.9f}")
@@ -2263,8 +2407,18 @@ def validate(
         == "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
         for frame in frames
     )
+    gbuffer_attributes_v3 = temporal_enabled and any(
+        isinstance(frame.get("temporalDiagnostics"), dict)
+        and frame["temporalDiagnostics"].get("gbufferAttributeSource")
+        == "deferred_main_view_gbuffer_same_pixel_observed_at_after_dof"
+        for frame in frames
+    )
     active_temporal_modalities = (
-        TEMPORAL_MODALITIES if history_rejection_v2 else TEMPORAL_MODALITIES_V1
+        TEMPORAL_MODALITIES
+        if gbuffer_attributes_v3
+        else TEMPORAL_MODALITIES_V2
+        if history_rejection_v2
+        else TEMPORAL_MODALITIES_V1
     )
     main_view = bool(job.get("bCaptureMainViewTemporalDiagnostics", False))
     scene_capture_lr_comparison = bool(
@@ -3412,6 +3566,48 @@ def validate(
                             sort_keys=True,
                         ),
                     )
+
+                    if (
+                        temporal.get("gbufferReplayComparison")
+                        == "quantized_attribute_numeric_tolerance_v1_with_heatmap"
+                    ):
+                        expected_state_frame_index = (
+                            frame_id + phase_offset
+                        ) & 0xFFFFFFFF
+                        actual_state_frame_index = int(
+                            temporal.get("stateFrameIndex", -1)
+                        )
+                        add_check(
+                            checks,
+                            f"frame_{frame_id:06d}.logical_view_state_frame_index",
+                            temporal.get("viewStateFrameIndexLogicalFrameLocked")
+                            is True
+                            and temporal.get("viewStateFrameIndexSource")
+                            == "scene_view_override_logical_frame_plus_phase_mod_uint32"
+                            and int(
+                                temporal.get(
+                                    "expectedLogicalViewStateFrameIndex", -1
+                                )
+                            )
+                            == expected_state_frame_index
+                            and actual_state_frame_index
+                            == expected_state_frame_index
+                            and int(temporal.get("stateFrameIndexMod8", -1))
+                            == expected_state_frame_index % 8,
+                            json.dumps(
+                                {
+                                    "expected": expected_state_frame_index,
+                                    "actual": temporal.get("stateFrameIndex"),
+                                    "actualMod8": temporal.get(
+                                        "stateFrameIndexMod8"
+                                    ),
+                                    "source": temporal.get(
+                                        "viewStateFrameIndexSource"
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                        )
 
                 validate_temporal_frame(
                     checks,
@@ -5085,6 +5281,12 @@ def validate(
                         and float(metrics.get("psnrDb", -math.inf)) >= 45.0
                         and float(metrics.get("meanAbs", math.inf)) <= 2.0 / 255.0
                     )
+            elif modality in GBUFFER_ATTRIBUTE_MODALITIES:
+                limits = GBUFFER_REPLAY_TOLERANCES_V1[modality]
+                within_tolerance = bool(metrics.get("valid")) and all(
+                    float(metrics.get(metric_name, math.inf)) <= limit
+                    for metric_name, limit in limits.items()
+                )
             else:
                 within_tolerance = bool(metrics.get("valid")) and float(metrics.get("maxAbs", math.inf)) <= 1e-6
             add_check(
@@ -5193,7 +5395,7 @@ def validate(
         else "not_run"
     )
     report = {
-        "validatorVersion": 16,
+        "validatorVersion": 17,
         "comparisonMode": compare_mode if compare is not None else "none",
         "mainViewSceneCapturePixelDomainGate": pixel_domain_gate,
         "stableInstanceIdGate": stable_instance_gate,

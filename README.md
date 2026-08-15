@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.11.0-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.12.0-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,12 +11,12 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.11.0 deliberately separates implemented output from certified training contracts:
+Version 0.12.0 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
 | `spatial-sr-data-v1` | Certified | Same-state HR/LR PNG and SceneCapture depth baseline. |
-| Main View temporal buffers | Experimental, validated fixture | Real AfterDOF HDR, motion, depth, jitter, matrices, masks and reason-coded, validity-gated disocclusion/history rejection are captured. Cross-instance and static-depth decisions are independently reconstructed; uncertain dynamic same-instance pixels are rejected with validity zero. A same-stage Main View/native-LR SceneCapture pixel-domain gate passes, but `nr-sr-data-v2` remains disabled until every production gate passes. |
+| Main View temporal buffers | Experimental, validated fixture | Real AfterDOF HDR, motion, depth, jitter, matrices, masks, same-pixel deferred GBuffer attributes and reason-coded, validity-gated disocclusion/history rejection are captured. Cross-instance and static-depth decisions are independently reconstructed; uncertain dynamic same-instance pixels are rejected with validity zero. A same-stage Main View/native-LR SceneCapture pixel-domain gate passes, but `nr-sr-data-v2` remains disabled until every production gate passes. |
 | FG forward/reverse endpoint plus intermediate replay | Experimental, uncertified | `motion_1_to_0` and `motion_0_to_1` come from independent processes and assemble with a real `tau=0.5` frame. Controlled skinning/WPO fixtures, project AnimBP replay, project animated-material logical time, bidirectional skeletal disocclusion, independent UI RGBA and zero visible `UWidgetComponent` residue have passed. The checked project has no project-authored WPO asset, so that external-content gate remains open. |
 
 The plugin rejects `nr-sr-data-v2` and direct `nr-fg-data-v1` capture jobs. Missing fields are never filled with guesses. The experimental FG assembler emits `nr-fg-data-v1` only with `frameGenerationCertified=false` and an explicit `missingRequirements` list.
@@ -59,6 +59,10 @@ translucency_after_dof_raw/
 transparency_mask/
 reactive_mask/
 object_id/                             # Custom Stencil uint8; optional stable component IDs
+normal_world/                           # deferred Main View world normal XYZ, A=valid
+base_color_linear/                      # deferred material Base Color RGB, A=valid
+material_properties/                    # R=roughness G=metallic B=specular A=valid
+gbuffer_valid/                          # opaque finite-positive-depth validity
 ui_color_alpha/                        # independent display-size Slate/UMG RGBA PNG
 ```
 
@@ -85,6 +89,7 @@ The experimental v2 history-rejection/disocclusion policy first compares motion-
 - Portable skeletal pose-cache artifacts for exact project AnimBP forward/reverse endpoint replay.
 - A shipped validation-only WPO material with explicit current/previous world offsets through UE's `PreviousFrameSwitch`; vertex-deformation velocity output is forced and recorded for temporal jobs.
 - Logical-frame `FSceneViewFamily` game time with signed previous time for forward/reverse material animation; real time is frozen to keep real-time material inputs deterministic.
+- Logical-frame `FSceneView::OverrideFrameIndexValue` and output-frame index when jitter locking is enabled, so base-pass material dithering and stochastic View consumers do not inherit process-uptime frame counts.
 - Independent display-size Slate/UMG RGBA capture. Any visible registered world-space `UWidgetComponent` is rejected before and during capture so it cannot silently contaminate HUD-less color.
 - Persistent, isolated SceneCapture view state for native/reference HR and the real player Main View history for temporal inputs.
 - Atomic file/manifest writes, hashes, map guard, CVar provenance and unattended auto-exit.
@@ -202,7 +207,7 @@ python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
   --compare '.\Saved\SRDataset\run_a'
 ```
 
-The v14 validator requires exact provenance and temporal/native-HR/reference-HR/HUD-less/UI/semantic/streaming metadata. It independently reconstructs the scene-control report, stable instance-map SHA-1 and v2 disocclusion reason grids, checks every count and exact allowlist/ID record, and enforces the requested zero-unclassified and fixed-topology gates. It also verifies the effective material texture Mip bias, logical material time, signed reverse-time delta, zero visible `UWidgetComponent` residue and the optional Main View/SceneCapture pixel-domain contract. Geometry, depth, motion, masks and IDs must be numerically exact; color permits a narrow documented floating-point tolerance and writes heatmaps when hashes differ.
+Validator v17 requires exact provenance and temporal/native-HR/reference-HR/HUD-less/UI/semantic/streaming metadata. It independently reconstructs the scene-control report, stable instance-map SHA-1 and v2 disocclusion reason grids, checks every count and exact allowlist/ID record, and enforces the requested zero-unclassified and fixed-topology gates. It also verifies the effective material texture Mip bias, logical material time, signed reverse-time delta, logical View State frame index, zero visible `UWidgetComponent` residue and the optional Main View/SceneCapture pixel-domain contract. Geometry, depth, motion, validity, masks and IDs remain numerically exact. Color and the quantized deferred attributes use separate narrow numeric contracts and produce heatmaps whenever hashes differ; GBuffer validity itself remains exact.
 
 ### Main View / SceneCapture LR pixel-domain gate
 
@@ -283,7 +288,7 @@ python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateFrameGenerationD
 
 Both endpoint passes enable `r.MotionVectorSimulation=1`. The forward pass supplies the last captured component transforms and skeletal poses, while the reverse pass starts at `t1` and supplies those future transforms/poses when it captures `t0`; the two motion fields are never derived from each other. A portable `.srcache` artifact proves exact project AnimBP pose application in both directions. Reverse Sequencer evaluation currently jumps to absolute logical frames, so opaque event-driven state still requires an adapter or cache. The intermediate role allows exactly one capture per process in v1, preventing an earlier intermediate from remaining in the retained View State.
 
-FG jobs lock `r.TemporalAA.Debug.OverrideTemporalIndex` to a phase computed from the logical frame ID. This is a non-shipping diagnostic CVar; use a Development/Debug capture build. The assembler additionally requires the actual forward/reverse jitter, camera, exposure, depth, Object ID and validity raster grids to match at each endpoint before it accepts the pair.
+FG jobs lock `r.TemporalAA.Debug.OverrideTemporalIndex` to a phase computed from the logical frame ID and set the renderer-supported Scene View frame/output-frame overrides to the full logical frame plus phase. This is a non-shipping diagnostic CVar path; use a Development/Debug capture build. The assembler additionally requires the actual forward/reverse jitter, camera, exposure, depth, Object ID and validity raster grids to match at each endpoint before it accepts the pair.
 
 The assembler refuses unvalidated sources, mismatched engine/GPU/map/shader/CVar provenance, incorrect endpoint history, non-midpoint samples, missing files or hash mismatches. Its integrity validator prints `PASS (UNCERTIFIED)` until all declared FG requirements exist.
 
@@ -311,6 +316,8 @@ Actors spawned during capture are discovered and prepared before their first eva
 `color_hr_reference_scene_hdr` first renders at `HRResolution * ReferenceHRScale`, then downsamples to the fixed non-jittered HR grid. For example, a 1920x1080 HR target with scale 2 renders internally at 3840x2160 but still writes a 1920x1080 EXR.
 
 ## Verified release evidence
+
+Version 0.12.0 adds same-pixel deferred Main View GBuffer supervision and logical View State frame locking. The AfterDOF extraction now writes world normal, linear material Base Color, roughness/metallic/specular and an exact opaque-validity raster from the same input pixel used by HDR, depth, motion and IDs; temporal jobs reject Forward Shading because those attributes are unavailable under that renderer contract. Validator v17 checks every attribute alpha against `gbuffer_valid`, requires validity to equal `depth_valid`, enforces unit world normals and finite `[0,1]` material ranges, and records heatmaps for cross-process differences. UE compilation and the 1/1 job-validation automation passed. The stable-ID job passed 474/474 standalone checks and 735/735 two-process replay checks; the moving/VFX semantic fixture passed 583/583, strict controllable-state preflight passed 508/508, and the fixture-free `1920x1080`/`960x540` strict job passed 517/517. Both replay runs reported logical View State indices `0,1`; all GBuffer/depth validity pixels were exact, while sparse quantized attribute-boundary differences stayed below the independently enforced per-modality limits. Validator-v17 backward compatibility retained the v0.8 dataset at 379/379.
 
 Version 0.11.0 extends `SRDatasetControllable` with audited opaque-state provenance. `DatasetGetDeterministicState()` lets gameplay, third-party VFX or procedural systems contribute a canonical state serialization to the scene hash. Strict jobs reject empty contributions before rendering; frame metadata stores only the state SHA-1 and byte count. The transient semantic fixture supplies a changing canonical state and the strict scene-control job passed 462/462 validator-v16 checks with one controllable Actor, one state record, zero missing records and distinct hashes across its two logical frames. The same binary's fixture-free `1920x1080`/`960x540` strict capture passed 469/469 with zero uncontrolled preflight records and a valid empty controllable-state set.
 
