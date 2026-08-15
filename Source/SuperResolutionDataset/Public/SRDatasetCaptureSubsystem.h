@@ -7,6 +7,7 @@
 
 class ASRDatasetCaptureRig;
 class ASRDatasetValidationFixture;
+class ASRDatasetStateCacheValidationActor;
 class ACameraActor;
 class AActor;
 class APlayerController;
@@ -14,6 +15,7 @@ class ALevelSequenceActor;
 class FJsonValue;
 class ULevelSequencePlayer;
 class UNiagaraComponent;
+class UNiagaraSimCache;
 class UNiagaraSystem;
 class USceneComponent;
 class USkinnedMeshComponent;
@@ -125,6 +127,7 @@ private:
 
 	struct FNiagaraComponentState
 	{
+		FString CacheComponentPath;
 		uint8 AgeUpdateMode = 0;
 		int32 RandomSeedOffset = 0;
 		float SeekDelta = 0.0f;
@@ -132,6 +135,8 @@ private:
 		bool bForceSolo = false;
 		bool bLockSeekDelta = false;
 		bool bCanRenderWhileSeeking = true;
+		bool bHadSimCache = false;
+		bool bSimCacheReplaced = false;
 	};
 
 	struct FNiagaraSystemState
@@ -175,6 +180,58 @@ private:
 		FString ComponentClassPath;
 	};
 
+	struct FControllableStateCacheRecord
+	{
+		FString ActorPath;
+		FString ActorClassPath;
+		FString CanonicalState;
+		FString StateSha1;
+		int32 Utf8Bytes = 0;
+	};
+
+	struct FControllableStateCacheFrame
+	{
+		int32 LogicalFrame = INDEX_NONE;
+		FString AggregateSha1;
+		TArray<FControllableStateCacheRecord> Actors;
+	};
+
+	struct FControllableStateCacheFrameMetrics
+	{
+		int32 ActorCount = 0;
+		int32 AppliedActorCount = 0;
+		int32 VerifiedActorCount = 0;
+		int32 ChangedBeforeApplyActorCount = 0;
+		FString AggregateSha1;
+	};
+
+	struct FNiagaraSimCacheMetadata
+	{
+		FString ComponentPath;
+		FString AssetPath;
+		FString SerializedSha1;
+		int32 FrameCount = 0;
+		int32 CPUEmitterCount = 0;
+		int32 GPUEmitterCount = 0;
+		int64 CachedParticleSamples = 0;
+		int64 CachedGPUParticleSamples = 0;
+		bool bWriteBegun = false;
+		bool bWriteFinished = false;
+	};
+
+	struct FNiagaraSimCacheFrameMetrics
+	{
+		int32 CacheFrameIndex = INDEX_NONE;
+		int32 ComponentCount = 0;
+		int32 RecordedComponentCount = 0;
+		int32 AppliedComponentCount = 0;
+		int32 VerifiedComponentCount = 0;
+		int32 CPUEmitterCount = 0;
+		int32 GPUEmitterCount = 0;
+		int64 CachedParticleCount = 0;
+		int64 CachedGPUParticleCount = 0;
+	};
+
 	void HandleWorldPreActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	void HandleWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	void HandleWorldTickEnd(UWorld* World, ELevelTick TickType, float DeltaSeconds);
@@ -198,6 +255,17 @@ private:
 	void ApplyCachedSkeletalPoses(int32 FrameNumber);
 	bool LoadSkeletalPoseCacheArtifact(FString& OutError);
 	bool SaveSkeletalPoseCacheArtifact(FString& OutError);
+	bool PrepareControllableStateCacheValidation(FString& OutError);
+	void RestoreControllableStateCacheValidation();
+	bool CaptureControllableStateCacheFrame(int32 FrameNumber, FString& OutError);
+	bool ApplyControllableStateCacheFrame(int32 FrameNumber, FString& OutError);
+	bool LoadControllableStateCacheArtifact(FString& OutError);
+	bool SaveControllableStateCacheArtifact(FString& OutError);
+	static FString ComputeControllableStateCacheFrameSha1(const FControllableStateCacheFrame& Frame);
+	bool CaptureNiagaraSimCacheFrame(int32 FrameNumber, FString& OutError);
+	bool ValidateNiagaraSimCachePlaybackFrame(int32 FrameNumber, FString& OutError);
+	bool LoadNiagaraSimCacheArtifact(FString& OutError);
+	bool SaveNiagaraSimCacheArtifact(FString& OutError);
 	FString ResolveProjectFile(const FString& InPath) const;
 	void PositionNonFixtureSkeletalValidationActor();
 	bool PrepareProjectAnimatedMaterialValidation(FString& OutError);
@@ -233,7 +301,7 @@ private:
 	bool RunSceneControlPreflight(FString& OutError);
 	bool WriteSceneControlPreflightReport(FString& OutError) const;
 	static bool MatchesSceneControlClassRule(const FString& ClassPath, const TArray<FString>& Rules);
-	void DiscoverAndControlNiagara(float TimeSeconds);
+	bool DiscoverAndControlNiagara(float TimeSeconds, FString& OutError);
 	void FinalizeNiagaraForCapture();
 	void RestoreNiagara();
 	void NotifyControllablesPrepare();
@@ -295,6 +363,10 @@ private:
 	FString StreamingStateAfterBarrierSha1;
 	FString SkeletalPoseCacheArtifactSha1;
 	bool bSkeletalPoseCacheLoadedFromArtifact = false;
+	FString ControllableStateCacheArtifactSha1;
+	bool bControllableStateCacheLoadedFromArtifact = false;
+	FString NiagaraSimCacheArtifactSha1;
+	bool bNiagaraSimCacheLoadedFromArtifact = false;
 	FDelegateHandle PreActorTickHandle;
 	FDelegateHandle PostActorTickHandle;
 	FDelegateHandle WorldTickEndHandle;
@@ -304,6 +376,9 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<ASRDatasetValidationFixture> ValidationFixture;
+
+	UPROPERTY(Transient)
+	TObjectPtr<ASRDatasetStateCacheValidationActor> ControllableStateCacheValidationActor;
 
 	UPROPERTY(Transient)
 	TObjectPtr<ULevelSequencePlayer> SequencePlayer;
@@ -322,6 +397,12 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<class UMaterialInterface> ProjectAnimatedMaterialValidationInterface;
+
+	UPROPERTY(Transient)
+	TMap<FString, TObjectPtr<UNiagaraSimCache>> NiagaraSimCachesByComponentPath;
+
+	UPROPERTY(Transient)
+	TMap<FString, TObjectPtr<UNiagaraSimCache>> PreviousNiagaraSimCachesByComponentPath;
 
 	FString ProjectAnimatedMaterialValidationBasePath;
 
@@ -349,6 +430,10 @@ private:
 	TMap<TWeakObjectPtr<USceneComponent>, FTransform> LastCapturedEndpointTransforms;
 	TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState> LastCapturedEndpointBoneStates;
 	TMap<int32, TMap<TWeakObjectPtr<USkinnedMeshComponent>, FSkeletalEndpointState>> CachedSkeletalPoseFrames;
+	TMap<int32, FControllableStateCacheFrame> ControllableStateCacheFrames;
+	TMap<int32, FControllableStateCacheFrameMetrics> ControllableStateCacheFrameMetrics;
+	TMap<FString, FNiagaraSimCacheMetadata> NiagaraSimCacheMetadataByComponentPath;
+	TMap<int32, FNiagaraSimCacheFrameMetrics> NiagaraSimCacheFrameMetrics;
 	TMap<TWeakObjectPtr<USkinnedMeshComponent>, int32> NonFixtureSkeletalObjectIds;
 	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FPrimitiveStencilState> NonFixtureSkeletalStencilStates;
 	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FPrimitiveStencilState> StableInstanceStencilStates;

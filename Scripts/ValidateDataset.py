@@ -161,6 +161,17 @@ REPLAY_METADATA_FIELDS = (
     "stableInstanceIdActiveIds",
     "stableInstanceIdNewIds",
     "dynamicInstanceIdValidation",
+    "controllableStateCacheActorCount",
+    "controllableStateCacheFrameSha1",
+    "controllableStateCacheArtifactSha1",
+    "niagaraSimCacheFrameIndex",
+    "niagaraSimCacheComponentCount",
+    "niagaraSimCacheCPUEmitterCount",
+    "niagaraSimCacheGPUEmitterCount",
+    "niagaraSimCacheCachedParticleCount",
+    "niagaraSimCacheCachedGPUParticleCount",
+    "niagaraSimCacheArtifactSha1",
+    "niagaraSimCacheValidationEnabled",
     "sceneActorCount",
     "sceneComponentCount",
     "sceneSkeletalComponentCount",
@@ -274,9 +285,59 @@ def normalized_vfx_reverse_provenance(provenance: dict[str, Any]) -> dict[str, A
     return normalized
 
 
+def normalized_state_cache_job(job: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(job)
+    for field in (
+        "jobName",
+        "outputDirectory",
+        "controllableStateCacheInputFile",
+        "controllableStateCacheOutputFile",
+    ):
+        normalized.pop(field, None)
+    return normalized
+
+
+def normalized_state_cache_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(provenance)
+    normalized.pop("captureConfigSha1", None)
+    return normalized
+
+
+def normalized_niagara_cache_job(job: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(job)
+    for field in (
+        "jobName",
+        "outputDirectory",
+        "niagaraSimCacheInputFile",
+        "niagaraSimCacheOutputFile",
+    ):
+        normalized.pop(field, None)
+    return normalized
+
+
+def normalized_niagara_cache_provenance(
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(provenance)
+    normalized.pop("captureConfigSha1", None)
+    return normalized
+
+
 def niagara_fixture_state(frame: dict[str, Any]) -> dict[str, Any] | None:
     expected_asset = str(
         frame.get("semanticValidationFixture", {}).get("niagaraFixtureAsset", "")
+    )
+    for state in frame.get("niagaraFrameStates", []):
+        if isinstance(state, dict) and str(state.get("assetPath", "")) == expected_asset:
+            return state
+    return None
+
+
+def niagara_gpu_fixture_state(frame: dict[str, Any]) -> dict[str, Any] | None:
+    expected_asset = str(
+        frame.get("semanticValidationFixture", {}).get(
+            "niagaraGPUFixtureAsset", ""
+        )
     )
     for state in frame.get("niagaraFrameStates", []):
         if isinstance(state, dict) and str(state.get("assetPath", "")) == expected_asset:
@@ -306,6 +367,45 @@ def sha1(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest().upper()
+
+
+def sha1_text(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest().upper()
+
+
+def is_sha1_hex(value: Any) -> bool:
+    text = str(value or "")
+    return len(text) == 40 and all(
+        character in "0123456789ABCDEFabcdef" for character in text
+    )
+
+
+def project_root_for_dataset(dataset: Path) -> Path | None:
+    for candidate in (dataset.resolve(), *dataset.resolve().parents):
+        if any(candidate.glob("*.uproject")):
+            return candidate
+    return None
+
+
+def resolve_state_cache_artifact(dataset: Path, configured_path: str) -> Path | None:
+    if not configured_path:
+        return None
+    path = Path(configured_path)
+    if path.is_absolute():
+        return path.resolve()
+    project_root = project_root_for_dataset(dataset)
+    return (project_root / path).resolve() if project_root is not None else None
+
+
+def controllable_state_frame_sha1(frame: dict[str, Any]) -> str:
+    logical_frame = int(frame["logicalFrame"])
+    lines = [f"logicalFrame={logical_frame}"]
+    for actor in frame["actors"]:
+        lines.append(
+            f"{actor['actorPath']}|{actor['actorClassPath']}|"
+            f"sha1={actor['stateSha1']}|utf8Bytes={int(actor['utf8Bytes'])}"
+        )
+    return sha1_text("\n".join(lines))
 
 
 def png_size(path: Path) -> tuple[int, int]:
@@ -2753,6 +2853,459 @@ def validate(
             ),
             artifact_hash,
         )
+    state_cache_enabled = bool(job.get("bCacheControllableStatesForReplay", False))
+    state_cache_manifest = manifest.get("controllableStateCache", {})
+    if state_cache_enabled:
+        state_cache_input = str(job.get("controllableStateCacheInputFile") or "")
+        state_cache_output = str(job.get("controllableStateCacheOutputFile") or "")
+        expected_state_cache_mode = (
+            "apply_and_verify" if state_cache_input else "record"
+        )
+        configured_state_cache_path = state_cache_input or state_cache_output
+        state_cache_hash = str(state_cache_manifest.get("artifactSha1") or "").upper()
+        state_cache_path = resolve_state_cache_artifact(
+            dataset, configured_state_cache_path
+        )
+        valid_state_cache_hash = len(state_cache_hash) == 40 and all(
+            character in "0123456789ABCDEF" for character in state_cache_hash
+        )
+        add_check(
+            checks,
+            "controllable_state_cache.root_contract",
+            isinstance(state_cache_manifest, dict)
+            and state_cache_manifest.get("enabled") is True
+            and int(state_cache_manifest.get("schemaVersion", 0)) == 1
+            and state_cache_manifest.get("mode") == expected_state_cache_mode
+            and state_cache_manifest.get("artifactFile")
+            == configured_state_cache_path
+            and state_cache_manifest.get("loadedFromArtifact")
+            is (expected_state_cache_mode == "apply_and_verify")
+            and state_cache_manifest.get("rawCanonicalStateStored") is True
+            and state_cache_manifest.get("actorIdentity")
+            == "world_relative_actor_path_and_exact_class_path"
+            and state_cache_manifest.get("applicationPhase")
+            == "post_actor_tick_before_render_data_submission"
+            and state_cache_manifest.get("verification")
+            == "apply_return_true_then_byte_exact_state_readback"
+            and state_cache_manifest.get("validationFixtureEnabled")
+            is bool(job.get("bValidateControllableStateCache", False)),
+            json.dumps(state_cache_manifest, sort_keys=True),
+        )
+        actual_state_cache_hash = ""
+        if state_cache_path is not None and state_cache_path.is_file():
+            actual_state_cache_hash = sha1(state_cache_path)
+        add_check(
+            checks,
+            "controllable_state_cache.artifact_present_and_hash",
+            state_cache_path is not None
+            and state_cache_path.is_file()
+            and valid_state_cache_hash
+            and actual_state_cache_hash == state_cache_hash
+            and str(provenance.get("controllableStateCacheArtifactSha1", "")).upper()
+            == state_cache_hash,
+            f"path={state_cache_path} manifest={state_cache_hash} actual={actual_state_cache_hash}",
+        )
+        state_cache_artifact: dict[str, Any] = {}
+        artifact_frames_by_id: dict[int, dict[str, Any]] = {}
+        artifact_integrity = False
+        artifact_detail = "artifact unavailable"
+        try:
+            if state_cache_path is None:
+                raise ValueError("project root could not be resolved")
+            state_cache_artifact = json.loads(
+                state_cache_path.read_text(encoding="utf-8")
+            )
+            artifact_frames = state_cache_artifact.get("frames", [])
+            expected_frame_ids = list(
+                range(int(job.get("startFrame", 0)), int(job.get("endFrame", -1)) + 1)
+            )
+            artifact_frame_ids = [
+                int(frame.get("logicalFrame", -1)) for frame in artifact_frames
+            ]
+            header_valid = (
+                int(state_cache_artifact.get("schemaVersion", 0)) == 1
+                and state_cache_artifact.get("engineVersion")
+                == manifest.get("engineVersion")
+                and state_cache_artifact.get("world") == job.get("expectedMap")
+                and int(state_cache_artifact.get("startFrame", -1))
+                == int(job.get("startFrame", -2))
+                and int(state_cache_artifact.get("endFrame", -1))
+                == int(job.get("endFrame", -2))
+                and int(state_cache_artifact.get("captureFrameRateNumerator", 0))
+                == int(job.get("captureFrameRateNumerator", -1))
+                and int(state_cache_artifact.get("captureFrameRateDenominator", 0))
+                == int(job.get("captureFrameRateDenominator", -1))
+                and int(state_cache_artifact.get("randomSeed", -1))
+                == int(job.get("randomSeed", -2))
+                and int(state_cache_artifact.get("frameCount", -1))
+                == len(expected_frame_ids)
+                and state_cache_artifact.get("hashScope")
+                == "logical_frame_and_sorted_world_relative_actor_path_class_state_sha1_utf8_bytes"
+                and artifact_frame_ids == expected_frame_ids
+            )
+            records_valid = header_valid
+            for artifact_frame in artifact_frames:
+                frame_id = int(artifact_frame["logicalFrame"])
+                actors = artifact_frame.get("actors", [])
+                actor_paths = [str(actor.get("actorPath") or "") for actor in actors]
+                frame_valid = (
+                    bool(actors)
+                    and actor_paths == sorted(actor_paths)
+                    and len(actor_paths) == len(set(actor_paths))
+                )
+                for actor in actors:
+                    canonical_state = str(actor.get("canonicalState") or "")
+                    actor_hash = str(actor.get("stateSha1") or "").upper()
+                    frame_valid = frame_valid and bool(
+                        actor.get("actorPath")
+                        and actor.get("actorClassPath")
+                        and canonical_state
+                        and actor_hash == sha1_text(canonical_state)
+                        and int(actor.get("utf8Bytes", -1))
+                        == len(canonical_state.encode("utf-8"))
+                    )
+                calculated_frame_hash = controllable_state_frame_sha1(
+                    artifact_frame
+                )
+                frame_valid = frame_valid and calculated_frame_hash == str(
+                    artifact_frame.get("aggregateSha1") or ""
+                ).upper()
+                records_valid = records_valid and frame_valid
+                artifact_frames_by_id[frame_id] = artifact_frame
+            artifact_integrity = records_valid
+            artifact_detail = json.dumps(
+                {
+                    "headerValid": header_valid,
+                    "frameIds": artifact_frame_ids,
+                    "expectedFrameIds": expected_frame_ids,
+                    "recordsValid": records_valid,
+                },
+                sort_keys=True,
+            )
+        except Exception as exc:
+            artifact_detail = str(exc)
+        add_check(
+            checks,
+            "controllable_state_cache.artifact_schema_and_integrity",
+            artifact_integrity,
+            artifact_detail,
+        )
+        for frame in frames:
+            frame_id = int(frame.get("logicalFrameId", -1))
+            artifact_frame = artifact_frames_by_id.get(frame_id, {})
+            expected_actor_count = len(artifact_frame.get("actors", []))
+            expected_frame_hash = str(
+                artifact_frame.get("aggregateSha1") or ""
+            ).upper()
+            common_frame_contract = (
+                frame.get("controllableStateCacheEnabled") is True
+                and frame.get("controllableStateCacheMode")
+                == expected_state_cache_mode
+                and frame.get("controllableStateCacheApplicationPhase")
+                == "post_actor_tick_before_render_data_submission"
+                and int(frame.get("controllableStateCacheActorCount", -1))
+                == expected_actor_count
+                and expected_actor_count > 0
+                and str(frame.get("controllableStateCacheFrameSha1") or "").upper()
+                == expected_frame_hash
+                and str(frame.get("controllableStateCacheArtifactSha1") or "").upper()
+                == state_cache_hash
+                and frame.get("controllableStateCacheValidationEnabled")
+                is bool(job.get("bValidateControllableStateCache", False))
+            )
+            applied_count = int(
+                frame.get("controllableStateCacheAppliedActorCount", -1)
+            )
+            verified_count = int(
+                frame.get("controllableStateCacheVerifiedActorCount", -1)
+            )
+            changed_count = int(
+                frame.get("controllableStateCacheChangedBeforeApplyActorCount", -1)
+            )
+            if expected_state_cache_mode == "record":
+                mode_contract = (
+                    applied_count == 0
+                    and verified_count == 0
+                    and changed_count == 0
+                )
+            else:
+                mode_contract = (
+                    applied_count == expected_actor_count
+                    and verified_count == expected_actor_count
+                    and (
+                        changed_count > 0
+                        if job.get("bValidateControllableStateCache", False)
+                        else changed_count >= 0
+                    )
+                )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.controllable_state_cache",
+                common_frame_contract and mode_contract,
+                json.dumps(
+                    {
+                        "mode": frame.get("controllableStateCacheMode"),
+                        "actors": expected_actor_count,
+                        "applied": applied_count,
+                        "verified": verified_count,
+                        "changedBeforeApply": changed_count,
+                        "frameSha1": frame.get("controllableStateCacheFrameSha1"),
+                    },
+                    sort_keys=True,
+                ),
+            )
+    niagara_cache_enabled = bool(job.get("bCacheNiagaraSimForReplay", False))
+    niagara_cache_manifest = manifest.get("niagaraSimCache", {})
+    if niagara_cache_enabled:
+        niagara_cache_input = str(job.get("niagaraSimCacheInputFile") or "")
+        niagara_cache_output = str(job.get("niagaraSimCacheOutputFile") or "")
+        expected_niagara_cache_mode = (
+            "apply_and_verify" if niagara_cache_input else "record"
+        )
+        configured_niagara_cache_path = (
+            niagara_cache_input or niagara_cache_output
+        )
+        niagara_cache_hash = str(
+            niagara_cache_manifest.get("artifactSha1") or ""
+        ).upper()
+        niagara_cache_path = resolve_state_cache_artifact(
+            dataset, configured_niagara_cache_path
+        )
+        niagara_components = niagara_cache_manifest.get("components", [])
+        if not isinstance(niagara_components, list):
+            niagara_components = []
+        expected_niagara_frame_count = (
+            int(job.get("endFrame", -1)) - int(job.get("startFrame", 0)) + 1
+        )
+        component_paths = [
+            str(component.get("componentPath") or "")
+            for component in niagara_components
+            if isinstance(component, dict)
+        ]
+        root_cpu_emitters = 0
+        root_gpu_emitters = 0
+        root_cached_particles = 0
+        root_cached_gpu_particles = 0
+        component_records_valid = (
+            bool(niagara_components)
+            and len(component_paths) == len(niagara_components)
+            and component_paths == sorted(component_paths)
+            and len(component_paths) == len(set(component_paths))
+        )
+        for component in niagara_components:
+            if not isinstance(component, dict):
+                component_records_valid = False
+                continue
+            cpu_emitters = int(component.get("cpuEmitterCount", -1))
+            gpu_emitters = int(component.get("gpuEmitterCount", -1))
+            cached_particles = int(component.get("cachedParticleSamples", -1))
+            cached_gpu_particles = int(
+                component.get("cachedGPUParticleSamples", -1)
+            )
+            root_cpu_emitters += max(cpu_emitters, 0)
+            root_gpu_emitters += max(gpu_emitters, 0)
+            root_cached_particles += max(cached_particles, 0)
+            root_cached_gpu_particles += max(cached_gpu_particles, 0)
+            component_records_valid = component_records_valid and bool(
+                component.get("componentPath")
+                and component.get("assetPath")
+                and is_sha1_hex(component.get("serializedSha1"))
+                and int(component.get("frameCount", -1))
+                == expected_niagara_frame_count
+                and cpu_emitters >= 0
+                and gpu_emitters >= 0
+                and cpu_emitters + gpu_emitters > 0
+                and cached_particles > 0
+                and 0 <= cached_gpu_particles <= cached_particles
+                and (gpu_emitters == 0 or cached_gpu_particles > 0)
+                and (gpu_emitters > 0 or cached_gpu_particles == 0)
+                and component.get("writeFinished") is True
+            )
+        if job.get("bValidateNiagaraSimCache", False):
+            component_records_valid = component_records_valid and (
+                root_cpu_emitters > 0
+                and root_gpu_emitters > 0
+                and root_cached_particles > 0
+                and root_cached_gpu_particles > 0
+            )
+        add_check(
+            checks,
+            "niagara_sim_cache.root_contract",
+            isinstance(niagara_cache_manifest, dict)
+            and niagara_cache_manifest.get("enabled") is True
+            and int(niagara_cache_manifest.get("schemaVersion", 0)) == 1
+            and niagara_cache_manifest.get("mode")
+            == expected_niagara_cache_mode
+            and niagara_cache_manifest.get("artifactFile")
+            == configured_niagara_cache_path
+            and niagara_cache_manifest.get("loadedFromArtifact")
+            is (expected_niagara_cache_mode == "apply_and_verify")
+            and int(niagara_cache_manifest.get("componentCount", -1))
+            == len(niagara_components)
+            and niagara_cache_manifest.get("attributeCaptureMode") == "all"
+            and niagara_cache_manifest.get("allowRebasing") is False
+            and niagara_cache_manifest.get("allowInterpolation") is False
+            and niagara_cache_manifest.get("dataInterfaceCaching") is False
+            and niagara_cache_manifest.get("largeCacheBulkDataSerialization")
+            is False
+            and niagara_cache_manifest.get("gpuCaptureReadback")
+            == "UNiagaraSimCache_FNiagaraDataSetReadback_ImmediateReadback"
+            and niagara_cache_manifest.get("identityContract")
+            == "exact_world_relative_component_path_system_asset_emitter_target_and_fixed_topology"
+            and niagara_cache_manifest.get("applicationPhase")
+            == "world_tick_end_after_niagara_finalize_before_dataset_render_submission"
+            and niagara_cache_manifest.get("validationFixtureEnabled")
+            is bool(job.get("bValidateNiagaraSimCache", False)),
+            json.dumps(niagara_cache_manifest, sort_keys=True),
+        )
+        add_check(
+            checks,
+            "niagara_sim_cache.component_records",
+            component_records_valid,
+            json.dumps(
+                {
+                    "componentCount": len(niagara_components),
+                    "componentPaths": component_paths,
+                    "cpuEmitters": root_cpu_emitters,
+                    "gpuEmitters": root_gpu_emitters,
+                    "cachedParticleSamples": root_cached_particles,
+                    "cachedGPUParticleSamples": root_cached_gpu_particles,
+                    "expectedFrameCount": expected_niagara_frame_count,
+                },
+                sort_keys=True,
+            ),
+        )
+        actual_niagara_cache_hash = ""
+        artifact_header_valid = False
+        artifact_header_detail = "artifact unavailable"
+        if niagara_cache_path is not None and niagara_cache_path.is_file():
+            actual_niagara_cache_hash = sha1(niagara_cache_path)
+            try:
+                with niagara_cache_path.open("rb") as stream:
+                    header = stream.read(8)
+                if len(header) == 8:
+                    magic, version = struct.unpack("<II", header)
+                    artifact_header_valid = magic == 0x53524E43 and version == 1
+                    artifact_header_detail = (
+                        f"magic=0x{magic:08X} version={version} bytes="
+                        f"{niagara_cache_path.stat().st_size}"
+                    )
+                else:
+                    artifact_header_detail = f"header_bytes={len(header)}"
+            except OSError as exc:
+                artifact_header_detail = str(exc)
+        add_check(
+            checks,
+            "niagara_sim_cache.artifact_present_header_and_hash",
+            niagara_cache_path is not None
+            and niagara_cache_path.is_file()
+            and is_sha1_hex(niagara_cache_hash)
+            and actual_niagara_cache_hash == niagara_cache_hash
+            and str(
+                provenance.get("niagaraSimCacheArtifactSha1", "")
+            ).upper()
+            == niagara_cache_hash
+            and artifact_header_valid,
+            f"path={niagara_cache_path} manifest={niagara_cache_hash} "
+            f"actual={actual_niagara_cache_hash} {artifact_header_detail}",
+        )
+        frame_cached_particles = 0
+        frame_cached_gpu_particles = 0
+        for frame in frames:
+            frame_id = int(frame.get("logicalFrameId", -1))
+            expected_frame_index = frame_id - int(job.get("startFrame", 0))
+            cached_particles = int(
+                frame.get("niagaraSimCacheCachedParticleCount", -1)
+            )
+            cached_gpu_particles = int(
+                frame.get("niagaraSimCacheCachedGPUParticleCount", -1)
+            )
+            frame_cached_particles += max(cached_particles, 0)
+            frame_cached_gpu_particles += max(cached_gpu_particles, 0)
+            common_frame_contract = (
+                frame.get("niagaraSimCacheEnabled") is True
+                and frame.get("niagaraSimCacheMode")
+                == expected_niagara_cache_mode
+                and frame.get("niagaraSimCacheApplicationPhase")
+                == "world_tick_end_after_niagara_finalize_before_any_dataset_render_submission"
+                and int(frame.get("niagaraSimCacheFrameIndex", -1))
+                == expected_frame_index
+                and int(frame.get("niagaraSimCacheComponentCount", -1))
+                == len(niagara_components)
+                and int(frame.get("niagaraSimCacheCPUEmitterCount", -1))
+                == root_cpu_emitters
+                and int(frame.get("niagaraSimCacheGPUEmitterCount", -1))
+                == root_gpu_emitters
+                and cached_particles > 0
+                and 0 <= cached_gpu_particles <= cached_particles
+                and str(frame.get("niagaraSimCacheArtifactSha1") or "").upper()
+                == niagara_cache_hash
+                and frame.get("niagaraSimCacheValidationEnabled")
+                is bool(job.get("bValidateNiagaraSimCache", False))
+            )
+            recorded_count = int(
+                frame.get("niagaraSimCacheRecordedComponentCount", -1)
+            )
+            applied_count = int(
+                frame.get("niagaraSimCacheAppliedComponentCount", -1)
+            )
+            verified_count = int(
+                frame.get("niagaraSimCacheVerifiedComponentCount", -1)
+            )
+            if expected_niagara_cache_mode == "record":
+                mode_contract = (
+                    recorded_count == len(niagara_components)
+                    and applied_count == 0
+                    and verified_count == 0
+                )
+            else:
+                mode_contract = (
+                    recorded_count == 0
+                    and applied_count == len(niagara_components)
+                    and verified_count == len(niagara_components)
+                )
+            fixture_contract = True
+            if job.get("bValidateNiagaraSimCache", False):
+                cpu_fixture = niagara_fixture_state(frame)
+                gpu_fixture = niagara_gpu_fixture_state(frame)
+                fixture_contract = bool(
+                    cpu_fixture
+                    and int(cpu_fixture.get("cpuEmitterCount", 0)) > 0
+                    and int(cpu_fixture.get("particleCount", 0)) > 0
+                    and gpu_fixture
+                    and int(gpu_fixture.get("gpuEmitterCount", 0)) > 0
+                    and int(gpu_fixture.get("particleCount", 0)) > 0
+                    and cached_gpu_particles > 0
+                )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.niagara_sim_cache",
+                common_frame_contract and mode_contract and fixture_contract,
+                json.dumps(
+                    {
+                        "mode": frame.get("niagaraSimCacheMode"),
+                        "frameIndex": frame.get("niagaraSimCacheFrameIndex"),
+                        "components": len(niagara_components),
+                        "recorded": recorded_count,
+                        "applied": applied_count,
+                        "verified": verified_count,
+                        "cpuEmitters": frame.get("niagaraSimCacheCPUEmitterCount"),
+                        "gpuEmitters": frame.get("niagaraSimCacheGPUEmitterCount"),
+                        "cachedParticles": cached_particles,
+                        "cachedGPUParticles": cached_gpu_particles,
+                        "fixtureContract": fixture_contract,
+                    },
+                    sort_keys=True,
+                ),
+            )
+        add_check(
+            checks,
+            "niagara_sim_cache.aggregate_particle_samples",
+            frame_cached_particles == root_cached_particles
+            and frame_cached_gpu_particles == root_cached_gpu_particles,
+            f"frames={frame_cached_particles}/{frame_cached_gpu_particles} "
+            f"components={root_cached_particles}/{root_cached_gpu_particles}",
+        )
     streaming_hash = str(provenance.get("streamingStateAfterBarrierSha1", ""))
     valid_streaming_hash = len(streaming_hash) == 40 and all(
         character in "0123456789ABCDEFabcdef" for character in streaming_hash
@@ -4906,6 +5459,113 @@ def validate(
                 normalized_provenance_match,
                 "exact after normalization" if normalized_provenance_match else "normalized provenance differs",
             )
+        elif compare_mode == "state-cache":
+            other_state_cache = other.get("controllableStateCache", {})
+            state_cache_roles_valid = {
+                str(state_cache_manifest.get("mode") or ""),
+                str(other_state_cache.get("mode") or ""),
+            } == {"record", "apply_and_verify"}
+            state_cache_hash_exact = (
+                str(state_cache_manifest.get("artifactSha1") or "").upper()
+                == str(other_state_cache.get("artifactSha1") or "").upper()
+                and len(str(state_cache_manifest.get("artifactSha1") or "")) == 40
+            )
+            normalized_jobs_match = normalized_state_cache_job(
+                job
+            ) == normalized_state_cache_job(other_job)
+            normalized_provenance_match = normalized_state_cache_provenance(
+                provenance
+            ) == normalized_state_cache_provenance(other.get("provenance", {}))
+            add_check(
+                checks,
+                "state_cache.record_apply_roles",
+                state_cache_roles_valid,
+                f"left={state_cache_manifest.get('mode')} right={other_state_cache.get('mode')}",
+            )
+            add_check(
+                checks,
+                "state_cache.artifact_hash_exact",
+                state_cache_hash_exact,
+                f"left={state_cache_manifest.get('artifactSha1')} right={other_state_cache.get('artifactSha1')}",
+            )
+            add_check(
+                checks,
+                "state_cache.jobs_equal_except_identity_output_and_cache_role",
+                normalized_jobs_match,
+                "exact after normalization"
+                if normalized_jobs_match
+                else "normalized jobs differ",
+            )
+            add_check(
+                checks,
+                "state_cache.provenance_equal_except_config_hash",
+                normalized_provenance_match,
+                "exact after normalization"
+                if normalized_provenance_match
+                else "normalized provenance differs",
+            )
+        elif compare_mode == "niagara-cache":
+            other_niagara_cache = other.get("niagaraSimCache", {})
+            niagara_cache_roles_valid = {
+                str(niagara_cache_manifest.get("mode") or ""),
+                str(other_niagara_cache.get("mode") or ""),
+            } == {"record", "apply_and_verify"}
+            niagara_cache_hash_exact = (
+                str(niagara_cache_manifest.get("artifactSha1") or "").upper()
+                == str(other_niagara_cache.get("artifactSha1") or "").upper()
+                and is_sha1_hex(niagara_cache_manifest.get("artifactSha1"))
+            )
+            niagara_cache_components_exact = (
+                niagara_cache_manifest.get("components")
+                == other_niagara_cache.get("components")
+                and bool(niagara_cache_manifest.get("components"))
+            )
+            normalized_jobs_match = normalized_niagara_cache_job(
+                job
+            ) == normalized_niagara_cache_job(other_job)
+            normalized_provenance_match = normalized_niagara_cache_provenance(
+                provenance
+            ) == normalized_niagara_cache_provenance(
+                other.get("provenance", {})
+            )
+            add_check(
+                checks,
+                "niagara_cache.record_apply_roles",
+                niagara_cache_roles_valid,
+                f"left={niagara_cache_manifest.get('mode')} "
+                f"right={other_niagara_cache.get('mode')}",
+            )
+            add_check(
+                checks,
+                "niagara_cache.artifact_hash_exact",
+                niagara_cache_hash_exact,
+                f"left={niagara_cache_manifest.get('artifactSha1')} "
+                f"right={other_niagara_cache.get('artifactSha1')}",
+            )
+            add_check(
+                checks,
+                "niagara_cache.component_payload_metadata_exact",
+                niagara_cache_components_exact,
+                "exact"
+                if niagara_cache_components_exact
+                else "component payload metadata differs",
+            )
+            add_check(
+                checks,
+                "niagara_cache.jobs_equal_except_identity_output_and_cache_role",
+                normalized_jobs_match,
+                "exact after normalization"
+                if normalized_jobs_match
+                else "normalized jobs differ",
+            )
+            add_check(
+                checks,
+                "niagara_cache.provenance_equal_except_config_hash",
+                normalized_provenance_match,
+                "exact after normalization"
+                if normalized_provenance_match
+                else "normalized provenance differs",
+            )
         else:
             add_check(
                 checks,
@@ -5573,7 +6233,7 @@ def validate(
         else "not_run"
     )
     report = {
-        "validatorVersion": 18,
+        "validatorVersion": 20,
         "comparisonMode": compare_mode if compare is not None else "none",
         "mainViewSceneCapturePixelDomainGate": pixel_domain_gate,
         "stableInstanceIdGate": stable_instance_gate,
@@ -5600,6 +6260,16 @@ def validate(
             else "fail" if compare is not None and compare_mode == "material-reverse"
             else "not_run"
         ),
+        "controllableStateCacheReplayGate": (
+            "pass" if compare is not None and compare_mode == "state-cache" and passed
+            else "fail" if compare is not None and compare_mode == "state-cache"
+            else "not_run"
+        ),
+        "niagaraSimCacheReplayGate": (
+            "pass" if compare is not None and compare_mode == "niagara-cache" and passed
+            else "fail" if compare is not None and compare_mode == "niagara-cache"
+            else "not_run"
+        ),
         "dataset": str(dataset.resolve()),
         "contractVersion": manifest.get("contractVersion"),
         "certificationStatus": manifest.get("certificationStatus"),
@@ -5612,7 +6282,7 @@ def validate(
         "statistics": stats,
         "datasetProfile": dataset_profile,
         "replayMetrics": replay_metrics,
-        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. Scene-control preflight evidence inventories and hashes ticking Actors/components, loaded Niagara Data Interfaces and known time/random material inputs; strict jobs reject every unclassified record. The optional Main View/SceneCapture LR gate compares the same AfterDOF linear-HDR stage after independent pre-exposure normalization and metadata-defined subpixel jitter alignment, without an extra render submission or simulation advance. Stable instance-ID jobs finalize a fixed renderable-component topology after warmup/streaming, assign collision-free uint8 Custom Stencil IDs, hash an ID-to-component/Actor/class map, fail on topology or label drift and verify that every nonzero raster value resolves through that map; the 255-instance/fixed-topology limit remains explicit. Disocclusion v2 independently reconstructs every non-reset reason from current motion/depth/ID plus the previous saved depth/ID buffers; cross-instance and static-depth decisions are valid, while dynamic same-instance or unlabeled motion is conservatively rejected with validity zero. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU Niagara particle counts and a visible AfterDOF VFX probe. The non-fixture skeletal gate requires a visible project-authored Actor and AnimBP, exact application of the shared cached pose and covered endpoint motion; skeletal-reverse requires exact absolute project poses, camera metadata and object-ID grids, tightly bounded depth-grid differences, and independent directional motion evidence. GPU particle payload readback, generalized actor-state recording, dynamic same-instance surface identity and Main View/reference-HR pixel equivalence remain separate gates.",
+        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. Scene-control preflight evidence inventories and hashes ticking Actors/components, loaded Niagara Data Interfaces and known time/random material inputs; strict jobs reject every unclassified record. The optional Main View/SceneCapture LR gate compares the same AfterDOF linear-HDR stage after independent pre-exposure normalization and metadata-defined subpixel jitter alignment, without an extra render submission or simulation advance. Stable instance-ID jobs finalize a fixed renderable-component topology after warmup/streaming, assign collision-free uint8 Custom Stencil IDs, hash an ID-to-component/Actor/class map, fail on topology or label drift and verify that every nonzero raster value resolves through that map; the uint8/per-component limits remain explicit. Disocclusion v2 independently reconstructs every non-reset reason from current motion/depth/ID plus the previous saved depth/ID buffers; cross-instance and static-depth decisions are valid, while dynamic same-instance or unlabeled motion is conservatively rejected with validity zero. Explicit controllable-state cache jobs store integration-owned canonical payloads by logical frame, apply them after Actor ticks, require byte-exact state readback and compare the restored scene plus images/depth against the recording process; ordinary manifests still persist only state hashes and byte counts. Native Niagara Sim Cache jobs record every attribute for fixed-topology CPU and GPU emitters, perform immediate GPU readback, serialize exact component/system identities and verify record/apply payload metrics plus rendered outputs; custom Niagara Data Interface storage remains disabled and must pass preflight classification. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU/GPU Niagara particle counts and visible AfterDOF VFX probes. Chaos solver cache, dynamic same-instance surface identity and Main View/reference-HR pixel equivalence remain separate gates.",
     }
     return report, passed
 
@@ -5623,7 +6293,7 @@ def main() -> int:
     parser.add_argument("--compare", type=Path, help="Second dataset directory or manifest for deterministic hash comparison")
     parser.add_argument(
         "--compare-mode",
-        choices=("exact-replay", "capture-order", "vfx-reverse", "skeletal-reverse", "material-reverse"),
+        choices=("exact-replay", "capture-order", "vfx-reverse", "skeletal-reverse", "material-reverse", "state-cache", "niagara-cache"),
         default="exact-replay",
         help="Comparison contract. Reverse modes compare forward/reverse endpoint roles at identical absolute times.",
     )
@@ -5635,6 +6305,8 @@ def main() -> int:
         "vfx-reverse",
         "skeletal-reverse",
         "material-reverse",
+        "state-cache",
+        "niagara-cache",
     ) and args.compare is None:
         parser.error(f"--compare-mode {args.compare_mode} requires --compare")
 

@@ -341,6 +341,39 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	FString SkeletalPoseCacheOutputFile;
 
 	/**
+	 * Capture or restore the canonical private state of every
+	 * SRDatasetControllable Actor on every logical frame. The artifact contains
+	 * the raw state strings, not only their hashes, and must therefore be handled
+	 * with the same privacy policy as project gameplay saves.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|State Cache")
+	bool bCacheControllableStatesForReplay = false;
+
+	/** Portable state-cache artifact loaded and applied after Actor ticks. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|State Cache", meta = (EditCondition = "bCacheControllableStatesForReplay"))
+	FString ControllableStateCacheInputFile;
+
+	/** Portable state-cache artifact written after a complete Standard replay. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|State Cache", meta = (EditCondition = "bCacheControllableStatesForReplay"))
+	FString ControllableStateCacheOutputFile;
+
+	/**
+	 * Record or replay every controlled Niagara component through UE's native
+	 * full-attribute Sim Cache. The binary artifact contains particle/system
+	 * buffers, including GPU readback data, and must be treated as project data.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Niagara Sim Cache")
+	bool bCacheNiagaraSimForReplay = false;
+
+	/** Native Niagara Sim Cache bundle loaded before deterministic replay. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Niagara Sim Cache", meta = (EditCondition = "bCacheNiagaraSimForReplay"))
+	FString NiagaraSimCacheInputFile;
+
+	/** Native Niagara Sim Cache bundle written after a complete Standard replay. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Niagara Sim Cache", meta = (EditCondition = "bCacheNiagaraSimForReplay"))
+	FString NiagaraSimCacheOutputFile;
+
+	/**
 	 * Bind the non-shipping Temporal AA/TSR jitter phase to logical frame ID.
 	 * Required by FG replay so forward, reverse and intermediate processes sample
 	 * the same logical frame on the same raster grid.
@@ -399,6 +432,17 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	/** Spawn a renderable component on frame 1 and remove it on frame 2 to prove dynamic ID allocation/release. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bAllowDynamicInstanceIdTopology"))
 	bool bValidateDynamicInstanceIdTopology = false;
+
+	/**
+	 * Spawn a private-state render probe whose process-local state differs before
+	 * cache application, proving that replay restores rather than merely observes.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheControllableStatesForReplay"))
+	bool bValidateControllableStateCache = false;
+
+	/** Spawn CPU and GPU Niagara probes and require native Sim Cache record/apply evidence. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheNiagaraSimForReplay"))
+	bool bValidateNiagaraSimCache = false;
 
 	/** Assign temporary Custom Stencil IDs to non-fixture skeletal components and require their production-scene pose/motion gate. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheSkeletalAnimationPosesForReplay"))

@@ -57,7 +57,9 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Add static/camera-only/object-only/mixed-motion and four-quadrant jitter-sign fixtures.
 - [x] Add a hashed strict preflight scanner for every registered ticking Actor/component, loaded Niagara Data Interface and known time/per-instance/particle-random material input.
 - [x] Let every `SRDatasetControllable` contribute a canonical opaque-state digest; strict jobs reject empty state before the selected render and include hashes in scene replay provenance.
-- [ ] Add Niagara Sim Cache, Chaos cache and an actor-state recorder for non-Sequencer gameplay.
+- [x] Add a portable logical-frame state recorder/replayer for adapter-owned `SRDatasetControllable` gameplay and third-party VFX state, with post-tick apply plus byte-exact readback.
+- [x] Add native fixed-topology Niagara CPU/GPU Sim Cache recording/replay with all-attribute capture, immediate GPU readback, exact topology/payload hashes and a dedicated two-process validator gate.
+- [ ] Add a Chaos internal solver-state cache adapter and project physics fixture.
 
 The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`. Certification stays false until every unchecked mandatory FG item above is implemented and validated.
 
@@ -151,7 +153,7 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - Report-only smoke capture passed 56/56 validator-v11 checks and exposed every unclassified project Tick source without blocking migration.
 - Strict First Person fixture captured two frames and passed 408/408 checks with zero unclassified records; its report contains 4 exact audited Actor classes, 5 audited ticking component instances and 8 subsystem-controlled components.
 - The negative strict fixture stopped at zero samples, retained its violation report/failed manifest, and the runner returned exit code 1 based on manifest state.
-- This closes the scanner/evidence gate, not the adapter gap: generalized actor-state recording, Niagara Sim Cache, Chaos cache and project-authored WPO validation remain open.
+- This closes the scanner/evidence gate; version 0.14 later closes adapter-owned actor-state recording, while automatic Niagara Sim Cache, Chaos cache and project-authored WPO validation remain open.
 
 ## Version 0.7.0 Main View / SceneCapture pixel-domain snapshot
 
@@ -208,3 +210,20 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - A real transient `UStaticMeshComponent` appeared on frame 1 and was destroyed on frame 2. The map grew from 60 to 61; active counts were `60 -> 61 -> 60`, new IDs were `[] -> [61] -> []`, and ID 61 appeared in the raster only while active.
 - Validator v18 passed 694/694 standalone and 1099/1099 two-process replay checks. Fixed-topology regression remained 474/474 and retained v0.8 data passed 379/379.
 - The carrier remains uint8 and component-scoped. More than 255 lifetime identities and same-component per-surface self-occlusion remain explicit open requirements.
+
+## Version 0.14.0 controllable state-cache snapshot
+
+- `DatasetApplyDeterministicState()` complements the existing canonical state getter. Cache recording stores every logical frame in a schema-v1 JSON artifact with raw payload, world-relative Actor/class identity, per-payload SHA-1/UTF-8 size and per-frame aggregate SHA-1.
+- Replay applies state after Actor ticks and before render-data submission, rejects Actor topology/class drift or an unimplemented/failed apply callback, then requires byte-exact state readback. Recording is deliberately Standard-only and non-resumable.
+- A validation Actor uses a process-local private value to move a visible cube. Both replay frames proved that state differed before apply, then matched the recorded payload and scene hash after apply.
+- Validator v19 passed 93/93 for the record dataset, 93/93 for the replay dataset and 277/277 for the dedicated cross-process `state-cache` comparison, including HR/LR/depth.
+- Ordinary manifests still contain only state hashes/byte counts. The explicit cache artifact contains raw project-private state and must follow save-data privacy policy. At this release the native Niagara GPU Sim Cache and Chaos solver caches remained open; v0.15 closes the declared Niagara path.
+
+## Version 0.15.0 native Niagara CPU/GPU Sim Cache snapshot
+
+- `bCacheNiagaraSimForReplay` records every logical frame into one `UNiagaraSimCache` per active component. The path uses all-attribute capture, immediate `FNiagaraDataSetReadback` for GPU emitters, no rebase/interpolation/extrapolation, no custom Data Interface storage and fixed component/system/emitter topology.
+- The atomic schema-v1 binary binds exact engine, world, policy, frame range, rational rate and seed. Each sorted component record carries system identity, CPU/GPU emitter counts, cumulative particle samples, serialized payload SHA-1 and a bounded payload; replay rejects header, topology, asset, hash, frame-count or age drift before rendering.
+- A generated UE 5.7 validation asset provides a real GPUComputeSim emitter alongside the CPU fixture. The two-frame recording captured 1,024 particles per frame, including 512 GPU particles; replay applied and verified both components on both frames from the same 287,461-byte artifact.
+- Validator v20 passed 522/522 recording, 522/522 replay and 819/819 dedicated `niagara-cache` comparison checks. Existing semantic, dynamic-ID, fixed-ID and controllable-state gates retained 583/583, 694/694, 474/474 and 293/293 checks respectively.
+- Repeating the live recording kept the CPU payload byte-identical but changed the GPU payload SHA-1 and a small set of translucent pixels within numeric bounds. The supported deterministic workflow therefore preserves one reviewed artifact and replays it; byte-identical GPUComputeSim re-recording is not claimed.
+- This closes replay of one native fixed-topology CPU/GPU Niagara state for the exact no-custom-DI policy. External/live Data Interface resources, arbitrary topology, long-cache bulk serialization, byte-identical GPU re-simulation and Chaos solver state remain open.

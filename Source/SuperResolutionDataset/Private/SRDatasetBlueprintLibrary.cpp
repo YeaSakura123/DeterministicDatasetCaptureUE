@@ -60,6 +60,7 @@ bool USRDatasetBlueprintLibrary::GenerateValidationNiagaraSystemAsset(
 	const FString& SystemPackagePath,
 	const FString& EmitterAssetPath,
 	const int32 RandomSeed,
+	const bool bUseGPUSimulation,
 	FString& OutError)
 {
 #if WITH_EDITOR
@@ -116,7 +117,9 @@ bool USRDatasetBlueprintLibrary::GenerateValidationNiagaraSystemAsset(
 			EmitterData->bDeterminism = true;
 			EmitterData->RandomSeed = static_cast<int32>(HashCombineFast(
 				static_cast<uint32>(RandomSeed), GetTypeHash(Handle.GetId())));
-			EmitterData->SimTarget = ENiagaraSimTarget::CPUSim;
+			EmitterData->SimTarget = bUseGPUSimulation
+				? ENiagaraSimTarget::GPUComputeSim
+				: ENiagaraSimTarget::CPUSim;
 		}
 	}
 

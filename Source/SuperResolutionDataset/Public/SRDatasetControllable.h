@@ -30,6 +30,14 @@ public:
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "SR Dataset")
 	FString DatasetGetDeterministicState();
 
+	/**
+	 * Restore a canonical state previously returned by
+	 * DatasetGetDeterministicState. Returning false rejects the replay before
+	 * rendering; the plugin also reads the state back and requires byte equality.
+	 */
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "SR Dataset")
+	bool DatasetApplyDeterministicState(const FString& CanonicalState);
+
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "SR Dataset")
 	void DatasetRestore();
 };

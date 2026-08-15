@@ -35,8 +35,10 @@ struct FSRDatasetValidationFixtureFrame
 	float WPOPreviousRightCm = 0.0f;
 	FVector2f ExpectedWPOMotionDisplayPixels = FVector2f::ZeroVector;
 	FVector2f NiagaraAnchorDisplayPixels = FVector2f::ZeroVector;
+	FVector2f NiagaraGPUAnchorDisplayPixels = FVector2f::ZeroVector;
 	float NiagaraValidationRadiusDisplayPixels = 0.0f;
 	bool bNiagaraVisibleProbeExpected = false;
+	bool bNiagaraGPUVisibleProbeExpected = false;
 	TMap<int32, float> ExpectedFrontDepthMeters;
 };
 
@@ -49,7 +51,7 @@ class ASRDatasetValidationFixture final : public AActor, public ISRDatasetContro
 public:
 	ASRDatasetValidationFixture();
 
-	bool Configure(FString& OutError);
+	bool Configure(bool bEnableGPUNiagaraProbe, FString& OutError);
 	void Evaluate(
 		const FMinimalViewInfo& CameraView,
 		int32 LogicalFrame,
@@ -116,6 +118,9 @@ private:
 	TObjectPtr<UNiagaraComponent> NiagaraFixture;
 
 	UPROPERTY(Transient)
+	TObjectPtr<UNiagaraComponent> NiagaraGPUFixture;
+
+	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> OpaqueMaterial;
 
 	UPROPERTY(Transient)
@@ -132,6 +137,9 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UNiagaraSystem> NiagaraSystem;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UNiagaraSystem> NiagaraGPUSystem;
 
 	FSRDatasetValidationFixtureFrame FrameMetadata;
 	bool bHasWorldAnchor = false;
@@ -150,4 +158,40 @@ private:
 	float LastWPORightCm = 0.0f;
 	bool bHasCapturedWPORight = false;
 	float LastCapturedWPORightCm = 0.0f;
+};
+
+/**
+ * Validation-only opaque gameplay/VFX state probe. Its process-local seed is
+ * intentionally different on each launch; only a loaded controllable-state
+ * cache can restore the recorded transform and canonical private value.
+ */
+UCLASS(NotBlueprintable, Transient)
+class ASRDatasetStateCacheValidationActor final : public AActor, public ISRDatasetControllable
+{
+	GENERATED_BODY()
+
+public:
+	ASRDatasetStateCacheValidationActor();
+
+	bool Configure(const FMinimalViewInfo& CameraView, FString& OutError);
+	virtual void DatasetPrepare_Implementation(int32 RandomSeed, float FixedDeltaSeconds) override;
+	virtual void DatasetEvaluateFrame_Implementation(int32 FrameNumber, float TimeSeconds) override;
+	virtual FString DatasetGetDeterministicState_Implementation() override;
+	virtual bool DatasetApplyDeterministicState_Implementation(const FString& CanonicalState) override;
+	virtual void DatasetRestore_Implementation() override;
+
+private:
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<USceneComponent> StateCacheRoot;
+
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UStaticMeshComponent> StateCacheProbe;
+
+	FTransform OriginalTransform = FTransform::Identity;
+	FVector BaseLocationCm = FVector::ZeroVector;
+	FVector CameraRight = FVector::RightVector;
+	uint64 ProcessNonce = 0;
+	uint32 PrivateValue = 0;
+	int32 LogicalFrame = INDEX_NONE;
+	bool bConfigured = false;
 };

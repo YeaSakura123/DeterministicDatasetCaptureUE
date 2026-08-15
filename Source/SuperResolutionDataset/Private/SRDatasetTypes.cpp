@@ -295,6 +295,64 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("A capture job may load or write a skeletal pose-cache artifact, but not both.");
 		return false;
 	}
+	if ((!ControllableStateCacheInputFile.IsEmpty() || !ControllableStateCacheOutputFile.IsEmpty()) &&
+		!bCacheControllableStatesForReplay)
+	{
+		OutError = TEXT("Controllable state-cache input/output files require bCacheControllableStatesForReplay=true.");
+		return false;
+	}
+	if (bCacheControllableStatesForReplay &&
+		ControllableStateCacheInputFile.IsEmpty() == ControllableStateCacheOutputFile.IsEmpty())
+	{
+		OutError = TEXT("Controllable state-cache replay requires exactly one input or output artifact.");
+		return false;
+	}
+	if (!ControllableStateCacheOutputFile.IsEmpty() &&
+		(ReplayPass != ESRDatasetReplayPass::Standard || bResume))
+	{
+		OutError = TEXT("A controllable state-cache artifact must be recorded by a non-resume Standard replay.");
+		return false;
+	}
+	if (bValidateControllableStateCache &&
+		(!bCacheControllableStatesForReplay || FrameStep != 1 || CaptureFrameOffset != 0 ||
+		 EndFrame - StartFrame < 1 || !bUseDeterministicCameraTransform ||
+		 !DeterministicCameraTranslationPerLogicalFrameCm.IsNearlyZero(UE_SMALL_NUMBER)))
+	{
+		OutError = TEXT("Controllable state-cache validation requires cache replay, a fixed deterministic camera, and at least two consecutive selected frames with offset zero.");
+		return false;
+	}
+	if ((!NiagaraSimCacheInputFile.IsEmpty() || !NiagaraSimCacheOutputFile.IsEmpty()) &&
+		!bCacheNiagaraSimForReplay)
+	{
+		OutError = TEXT("Niagara Sim Cache input/output files require bCacheNiagaraSimForReplay=true.");
+		return false;
+	}
+	if (bCacheNiagaraSimForReplay && !bControlNiagara)
+	{
+		OutError = TEXT("Niagara Sim Cache replay requires bControlNiagara=true.");
+		return false;
+	}
+	if (bCacheNiagaraSimForReplay &&
+		NiagaraSimCacheInputFile.IsEmpty() == NiagaraSimCacheOutputFile.IsEmpty())
+	{
+		OutError = TEXT("Niagara Sim Cache replay requires exactly one input or output artifact.");
+		return false;
+	}
+	if (!NiagaraSimCacheOutputFile.IsEmpty() &&
+		(ReplayPass != ESRDatasetReplayPass::Standard || bResume))
+	{
+		OutError = TEXT("A Niagara Sim Cache artifact must be recorded by a non-resume Standard replay.");
+		return false;
+	}
+	if (bValidateNiagaraSimCache &&
+		(!bCacheNiagaraSimForReplay || !bEnableSemanticValidationFixture ||
+		 FrameStep != 1 || CaptureFrameOffset != 0 || EndFrame - StartFrame < 1 ||
+		 !bUseDeterministicCameraTransform ||
+		 !DeterministicCameraTranslationPerLogicalFrameCm.IsNearlyZero(UE_SMALL_NUMBER)))
+	{
+		OutError = TEXT("Niagara Sim Cache validation requires CPU/GPU semantic fixtures, a fixed deterministic camera, and at least two consecutive selected frames with offset zero.");
+		return false;
+	}
 	if (bCacheSkeletalAnimationPosesForReplay && WarmupFrames < PoseCacheFrameCount)
 	{
 		OutError = FString::Printf(

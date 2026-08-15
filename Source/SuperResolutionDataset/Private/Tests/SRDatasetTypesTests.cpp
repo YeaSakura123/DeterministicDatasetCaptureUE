@@ -98,6 +98,46 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Dynamic instance validation accepts three consecutive stable-ID frames"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
+	Job.ControllableStateCacheOutputFile = TEXT("Saved/SRDataset/cache.json");
+	TestFalse(TEXT("Controllable cache paths require cache replay"), Job.Validate(Error));
+	Job.bCacheControllableStatesForReplay = true;
+	Job.bResume = false;
+	TestTrue(TEXT("A Standard job may record a controllable state cache"), Job.Validate(Error));
+	Job.ControllableStateCacheInputFile = TEXT("Saved/SRDataset/cache.json");
+	TestFalse(TEXT("Controllable state cache rejects simultaneous input and output"), Job.Validate(Error));
+	Job.ControllableStateCacheOutputFile.Reset();
+	TestTrue(TEXT("A job may load a controllable state cache"), Job.Validate(Error));
+	Job.bValidateControllableStateCache = true;
+	Job.bUseDeterministicCameraTransform = true;
+	Job.EndFrame = Job.StartFrame;
+	TestFalse(TEXT("Controllable state-cache validation requires two frames"), Job.Validate(Error));
+	Job.EndFrame = Job.StartFrame + 1;
+	TestTrue(TEXT("Controllable state-cache validation accepts two consecutive frames"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
+	Job.NiagaraSimCacheOutputFile = TEXT("Saved/SRDataset/niagara.srncache");
+	TestFalse(TEXT("Niagara cache paths require native cache replay"), Job.Validate(Error));
+	Job.bCacheNiagaraSimForReplay = true;
+	Job.bResume = false;
+	TestTrue(TEXT("A Standard job may record a Niagara Sim Cache"), Job.Validate(Error));
+	Job.NiagaraSimCacheInputFile = TEXT("Saved/SRDataset/niagara.srncache");
+	TestFalse(TEXT("Niagara Sim Cache rejects simultaneous input and output"), Job.Validate(Error));
+	Job.NiagaraSimCacheOutputFile.Reset();
+	TestTrue(TEXT("A job may load a Niagara Sim Cache"), Job.Validate(Error));
+	Job.bValidateNiagaraSimCache = true;
+	Job.bEnableSemanticValidationFixture = true;
+	Job.bUseDeterministicCameraTransform = true;
+	Job.LRMode = ESRDatasetLRMode::NativeRender;
+	Job.bCaptureTemporalDiagnostics = true;
+	Job.bCaptureMainViewTemporalDiagnostics = true;
+	Job.EndFrame = Job.StartFrame;
+	TestFalse(TEXT("Niagara Sim Cache validation requires two frames"), Job.Validate(Error));
+	Job.EndFrame = Job.StartFrame + 1;
+	TestTrue(TEXT("Niagara Sim Cache validation accepts two consecutive frames"), Job.Validate(Error));
+	Job.bControlNiagara = false;
+	TestFalse(TEXT("Niagara Sim Cache replay requires Niagara control"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
 	Job.bValidateMainViewSceneCapturePixelDomain = true;
 	TestFalse(TEXT("Pixel-domain validation cannot be enabled without the paired SceneCapture extraction"), Job.Validate(Error));
 

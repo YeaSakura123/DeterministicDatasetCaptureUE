@@ -26,5 +26,6 @@ public:
 		const FString& SystemPackagePath,
 		const FString& EmitterAssetPath,
 		int32 RandomSeed,
+		bool bUseGPUSimulation,
 		FString& OutError);
 };
