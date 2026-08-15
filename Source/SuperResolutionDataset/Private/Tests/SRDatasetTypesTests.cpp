@@ -40,6 +40,11 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	Job.bRequireSceneControlPreflight = true;
 	TestFalse(TEXT("Required scene-control preflight cannot be disabled"), Job.Validate(Error));
 	Job.bRunSceneControlPreflight = true;
+	Job.bRequireSceneControlPreflight = false;
+	Job.bRequireControllableState = true;
+	TestFalse(TEXT("Required controllable state requires strict scene-control preflight"), Job.Validate(Error));
+	Job.bRequireSceneControlPreflight = true;
+	Job.bRequireControllableState = false;
 	Job.SceneControlAllowedTickingActorClassPaths = { TEXT("/Script/Engine.SkyAtmosphere*") };
 	TestTrue(TEXT("Scene-control rules accept an absolute class prefix with one trailing wildcard"), Job.Validate(Error));
 	Job.SceneControlAllowedTickingActorClassPaths = { TEXT("Script/Engine.Actor") };

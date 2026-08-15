@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.10.0-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.11.0-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,7 +11,7 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.10.0 deliberately separates implemented output from certified training contracts:
+Version 0.11.0 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
@@ -297,9 +297,10 @@ Implement `SRDatasetControllable` for systems requiring explicit dataset-time ev
 
 - `DatasetPrepare(RandomSeed, FixedDeltaSeconds)`
 - `DatasetEvaluateFrame(FrameNumber, TimeSeconds)`
+- `DatasetGetDeterministicState()` — return a canonical serialization of opaque render-affecting state
 - `DatasetRestore()`
 
-Actors spawned during capture are discovered and prepared before their first evaluation.
+Actors spawned during capture are discovered and prepared before their first evaluation. Set `bRequireControllableState=true` together with strict scene-control preflight to reject a selected frame before rendering when any controllable returns an empty state. The manifest stores only the Actor path, SHA-1 and UTF-8 byte count; the integration owns the canonical serialization and can keep private payloads out of the dataset.
 
 ## LR and HR choices
 
@@ -310,6 +311,8 @@ Actors spawned during capture are discovered and prepared before their first eva
 `color_hr_reference_scene_hdr` first renders at `HRResolution * ReferenceHRScale`, then downsamples to the fixed non-jittered HR grid. For example, a 1920x1080 HR target with scale 2 renders internally at 3840x2160 but still writes a 1920x1080 EXR.
 
 ## Verified release evidence
+
+Version 0.11.0 extends `SRDatasetControllable` with audited opaque-state provenance. `DatasetGetDeterministicState()` lets gameplay, third-party VFX or procedural systems contribute a canonical state serialization to the scene hash. Strict jobs reject empty contributions before rendering; frame metadata stores only the state SHA-1 and byte count. The transient semantic fixture supplies a changing canonical state and the strict scene-control job passed 462/462 validator-v16 checks with one controllable Actor, one state record, zero missing records and distinct hashes across its two logical frames. The same binary's fixture-free `1920x1080`/`960x540` strict capture passed 469/469 with zero uncontrolled preflight records and a valid empty controllable-state set.
 
 Version 0.10.0 adds a deterministic training-distribution profile to validator v15. It reports per-frame and aggregate motion p50/p95, valid/uncertain disocclusion, reactive/transparency coverage, linear-depth range, pre-exposure-normalized luminance percentiles, edge/high-frequency content, exposure change and camera translation/angular speed. Reset frames are excluded from temporal distributions, and recommendations identify missing motion, reveal, VFX and camera-rotation coverage without weakening the integrity gate. The checked UE 5.7 datasets produced:
 

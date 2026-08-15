@@ -33,6 +33,7 @@
   "bForceSynchronousRendering": true,
   "bRunSceneControlPreflight": true,
   "bRequireSceneControlPreflight": true,
+  "bRequireControllableState": true,
   "sceneControlAllowedTickingActorClassPaths": [
     "/Game/FirstPerson/Blueprints/BP_FirstPersonCharacter.BP_FirstPersonCharacter_C",
     "/Game/FirstPerson/Blueprints/BP_FirstPersonPlayerController.BP_FirstPersonPlayerController_C",

@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Camera/CameraTypes.h"
 #include "GameFramework/Actor.h"
+#include "SRDatasetControllable.h"
 #include "SRDatasetTypes.h"
 #include "SRDatasetValidationFixture.generated.h"
 
@@ -41,7 +42,7 @@ struct FSRDatasetValidationFixtureFrame
 
 /** A transient chart used only by the automated semantic capture gate. */
 UCLASS(NotBlueprintable, Transient)
-class ASRDatasetValidationFixture final : public AActor
+class ASRDatasetValidationFixture final : public AActor, public ISRDatasetControllable
 {
 	GENERATED_BODY()
 
@@ -58,6 +59,7 @@ public:
 		ESRDatasetSemanticMotionScenario MotionScenario);
 	void CommitCapturedFrame();
 	const FSRDatasetValidationFixtureFrame& GetFrameMetadata() const { return FrameMetadata; }
+	virtual FString DatasetGetDeterministicState_Implementation() override;
 
 	static constexpr int32 MovingObjectId = 1;
 	static constexpr int32 BackgroundObjectId = 2;

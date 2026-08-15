@@ -467,3 +467,26 @@ void ASRDatasetValidationFixture::CommitCapturedFrame()
 	bHasCapturedWPORight = true;
 	LastCapturedWPORightCm = LastWPORightCm;
 }
+
+FString ASRDatasetValidationFixture::DatasetGetDeterministicState_Implementation()
+{
+	return FString::Printf(
+		TEXT("schema=1|logicalFrame=%d|scenario=%d|worldAnchored=%d|objectMotion=%d|camera=%.17g,%.17g,%.17g|previousCamera=%.17g,%.17g,%.17g|moving=%.17g,%.17g|skeletal=%.17g,%.17g|wpo=%.17g,%.17g|lastEvaluated=%d"),
+		FrameMetadata.LogicalFrame,
+		static_cast<int32>(FrameMetadata.MotionScenario),
+		FrameMetadata.bWorldAnchored ? 1 : 0,
+		FrameMetadata.bObjectMotionEnabled ? 1 : 0,
+		FrameMetadata.CurrentCameraLocationCm.X,
+		FrameMetadata.CurrentCameraLocationCm.Y,
+		FrameMetadata.CurrentCameraLocationCm.Z,
+		FrameMetadata.PreviousCameraLocationCm.X,
+		FrameMetadata.PreviousCameraLocationCm.Y,
+		FrameMetadata.PreviousCameraLocationCm.Z,
+		FrameMetadata.MovingCurrentRightCm,
+		FrameMetadata.MovingPreviousRightCm,
+		FrameMetadata.SkeletalCurrentRightCm,
+		FrameMetadata.SkeletalPreviousRightCm,
+		FrameMetadata.WPOCurrentRightCm,
+		FrameMetadata.WPOPreviousRightCm,
+		LastEvaluatedFrame);
+}

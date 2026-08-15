@@ -134,8 +134,11 @@ REPLAY_METADATA_FIELDS = (
     "sceneNiagaraTotalSpawnedParticleCount",
     "niagaraFrameStates",
     "sceneControllableActorCount",
+    "sceneControllableStateCount",
     "sceneUncontrolledTickingActorCount",
     "sceneControllableActors",
+    "sceneControllableStates",
+    "sceneControllableActorsWithoutState",
     "sceneUncontrolledTickingActors",
     "sceneStateHashScope",
     "renderSubmissions",
@@ -2911,9 +2914,77 @@ def validate(
         niagara_total_spawned = int(frame.get("sceneNiagaraTotalSpawnedParticleCount", -1))
         niagara_states = frame.get("niagaraFrameStates", [])
         controllable_count = int(frame.get("sceneControllableActorCount", -1))
+        controllable_state_count = int(frame.get("sceneControllableStateCount", -1))
         uncontrolled_ticking_count = int(frame.get("sceneUncontrolledTickingActorCount", -1))
         controllable_actors = frame.get("sceneControllableActors", [])
+        controllable_states = frame.get("sceneControllableStates")
+        controllable_without_state = frame.get("sceneControllableActorsWithoutState")
         uncontrolled_ticking_actors = frame.get("sceneUncontrolledTickingActors", [])
+        controllable_state_v1 = isinstance(controllable_states, list) and isinstance(
+            controllable_without_state, list
+        )
+        controllable_paths = {
+            str(record).split("|", 1)[0]
+            for record in controllable_actors
+            if isinstance(record, str)
+        }
+        state_actor_paths = (
+            [str(state.get("actorPath", "")) for state in controllable_states]
+            if controllable_state_v1
+            else []
+        )
+        controllable_state_schema = bool(
+            controllable_state_v1
+            and controllable_state_count == len(controllable_states)
+            and controllable_state_count + len(controllable_without_state)
+            == controllable_count
+            and state_actor_paths == sorted(state_actor_paths)
+            and len(set(state_actor_paths)) == len(state_actor_paths)
+            and set(state_actor_paths).issubset(controllable_paths)
+            and all(
+                isinstance(state, dict)
+                and isinstance(state.get("actorPath"), str)
+                and len(str(state.get("stateSha1", ""))) == 40
+                and all(
+                    character in "0123456789ABCDEFabcdef"
+                    for character in str(state.get("stateSha1", ""))
+                )
+                and int(state.get("utf8Bytes", 0)) > 0
+                for state in controllable_states
+            )
+            and all(
+                isinstance(path, str) and path in controllable_paths
+                for path in controllable_without_state
+            )
+            and len(set(controllable_without_state))
+            == len(controllable_without_state)
+        )
+        add_check(
+            checks,
+            f"frame_{frame_id:06d}.controllable_canonical_state",
+            (
+                controllable_state_schema
+                and (
+                    not job.get("bRequireControllableState", False)
+                    or (
+                        controllable_state_count == controllable_count
+                        and not controllable_without_state
+                    )
+                )
+            )
+            if controllable_state_v1
+            else not job.get("bRequireControllableState", False),
+            json.dumps(
+                {
+                    "enabled": controllable_state_v1,
+                    "required": bool(job.get("bRequireControllableState", False)),
+                    "actorCount": controllable_count,
+                    "stateCount": controllable_state_count,
+                    "withoutState": controllable_without_state,
+                },
+                sort_keys=True,
+            ),
+        )
         add_check(
             checks,
             f"frame_{frame_id:06d}.scene_state_provenance",
@@ -2941,7 +3012,14 @@ def validate(
             and len(uncontrolled_ticking_actors) == uncontrolled_ticking_count
             and len(set(uncontrolled_ticking_actors)) == uncontrolled_ticking_count
             and frame.get("sceneStateHashScope")
-            == "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back",
+            in {
+                "sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back",
+                "sorted_actor_component_transforms_visibility_tick_controllable_canonical_state_hashes_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back",
+            }
+            and (
+                not controllable_state_v1
+                or controllable_state_schema
+            ),
             json.dumps(
                 {
                     "sha1": scene_state_hash,
@@ -2957,6 +3035,8 @@ def validate(
                     "niagaraParticles": niagara_particle_count,
                     "niagaraTotalSpawned": niagara_total_spawned,
                     "controllableActors": controllable_count,
+                    "controllableStates": controllable_state_count,
+                    "controllableActorsWithoutState": controllable_without_state,
                     "uncontrolledTickingActors": uncontrolled_ticking_count,
                     "uncontrolledTickingActorPaths": uncontrolled_ticking_actors,
                 },
@@ -5113,7 +5193,7 @@ def validate(
         else "not_run"
     )
     report = {
-        "validatorVersion": 15,
+        "validatorVersion": 16,
         "comparisonMode": compare_mode if compare is not None else "none",
         "mainViewSceneCapturePixelDomainGate": pixel_domain_gate,
         "stableInstanceIdGate": stable_instance_gate,

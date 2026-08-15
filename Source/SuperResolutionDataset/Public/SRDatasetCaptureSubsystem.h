@@ -46,6 +46,13 @@ protected:
 private:
 	struct FSceneStateSummary
 	{
+		struct FControllableStateSummary
+		{
+			FString ActorPath;
+			FString StateSha1;
+			int32 Utf8Bytes = 0;
+		};
+
 		struct FNiagaraSummary
 		{
 			FString ComponentPath;
@@ -84,8 +91,11 @@ private:
 		int32 NiagaraParticleCount = 0;
 		int32 NiagaraTotalSpawnedParticleCount = 0;
 		int32 ControllableActorCount = 0;
+		int32 ControllableStateCount = 0;
 		int32 UncontrolledTickingActorCount = 0;
 		TArray<FString> ControllableActors;
+		TArray<FControllableStateSummary> ControllableStates;
+		TArray<FString> ControllableActorsWithoutState;
 		TArray<FString> UncontrolledTickingActors;
 		TArray<FNiagaraSummary> NiagaraComponents;
 	};
@@ -210,6 +220,7 @@ private:
 	bool EnsureStreamingReady(FString& OutError);
 	FString ComputeStreamingStateSha1(int32& OutTextureCount, int32& OutPendingTextureCount) const;
 	FSceneStateSummary ComputeSceneStateSummary() const;
+	bool ValidateControllableStates(FString& OutError) const;
 	bool RunSceneControlPreflight(FString& OutError);
 	bool WriteSceneControlPreflightReport(FString& OutError) const;
 	static bool MatchesSceneControlClassRule(const FString& ClassPath, const TArray<FString>& Rules);

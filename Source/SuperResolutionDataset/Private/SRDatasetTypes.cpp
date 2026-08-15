@@ -19,6 +19,11 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("bRequireSceneControlPreflight requires bRunSceneControlPreflight=true.");
 		return false;
 	}
+	if (bRequireControllableState && !bRequireSceneControlPreflight)
+	{
+		OutError = TEXT("bRequireControllableState requires bRequireSceneControlPreflight=true.");
+		return false;
+	}
 	const auto ValidateSceneControlRules = [&OutError](
 		const TArray<FString>& Rules,
 		const TCHAR* FieldName)

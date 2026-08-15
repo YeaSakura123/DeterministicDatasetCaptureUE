@@ -2098,6 +2098,27 @@ USRDatasetCaptureSubsystem::FSceneStateSummary USRDatasetCaptureSubsystem::Compu
 		{
 			Summary.ControllableActors.Add(FString::Printf(
 				TEXT("%s|%s"), *Actor->GetPathName(), *Actor->GetClass()->GetPathName()));
+			const FString CanonicalState =
+				ISRDatasetControllable::Execute_DatasetGetDeterministicState(Actor);
+			if (CanonicalState.IsEmpty())
+			{
+				Summary.ControllableActorsWithoutState.Add(Actor->GetPathName());
+			}
+			else
+			{
+				FTCHARToUTF8 Utf8(*CanonicalState);
+				FSceneStateSummary::FControllableStateSummary& State =
+					Summary.ControllableStates.AddDefaulted_GetRef();
+				State.ActorPath = Actor->GetPathName();
+				State.StateSha1 = HashString(CanonicalState);
+				State.Utf8Bytes = Utf8.Length();
+				++Summary.ControllableStateCount;
+				StateLines.Add(FString::Printf(
+					TEXT("controllable_state|%s|sha1=%s|utf8Bytes=%d"),
+					*State.ActorPath,
+					*State.StateSha1,
+					State.Utf8Bytes));
+			}
 		}
 		if (Actor->IsActorTickEnabled() && !bControllable)
 		{
@@ -2277,6 +2298,13 @@ USRDatasetCaptureSubsystem::FSceneStateSummary USRDatasetCaptureSubsystem::Compu
 		return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
 	});
 	Summary.ControllableActors.Sort();
+	Summary.ControllableActorsWithoutState.Sort();
+	Summary.ControllableStates.Sort([](
+		const FSceneStateSummary::FControllableStateSummary& Left,
+		const FSceneStateSummary::FControllableStateSummary& Right)
+	{
+		return Left.ActorPath.Compare(Right.ActorPath, ESearchCase::CaseSensitive) < 0;
+	});
 	Summary.UncontrolledTickingActors.Sort();
 	Summary.NiagaraComponents.Sort([](
 		const FSceneStateSummary::FNiagaraSummary& Left,
@@ -2286,6 +2314,39 @@ USRDatasetCaptureSubsystem::FSceneStateSummary USRDatasetCaptureSubsystem::Compu
 	});
 	Summary.Sha1 = HashString(FString::Join(StateLines, TEXT("\n")));
 	return Summary;
+}
+
+bool USRDatasetCaptureSubsystem::ValidateControllableStates(FString& OutError) const
+{
+	if (!ActiveJob.bRequireControllableState || !GetWorld())
+	{
+		return true;
+	}
+
+	TArray<FString> MissingActors;
+	for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!IsValid(Actor) || !Actor->GetClass()->ImplementsInterface(
+			USRDatasetControllable::StaticClass()))
+		{
+			continue;
+		}
+		if (ISRDatasetControllable::Execute_DatasetGetDeterministicState(Actor).IsEmpty())
+		{
+			MissingActors.Add(Actor->GetPathName());
+		}
+	}
+	MissingActors.Sort();
+	if (!MissingActors.IsEmpty())
+	{
+		OutError = FString::Printf(
+			TEXT("bRequireControllableState rejected %d SRDatasetControllable Actor(s) with empty canonical state: %s"),
+			MissingActors.Num(),
+			*FString::Join(MissingActors, TEXT(", ")));
+		return false;
+	}
+	return true;
 }
 
 bool USRDatasetCaptureSubsystem::MatchesSceneControlClassRule(
@@ -2686,7 +2747,7 @@ bool USRDatasetCaptureSubsystem::WriteSceneControlPreflightReport(FString& OutEr
 	};
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 1);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.10.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.11.0"));
 	Root->SetBoolField(TEXT("ran"), SceneControlPreflight.bRan);
 	Root->SetBoolField(TEXT("required"), ActiveJob.bRequireSceneControlPreflight);
 	Root->SetBoolField(TEXT("passed"), SceneControlPreflight.bPassed);
@@ -3337,6 +3398,10 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 	{
 		return false;
 	}
+	if (!ValidateControllableStates(OutError))
+	{
+		return false;
+	}
 
 	const int32 FrameNumber = Status.CurrentFrame;
 	const int32 FirstCapturedFrame = GetFirstCapturedFrame();
@@ -3855,6 +3920,7 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		TEXT("sceneNiagaraTotalSpawnedParticleCount"),
 		SceneState.NiagaraTotalSpawnedParticleCount);
 	Frame->SetNumberField(TEXT("sceneControllableActorCount"), SceneState.ControllableActorCount);
+	Frame->SetNumberField(TEXT("sceneControllableStateCount"), SceneState.ControllableStateCount);
 	Frame->SetNumberField(
 		TEXT("sceneUncontrolledTickingActorCount"),
 		SceneState.UncontrolledTickingActorCount);
@@ -3869,6 +3935,21 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		return JsonValues;
 	};
 	Frame->SetArrayField(TEXT("sceneControllableActors"), StringArray(SceneState.ControllableActors));
+	Frame->SetArrayField(
+		TEXT("sceneControllableActorsWithoutState"),
+		StringArray(SceneState.ControllableActorsWithoutState));
+	TArray<TSharedPtr<FJsonValue>> ControllableStateJson;
+	ControllableStateJson.Reserve(SceneState.ControllableStates.Num());
+	for (const FSceneStateSummary::FControllableStateSummary& ControllableState :
+		SceneState.ControllableStates)
+	{
+		TSharedRef<FJsonObject> State = MakeShared<FJsonObject>();
+		State->SetStringField(TEXT("actorPath"), ControllableState.ActorPath);
+		State->SetStringField(TEXT("stateSha1"), ControllableState.StateSha1);
+		State->SetNumberField(TEXT("utf8Bytes"), ControllableState.Utf8Bytes);
+		ControllableStateJson.Add(MakeShared<FJsonValueObject>(State));
+	}
+	Frame->SetArrayField(TEXT("sceneControllableStates"), ControllableStateJson);
 	Frame->SetArrayField(
 		TEXT("sceneUncontrolledTickingActors"),
 		StringArray(SceneState.UncontrolledTickingActors));
@@ -3928,7 +4009,7 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	Frame->SetArrayField(TEXT("niagaraFrameStates"), NiagaraStateJson);
 	Frame->SetStringField(
 		TEXT("sceneStateHashScope"),
-		TEXT("sorted_actor_component_transforms_visibility_tick_controllable_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back"));
+		TEXT("sorted_actor_component_transforms_visibility_tick_controllable_canonical_state_hashes_skeletal_component_space_bones_niagara_component_and_finalized_cpu_particle_counts_cascade_component_state_gpu_payload_not_read_back"));
 	Frame->SetBoolField(
 		TEXT("skeletalPoseCacheReplayEnabled"),
 		ActiveJob.bCacheSkeletalAnimationPosesForReplay);
@@ -4667,7 +4748,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.10.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.11.0"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -4796,6 +4877,10 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Contract->SetBoolField(TEXT("sceneControlPreflightEnabled"), ActiveJob.bRunSceneControlPreflight);
 	Contract->SetBoolField(TEXT("sceneControlPreflightRequired"), ActiveJob.bRequireSceneControlPreflight);
 	Contract->SetBoolField(TEXT("sceneControlPreflightPassed"), SceneControlPreflight.bPassed);
+	Contract->SetBoolField(TEXT("controllableCanonicalStateRequired"), ActiveJob.bRequireControllableState);
+	Contract->SetStringField(
+		TEXT("controllableCanonicalStateScope"),
+		TEXT("plugin_stores_sha1_and_utf8_byte_count_only;implementer_owns_canonical_serialization"));
 	Contract->SetStringField(
 		TEXT("sceneControlPreflightScope"),
 		TEXT("registered_ticking_actors_and_components_loaded_niagara_data_interfaces_and_material_time_per_instance_random_particle_random_expressions"));

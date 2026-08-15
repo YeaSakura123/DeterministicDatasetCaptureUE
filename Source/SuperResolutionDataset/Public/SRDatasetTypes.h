@@ -282,6 +282,14 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	bool bRequireSceneControlPreflight = false;
 
 	/**
+	 * Require every SRDatasetControllable Actor to return a non-empty canonical
+	 * state serialization before each selected capture. This closes the gap
+	 * between receiving logical time and proving opaque internal state.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Scene Control")
+	bool bRequireControllableState = false;
+
+	/**
 	 * Audited ticking Actor class paths. Rules are case-sensitive exact class
 	 * paths; a single trailing '*' enables a prefix match.
 	 */

@@ -53,6 +53,7 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [ ] Add per-surface/wider dynamic identity so same-component moving, WPO and animated-material disocclusion can be valid rather than conservatively rejected.
 - [x] Add static/camera-only/object-only/mixed-motion and four-quadrant jitter-sign fixtures.
 - [x] Add a hashed strict preflight scanner for every registered ticking Actor/component, loaded Niagara Data Interface and known time/per-instance/particle-random material input.
+- [x] Let every `SRDatasetControllable` contribute a canonical opaque-state digest; strict jobs reject empty state before the selected render and include hashes in scene replay provenance.
 - [ ] Add Niagara Sim Cache, Chaos cache and an actor-state recorder for non-Sequencer gameplay.
 
 The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`. Certification stays false until every unchecked mandatory FG item above is implemented and validated.
@@ -179,3 +180,11 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - Reset frames are excluded from temporal distributions. Profile integrity is a required gate; diversity recommendations remain diagnostic so a two-frame validation job is not mistaken for a balanced training corpus.
 - The strict 1080p/540p dataset passed 467/467 and correctly reported its static/no-VFX coverage gaps. The moving/VFX semantic fixture passed 535/535, classified its non-reset sample as fast motion, measured 25.18% valid rejected history and about 5% reactive coverage.
 - Independent stable-ID captures passed 424/424 each; geometry-derived profile values were exact, while color-profile drift stayed within the existing color replay tolerance.
+
+## Version 0.11.0 controllable opaque-state snapshot
+
+- `DatasetGetDeterministicState()` adds a canonical integration-owned state serialization to `SRDatasetControllable`; raw state is never written, only Actor path, SHA-1 and UTF-8 byte count.
+- `bRequireControllableState` requires strict preflight and rejects an empty contribution before rendering a selected frame.
+- The semantic fixture emits deterministic frame-varying state. The strict scene-control capture passed validator-v16 462/462 with one controllable, one digest record, zero missing records and different hashes at the two logical frames.
+- The fixture-free strict `1920x1080`/`960x540` capture passed 469/469 with zero uncontrolled preflight records and a valid empty controllable-state set.
+- This closes adapter-provided opaque-state provenance, not automatic Niagara Sim Cache, Chaos cache or arbitrary gameplay serialization.
