@@ -172,6 +172,13 @@ REPLAY_METADATA_FIELDS = (
     "niagaraSimCacheCachedGPUParticleCount",
     "niagaraSimCacheArtifactSha1",
     "niagaraSimCacheValidationEnabled",
+    "chaosRigidBodyCacheFrameIndex",
+    "chaosRigidBodyCacheComponentCount",
+    "chaosRigidBodyCacheMovingComponentCount",
+    "chaosRigidBodyCacheFixtureCollisionCount",
+    "chaosRigidBodyCacheFrameSha1",
+    "chaosRigidBodyCacheArtifactSha1",
+    "chaosRigidBodyCacheValidationEnabled",
     "sceneActorCount",
     "sceneComponentCount",
     "sceneSkeletalComponentCount",
@@ -316,6 +323,26 @@ def normalized_niagara_cache_job(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalized_niagara_cache_provenance(
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(provenance)
+    normalized.pop("captureConfigSha1", None)
+    return normalized
+
+
+def normalized_chaos_cache_job(job: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(job)
+    for field in (
+        "jobName",
+        "outputDirectory",
+        "chaosRigidBodyCacheInputFile",
+        "chaosRigidBodyCacheOutputFile",
+    ):
+        normalized.pop(field, None)
+    return normalized
+
+
+def normalized_chaos_cache_provenance(
     provenance: dict[str, Any],
 ) -> dict[str, Any]:
     normalized = dict(provenance)
@@ -3306,6 +3333,263 @@ def validate(
             f"frames={frame_cached_particles}/{frame_cached_gpu_particles} "
             f"components={root_cached_particles}/{root_cached_gpu_particles}",
         )
+    chaos_cache_enabled = bool(
+        job.get("bCacheChaosRigidBodyTransformsForReplay", False)
+    )
+    chaos_cache_manifest = manifest.get("chaosRigidBodyCache", {})
+    if chaos_cache_enabled:
+        chaos_cache_input = str(job.get("chaosRigidBodyCacheInputFile") or "")
+        chaos_cache_output = str(job.get("chaosRigidBodyCacheOutputFile") or "")
+        expected_chaos_cache_mode = (
+            "apply_and_verify" if chaos_cache_input else "record"
+        )
+        configured_chaos_cache_path = chaos_cache_input or chaos_cache_output
+        chaos_cache_hash = str(
+            chaos_cache_manifest.get("artifactSha1") or ""
+        ).upper()
+        chaos_cache_path = resolve_state_cache_artifact(
+            dataset, configured_chaos_cache_path
+        )
+        chaos_components = chaos_cache_manifest.get("components", [])
+        if not isinstance(chaos_components, list):
+            chaos_components = []
+        expected_chaos_frame_count = (
+            int(job.get("endFrame", -1)) - int(job.get("startFrame", 0)) + 1
+        )
+        chaos_component_paths = [
+            str(component.get("componentPath") or "")
+            for component in chaos_components
+            if isinstance(component, dict)
+        ]
+        chaos_component_records_valid = bool(chaos_components) and (
+            len(chaos_component_paths) == len(chaos_components)
+            and chaos_component_paths == sorted(chaos_component_paths)
+            and len(chaos_component_paths) == len(set(chaos_component_paths))
+        )
+        for component in chaos_components:
+            if not isinstance(component, dict):
+                chaos_component_records_valid = False
+                continue
+            translation = component.get("initialTranslationCm")
+            rotation = component.get("initialRotationQuaternion")
+            scale = component.get("initialScale")
+            numeric_transform = (
+                isinstance(translation, list)
+                and len(translation) == 3
+                and isinstance(rotation, list)
+                and len(rotation) == 4
+                and isinstance(scale, list)
+                and len(scale) == 3
+                and all(
+                    isinstance(value, (int, float)) and math.isfinite(float(value))
+                    for value in translation + rotation + scale
+                )
+            )
+            chaos_component_records_valid = chaos_component_records_valid and bool(
+                component.get("componentPath")
+                and component.get("actorPath")
+                and component.get("componentClassPath")
+                == "/Script/Engine.StaticMeshComponent"
+                and component.get("staticMeshPath")
+                and component.get("cacheName")
+                and is_sha1_hex(component.get("serializedSha1"))
+                and int(component.get("recordedFrameCount", -1))
+                == expected_chaos_frame_count
+                and int(component.get("particleTrackCount", 0)) >= 1
+                and int(component.get("transformKeyCount", 0)) >= 2
+                and numeric_transform
+            )
+        add_check(
+            checks,
+            "chaos_rigid_body_cache.root_contract",
+            isinstance(chaos_cache_manifest, dict)
+            and chaos_cache_manifest.get("enabled") is True
+            and int(chaos_cache_manifest.get("schemaVersion", 0)) == 1
+            and chaos_cache_manifest.get("mode") == expected_chaos_cache_mode
+            and chaos_cache_manifest.get("artifactFile")
+            == configured_chaos_cache_path
+            and chaos_cache_manifest.get("loadedFromArtifact")
+            is (expected_chaos_cache_mode == "apply_and_verify")
+            and int(chaos_cache_manifest.get("componentCount", -1))
+            == len(chaos_components)
+            and int(chaos_cache_manifest.get("referenceFrameCount", -1))
+            == expected_chaos_frame_count
+            and chaos_cache_manifest.get("nativeAdapterScope")
+            == "ChaosCaching_UStaticMeshComponent_fixed_topology"
+            and chaos_cache_manifest.get("authorityScope")
+            == "world_translation_world_rotation_and_companion_fixed_component_scale"
+            and chaos_cache_manifest.get("applicationPhase")
+            == "native_physics_presolve_then_exact_logical_frame_random_access_before_render"
+            and math.isclose(
+                float(chaos_cache_manifest.get("translationToleranceCm", math.nan)),
+                0.05,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            and math.isclose(
+                float(
+                    chaos_cache_manifest.get(
+                        "rotationToleranceDegrees", math.nan
+                    )
+                ),
+                0.05,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            and chaos_cache_manifest.get("fullSolverStateSerialized") is False
+            and chaos_cache_manifest.get("velocitySerialized") is False
+            and chaos_cache_manifest.get("constraintStateSerialized") is False
+            and chaos_cache_manifest.get("validationFixtureEnabled")
+            is bool(job.get("bValidateChaosRigidBodyCache", False)),
+            json.dumps(chaos_cache_manifest, sort_keys=True),
+        )
+        add_check(
+            checks,
+            "chaos_rigid_body_cache.component_records",
+            chaos_component_records_valid,
+            json.dumps(
+                {
+                    "componentCount": len(chaos_components),
+                    "componentPaths": chaos_component_paths,
+                    "expectedFrameCount": expected_chaos_frame_count,
+                },
+                sort_keys=True,
+            ),
+        )
+        actual_chaos_cache_hash = ""
+        chaos_artifact_header_valid = False
+        chaos_artifact_header_detail = "artifact unavailable"
+        if chaos_cache_path is not None and chaos_cache_path.is_file():
+            actual_chaos_cache_hash = sha1(chaos_cache_path)
+            try:
+                with chaos_cache_path.open("rb") as stream:
+                    header = stream.read(8)
+                if len(header) == 8:
+                    magic, version = struct.unpack("<II", header)
+                    chaos_artifact_header_valid = (
+                        magic == 0x53524343 and version == 1
+                    )
+                    chaos_artifact_header_detail = (
+                        f"magic=0x{magic:08X} version={version} bytes="
+                        f"{chaos_cache_path.stat().st_size}"
+                    )
+                else:
+                    chaos_artifact_header_detail = f"header_bytes={len(header)}"
+            except OSError as exc:
+                chaos_artifact_header_detail = str(exc)
+        add_check(
+            checks,
+            "chaos_rigid_body_cache.artifact_present_header_and_hash",
+            chaos_cache_path is not None
+            and chaos_cache_path.is_file()
+            and is_sha1_hex(chaos_cache_hash)
+            and actual_chaos_cache_hash == chaos_cache_hash
+            and str(
+                provenance.get("chaosRigidBodyCacheArtifactSha1", "")
+            ).upper()
+            == chaos_cache_hash
+            and chaos_artifact_header_valid,
+            f"path={chaos_cache_path} manifest={chaos_cache_hash} "
+            f"actual={actual_chaos_cache_hash} {chaos_artifact_header_detail}",
+        )
+        moving_frame_count = 0
+        maximum_fixture_collisions = 0
+        for frame in frames:
+            frame_id = int(frame.get("logicalFrameId", -1))
+            expected_frame_index = frame_id - int(job.get("startFrame", 0))
+            component_count = int(
+                frame.get("chaosRigidBodyCacheComponentCount", -1)
+            )
+            recorded_count = int(
+                frame.get("chaosRigidBodyCacheRecordedComponentCount", -1)
+            )
+            applied_count = int(
+                frame.get("chaosRigidBodyCacheAppliedComponentCount", -1)
+            )
+            verified_count = int(
+                frame.get("chaosRigidBodyCacheVerifiedComponentCount", -1)
+            )
+            moving_count = int(
+                frame.get("chaosRigidBodyCacheMovingComponentCount", -1)
+            )
+            collision_count = int(
+                frame.get("chaosRigidBodyCacheFixtureCollisionCount", -1)
+            )
+            translation_error = float(
+                frame.get("chaosRigidBodyCacheMaxTranslationErrorCm", math.inf)
+            )
+            rotation_error = float(
+                frame.get(
+                    "chaosRigidBodyCacheMaxRotationErrorDegrees", math.inf
+                )
+            )
+            moving_frame_count += moving_count > 0
+            maximum_fixture_collisions = max(
+                maximum_fixture_collisions, collision_count
+            )
+            common_frame_contract = (
+                frame.get("chaosRigidBodyCacheEnabled") is True
+                and frame.get("chaosRigidBodyCacheMode")
+                == expected_chaos_cache_mode
+                and frame.get("chaosRigidBodyCacheApplicationPhase")
+                == "native_physics_presolve_plus_logical_frame_random_access_before_dataset_render_submission"
+                and int(frame.get("chaosRigidBodyCacheFrameIndex", -1))
+                == expected_frame_index
+                and component_count == len(chaos_components)
+                and component_count > 0
+                and moving_count >= 0
+                and collision_count >= 0
+                and is_sha1_hex(frame.get("chaosRigidBodyCacheFrameSha1"))
+                and str(
+                    frame.get("chaosRigidBodyCacheArtifactSha1") or ""
+                ).upper()
+                == chaos_cache_hash
+                and frame.get("chaosRigidBodyCacheValidationEnabled")
+                is bool(job.get("bValidateChaosRigidBodyCache", False))
+            )
+            if expected_chaos_cache_mode == "record":
+                mode_contract = (
+                    recorded_count == component_count
+                    and applied_count == 0
+                    and verified_count == 0
+                    and translation_error == 0.0
+                    and rotation_error == 0.0
+                )
+            else:
+                mode_contract = (
+                    recorded_count == 0
+                    and applied_count == component_count
+                    and verified_count == component_count
+                    and 0.0 <= translation_error <= 0.05
+                    and 0.0 <= rotation_error <= 0.05
+                )
+            add_check(
+                checks,
+                f"frame_{frame_id:06d}.chaos_rigid_body_cache",
+                common_frame_contract and mode_contract,
+                json.dumps(
+                    {
+                        "mode": frame.get("chaosRigidBodyCacheMode"),
+                        "frameIndex": frame.get("chaosRigidBodyCacheFrameIndex"),
+                        "components": component_count,
+                        "recorded": recorded_count,
+                        "applied": applied_count,
+                        "verified": verified_count,
+                        "moving": moving_count,
+                        "collisions": collision_count,
+                        "translationErrorCm": translation_error,
+                        "rotationErrorDegrees": rotation_error,
+                    },
+                    sort_keys=True,
+                ),
+            )
+        if job.get("bValidateChaosRigidBodyCache", False):
+            add_check(
+                checks,
+                "chaos_rigid_body_cache.fixture_collision_and_motion",
+                maximum_fixture_collisions > 0 and moving_frame_count >= 2,
+                f"collisions={maximum_fixture_collisions} movingFrames={moving_frame_count}",
+            )
     streaming_hash = str(provenance.get("streamingStateAfterBarrierSha1", ""))
     valid_streaming_hash = len(streaming_hash) == 40 and all(
         character in "0123456789ABCDEFabcdef" for character in streaming_hash
@@ -5566,6 +5850,68 @@ def validate(
                 if normalized_provenance_match
                 else "normalized provenance differs",
             )
+        elif compare_mode == "chaos-cache":
+            other_chaos_cache = other.get("chaosRigidBodyCache", {})
+            chaos_cache_roles_valid = {
+                str(chaos_cache_manifest.get("mode") or ""),
+                str(other_chaos_cache.get("mode") or ""),
+            } == {"record", "apply_and_verify"}
+            chaos_cache_hash_exact = (
+                str(chaos_cache_manifest.get("artifactSha1") or "").upper()
+                == str(other_chaos_cache.get("artifactSha1") or "").upper()
+                and is_sha1_hex(chaos_cache_manifest.get("artifactSha1"))
+            )
+            chaos_cache_components_exact = (
+                chaos_cache_manifest.get("components")
+                == other_chaos_cache.get("components")
+                and bool(chaos_cache_manifest.get("components"))
+            )
+            normalized_jobs_match = normalized_chaos_cache_job(
+                job
+            ) == normalized_chaos_cache_job(other_job)
+            normalized_provenance_match = normalized_chaos_cache_provenance(
+                provenance
+            ) == normalized_chaos_cache_provenance(
+                other.get("provenance", {})
+            )
+            add_check(
+                checks,
+                "chaos_cache.record_apply_roles",
+                chaos_cache_roles_valid,
+                f"left={chaos_cache_manifest.get('mode')} "
+                f"right={other_chaos_cache.get('mode')}",
+            )
+            add_check(
+                checks,
+                "chaos_cache.artifact_hash_exact",
+                chaos_cache_hash_exact,
+                f"left={chaos_cache_manifest.get('artifactSha1')} "
+                f"right={other_chaos_cache.get('artifactSha1')}",
+            )
+            add_check(
+                checks,
+                "chaos_cache.component_payload_metadata_exact",
+                chaos_cache_components_exact,
+                "exact"
+                if chaos_cache_components_exact
+                else "component payload metadata differs",
+            )
+            add_check(
+                checks,
+                "chaos_cache.jobs_equal_except_identity_output_and_cache_role",
+                normalized_jobs_match,
+                "exact after normalization"
+                if normalized_jobs_match
+                else "normalized jobs differ",
+            )
+            add_check(
+                checks,
+                "chaos_cache.provenance_equal_except_config_hash",
+                normalized_provenance_match,
+                "exact after normalization"
+                if normalized_provenance_match
+                else "normalized provenance differs",
+            )
         else:
             add_check(
                 checks,
@@ -6170,6 +6516,11 @@ def validate(
                     "auxiliaryCaptureOrder",
                 }:
                     continue
+                if compare_mode == "chaos-cache" and field == "sceneStateSha1":
+                    # The generic scene hash encodes double matrix text exactly,
+                    # while the native Chaos gate has an explicit 0.05 cm/degree
+                    # transform tolerance plus an exact artifact reference hash.
+                    continue
                 left_value = left_frame.get(field)
                 right_value = right_frame.get(field)
                 add_check(
@@ -6233,7 +6584,7 @@ def validate(
         else "not_run"
     )
     report = {
-        "validatorVersion": 20,
+        "validatorVersion": 21,
         "comparisonMode": compare_mode if compare is not None else "none",
         "mainViewSceneCapturePixelDomainGate": pixel_domain_gate,
         "stableInstanceIdGate": stable_instance_gate,
@@ -6270,6 +6621,11 @@ def validate(
             else "fail" if compare is not None and compare_mode == "niagara-cache"
             else "not_run"
         ),
+        "chaosRigidBodyCacheReplayGate": (
+            "pass" if compare is not None and compare_mode == "chaos-cache" and passed
+            else "fail" if compare is not None and compare_mode == "chaos-cache"
+            else "not_run"
+        ),
         "dataset": str(dataset.resolve()),
         "contractVersion": manifest.get("contractVersion"),
         "certificationStatus": manifest.get("certificationStatus"),
@@ -6282,7 +6638,7 @@ def validate(
         "statistics": stats,
         "datasetProfile": dataset_profile,
         "replayMetrics": replay_metrics,
-        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. Scene-control preflight evidence inventories and hashes ticking Actors/components, loaded Niagara Data Interfaces and known time/random material inputs; strict jobs reject every unclassified record. The optional Main View/SceneCapture LR gate compares the same AfterDOF linear-HDR stage after independent pre-exposure normalization and metadata-defined subpixel jitter alignment, without an extra render submission or simulation advance. Stable instance-ID jobs finalize a fixed renderable-component topology after warmup/streaming, assign collision-free uint8 Custom Stencil IDs, hash an ID-to-component/Actor/class map, fail on topology or label drift and verify that every nonzero raster value resolves through that map; the uint8/per-component limits remain explicit. Disocclusion v2 independently reconstructs every non-reset reason from current motion/depth/ID plus the previous saved depth/ID buffers; cross-instance and static-depth decisions are valid, while dynamic same-instance or unlabeled motion is conservatively rejected with validity zero. Explicit controllable-state cache jobs store integration-owned canonical payloads by logical frame, apply them after Actor ticks, require byte-exact state readback and compare the restored scene plus images/depth against the recording process; ordinary manifests still persist only state hashes and byte counts. Native Niagara Sim Cache jobs record every attribute for fixed-topology CPU and GPU emitters, perform immediate GPU readback, serialize exact component/system identities and verify record/apply payload metrics plus rendered outputs; custom Niagara Data Interface storage remains disabled and must pass preflight classification. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU/GPU Niagara particle counts and visible AfterDOF VFX probes. Chaos solver cache, dynamic same-instance surface identity and Main View/reference-HR pixel equivalence remain separate gates.",
+        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. Scene-control preflight evidence inventories and hashes ticking Actors/components, loaded Niagara Data Interfaces and known time/random material inputs; strict jobs reject every unclassified record. The optional Main View/SceneCapture LR gate compares the same AfterDOF linear-HDR stage after independent pre-exposure normalization and metadata-defined subpixel jitter alignment, without an extra render submission or simulation advance. Stable instance-ID jobs finalize a fixed renderable-component topology after warmup/streaming, assign collision-free uint8 Custom Stencil IDs, hash an ID-to-component/Actor/class map, fail on topology or label drift and verify that every nonzero raster value resolves through that map; the uint8/per-component limits remain explicit. Disocclusion v2 independently reconstructs every non-reset reason from current motion/depth/ID plus the previous saved depth/ID buffers; cross-instance and static-depth decisions are valid, while dynamic same-instance or unlabeled motion is conservatively rejected with validity zero. Explicit controllable-state cache jobs store integration-owned canonical payloads by logical frame, apply them after Actor ticks, require byte-exact state readback and compare the restored scene plus images/depth against the recording process; ordinary manifests still persist only state hashes and byte counts. Native Niagara Sim Cache jobs record every attribute for fixed-topology CPU and GPU emitters, perform immediate GPU readback, serialize exact component/system identities and verify record/apply payload metrics plus rendered outputs; custom Niagara Data Interface storage remains disabled and must pass preflight classification. Native Chaos rigid-body cache jobs record fixed-topology UStaticMeshComponent transform tracks after solve, preserve component scale, random-access the cache by logical frame before rendering, and validate a real collision fixture plus record/apply images and depth; velocity, constraints and full solver internals remain explicitly outside this gate. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU/GPU Niagara particle counts and visible AfterDOF VFX probes. Dynamic same-instance surface identity and Main View/reference-HR pixel equivalence remain separate gates.",
     }
     return report, passed
 
@@ -6293,7 +6649,7 @@ def main() -> int:
     parser.add_argument("--compare", type=Path, help="Second dataset directory or manifest for deterministic hash comparison")
     parser.add_argument(
         "--compare-mode",
-        choices=("exact-replay", "capture-order", "vfx-reverse", "skeletal-reverse", "material-reverse", "state-cache", "niagara-cache"),
+        choices=("exact-replay", "capture-order", "vfx-reverse", "skeletal-reverse", "material-reverse", "state-cache", "niagara-cache", "chaos-cache"),
         default="exact-replay",
         help="Comparison contract. Reverse modes compare forward/reverse endpoint roles at identical absolute times.",
     )
@@ -6307,6 +6663,7 @@ def main() -> int:
         "material-reverse",
         "state-cache",
         "niagara-cache",
+        "chaos-cache",
     ) and args.compare is None:
         parser.error(f"--compare-mode {args.compare_mode} requires --compare")
 

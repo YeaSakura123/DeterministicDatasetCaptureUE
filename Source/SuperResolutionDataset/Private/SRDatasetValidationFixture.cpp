@@ -7,6 +7,8 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "Engine/SkeletalMesh.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/HitResult.h"
 #include "NiagaraComponent.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraEmitterHandle.h"
@@ -669,4 +671,130 @@ bool ASRDatasetStateCacheValidationActor::DatasetApplyDeterministicState_Impleme
 void ASRDatasetStateCacheValidationActor::DatasetRestore_Implementation()
 {
 	SetActorTransform(OriginalTransform, false, nullptr, ETeleportType::TeleportPhysics);
+}
+
+ASRDatasetChaosValidationActor::ASRDatasetChaosValidationActor()
+{
+	PrimaryActorTick.bCanEverTick = false;
+	SetActorEnableCollision(true);
+
+	PhysicsRoot = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+	SetRootComponent(PhysicsRoot);
+	Ground = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Ground"));
+	DynamicCubeA = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("DynamicCubeA"));
+	DynamicCubeB = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("DynamicCubeB"));
+
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeMeshFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> MaterialFinder(
+		TEXT("/Engine/BasicShapes/BasicShapeMaterial_Inst.BasicShapeMaterial_Inst"));
+	for (UStaticMeshComponent* Component : { Ground.Get(), DynamicCubeA.Get(), DynamicCubeB.Get() })
+	{
+		Component->SetupAttachment(PhysicsRoot);
+		Component->SetStaticMesh(CubeMeshFinder.Object);
+		Component->SetMaterial(0, MaterialFinder.Object);
+		Component->SetMobility(EComponentMobility::Movable);
+		Component->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+		Component->SetCollisionObjectType(ECC_PhysicsBody);
+		Component->SetCollisionResponseToAllChannels(ECR_Block);
+		Component->SetGenerateOverlapEvents(false);
+		Component->SetCastShadow(false);
+		Component->SetReceivesDecals(false);
+	}
+	Ground->SetCollisionObjectType(ECC_WorldStatic);
+	Ground->SetSimulatePhysics(false);
+	DynamicCubeA->SetSimulatePhysics(false);
+	DynamicCubeB->SetSimulatePhysics(false);
+	DynamicCubeA->SetNotifyRigidBodyCollision(true);
+	DynamicCubeB->SetNotifyRigidBodyCollision(true);
+	DynamicCubeA->OnComponentHit.AddDynamic(this, &ThisClass::HandlePhysicsHit);
+	DynamicCubeB->OnComponentHit.AddDynamic(this, &ThisClass::HandlePhysicsHit);
+}
+
+bool ASRDatasetChaosValidationActor::Configure(
+	const FVector& CameraLocationCm,
+	const FRotator& CameraRotationDegrees,
+	FString& OutError)
+{
+	if (!Ground || !DynamicCubeA || !DynamicCubeB || !Ground->GetStaticMesh() ||
+		!DynamicCubeA->GetStaticMesh() || !DynamicCubeB->GetStaticMesh())
+	{
+		OutError = TEXT("Chaos rigid-body validation assets are unavailable.");
+		return false;
+	}
+	const FRotationMatrix CameraBasis(CameraRotationDegrees);
+	const FVector CameraForward = CameraBasis.GetScaledAxis(EAxis::X).GetSafeNormal();
+	const FVector CameraRight = CameraBasis.GetScaledAxis(EAxis::Y).GetSafeNormal();
+	const FVector HorizontalForward = FVector(CameraForward.X, CameraForward.Y, 0.0).GetSafeNormal();
+	const FVector HorizontalRight = FVector(CameraRight.X, CameraRight.Y, 0.0).GetSafeNormal();
+	if (HorizontalForward.IsNearlyZero() || HorizontalRight.IsNearlyZero())
+	{
+		OutError = TEXT("Chaos rigid-body validation requires a camera with a non-vertical forward/right basis.");
+		return false;
+	}
+
+	const FVector GroundLocation = FVector(
+		CameraLocationCm.X,
+		CameraLocationCm.Y,
+		CameraLocationCm.Z - 145.0) + HorizontalForward * 500.0;
+	Ground->SetWorldLocation(GroundLocation, false, nullptr, ETeleportType::TeleportPhysics);
+	Ground->SetWorldRotation(FRotator::ZeroRotator);
+	Ground->SetWorldScale3D(FVector(4.0, 3.0, 0.1));
+
+	const FVector BodyCenter = GroundLocation + FVector(0.0, 0.0, 100.0);
+	InitialTransformA = FTransform(
+		FRotator(0.0, 12.0, 0.0),
+		BodyCenter - HorizontalRight * 85.0,
+		FVector(0.55));
+	InitialTransformB = FTransform(
+		FRotator(0.0, -18.0, 0.0),
+		BodyCenter + HorizontalRight * 85.0,
+		FVector(0.55));
+	InitialVelocityA = HorizontalRight * 260.0;
+	InitialVelocityB = HorizontalRight * -260.0;
+	DynamicCubeA->SetWorldTransform(InitialTransformA, false, nullptr, ETeleportType::TeleportPhysics);
+	DynamicCubeB->SetWorldTransform(InitialTransformB, false, nullptr, ETeleportType::TeleportPhysics);
+	CollisionCount = 0;
+	bConfigured = true;
+	return true;
+}
+
+void ASRDatasetChaosValidationActor::ArmForCapture()
+{
+	if (!bConfigured)
+	{
+		return;
+	}
+	for (UStaticMeshComponent* Component : { DynamicCubeA.Get(), DynamicCubeB.Get() })
+	{
+		Component->SetSimulatePhysics(false);
+	}
+	DynamicCubeA->SetWorldTransform(InitialTransformA, false, nullptr, ETeleportType::TeleportPhysics);
+	DynamicCubeB->SetWorldTransform(InitialTransformB, false, nullptr, ETeleportType::TeleportPhysics);
+	CollisionCount = 0;
+	DynamicCubeA->SetSimulatePhysics(true);
+	DynamicCubeB->SetSimulatePhysics(true);
+	DynamicCubeA->SetPhysicsLinearVelocity(InitialVelocityA, false);
+	DynamicCubeB->SetPhysicsLinearVelocity(InitialVelocityB, false);
+	DynamicCubeA->SetPhysicsAngularVelocityInDegrees(FVector(0.0, 0.0, 45.0), false);
+	DynamicCubeB->SetPhysicsAngularVelocityInDegrees(FVector(0.0, 0.0, -35.0), false);
+	DynamicCubeA->WakeAllRigidBodies();
+	DynamicCubeB->WakeAllRigidBodies();
+}
+
+TArray<UStaticMeshComponent*> ASRDatasetChaosValidationActor::GetDynamicComponents() const
+{
+	return { DynamicCubeA.Get(), DynamicCubeB.Get() };
+}
+
+void ASRDatasetChaosValidationActor::HandlePhysicsHit(
+	UPrimitiveComponent* HitComponent,
+	AActor* OtherActor,
+	UPrimitiveComponent* OtherComponent,
+	FVector NormalImpulse,
+	const FHitResult& Hit)
+{
+	if (HitComponent && OtherComponent && !NormalImpulse.IsNearlyZero())
+	{
+		++CollisionCount;
+	}
 }

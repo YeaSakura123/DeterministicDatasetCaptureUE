@@ -138,6 +138,25 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("Niagara Sim Cache replay requires Niagara control"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
+	Job.ChaosRigidBodyCacheOutputFile = TEXT("Saved/SRDataset/chaos.srcache");
+	TestFalse(TEXT("Chaos cache paths require native cache replay"), Job.Validate(Error));
+	Job.bCacheChaosRigidBodyTransformsForReplay = true;
+	Job.bResume = false;
+	TestTrue(TEXT("A Standard job may record a Chaos rigid-body cache"), Job.Validate(Error));
+	Job.ChaosRigidBodyCacheInputFile = TEXT("Saved/SRDataset/chaos.srcache");
+	TestFalse(TEXT("Chaos rigid-body cache rejects simultaneous input and output"), Job.Validate(Error));
+	Job.ChaosRigidBodyCacheOutputFile.Reset();
+	TestTrue(TEXT("A job may load a Chaos rigid-body cache"), Job.Validate(Error));
+	Job.bValidateChaosRigidBodyCache = true;
+	Job.bUseDeterministicCameraTransform = true;
+	Job.EndFrame = Job.StartFrame + 10;
+	TestFalse(TEXT("Chaos rigid-body cache validation requires twelve frames"), Job.Validate(Error));
+	Job.EndFrame = Job.StartFrame + 11;
+	TestTrue(TEXT("Chaos rigid-body cache validation accepts twelve consecutive frames"), Job.Validate(Error));
+	Job.bEnableChaosDeterminism = false;
+	TestFalse(TEXT("Chaos rigid-body cache replay requires Chaos determinism"), Job.Validate(Error));
+
+	Job = FSRDatasetCaptureJob();
 	Job.bValidateMainViewSceneCapturePixelDomain = true;
 	TestFalse(TEXT("Pixel-domain validation cannot be enabled without the paired SceneCapture extraction"), Job.Validate(Error));
 

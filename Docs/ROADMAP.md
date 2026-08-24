@@ -59,7 +59,8 @@ This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and 
 - [x] Let every `SRDatasetControllable` contribute a canonical opaque-state digest; strict jobs reject empty state before the selected render and include hashes in scene replay provenance.
 - [x] Add a portable logical-frame state recorder/replayer for adapter-owned `SRDatasetControllable` gameplay and third-party VFX state, with post-tick apply plus byte-exact readback.
 - [x] Add native fixed-topology Niagara CPU/GPU Sim Cache recording/replay with all-attribute capture, immediate GPU readback, exact topology/payload hashes and a dedicated two-process validator gate.
-- [ ] Add a Chaos internal solver-state cache adapter and project physics fixture.
+- [x] Add native fixed-topology Chaos `UStaticMeshComponent` rigid transform record/replay, exact logical-frame random access and a real colliding two-body fixture.
+- [ ] Extend Chaos capture beyond visible rigid transforms to velocities, constraints, contacts/sleep/island state, Geometry Collections and full solver restart.
 
 The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`. Certification stays false until every unchecked mandatory FG item above is implemented and validated.
 
@@ -227,3 +228,11 @@ The current assembler writes `nr-fg-data-v1` only as `experimental_uncertified`.
 - Validator v20 passed 522/522 recording, 522/522 replay and 819/819 dedicated `niagara-cache` comparison checks. Existing semantic, dynamic-ID, fixed-ID and controllable-state gates retained 583/583, 694/694, 474/474 and 293/293 checks respectively.
 - Repeating the live recording kept the CPU payload byte-identical but changed the GPU payload SHA-1 and a small set of translucent pixels within numeric bounds. The supported deterministic workflow therefore preserves one reviewed artifact and replays it; byte-identical GPUComputeSim re-recording is not claimed.
 - This closes replay of one native fixed-topology CPU/GPU Niagara state for the exact no-custom-DI policy. External/live Data Interface resources, arbitrary topology, long-cache bulk serialization, byte-identical GPU re-simulation and Chaos solver state remain open.
+
+## Version 0.16.0 native Chaos rigid-body transform snapshot
+
+- `bCacheChaosRigidBodyTransformsForReplay` records each supported, simulating, fixed-topology `UStaticMeshComponent` through UE 5.7's native Chaos static-mesh adapter and adds an exact per-logical-frame reference-pose channel to the atomic schema-v1 `.srcache`.
+- Replay requires exact engine/world/policy/rate/seed and Actor/component/class/static-mesh topology, random-accesses the native cache at the requested logical frame, verifies translation/rotation within `0.05 cm`/`0.05 degrees`, preserves fixed scale and applies the hash-validated reference pose before dataset render submission.
+- The 18-frame validation fixture exercised two independently moving rigid bodies and 44 accumulated hit events. Both standalone datasets passed 499/499 validator-v21 checks; the dedicated `chaos-cache` comparison passed 2360/2360 with two components applied and verified on every frame.
+- Depth was byte exact across record/replay. HR/LR color satisfied the numeric rendering contract but was not universally byte exact, which remains an explicit renderer-boundary observation rather than a relaxed Chaos state gate.
+- This closes authoritative visible rigid transform replay for the declared native static-mesh/fixed-topology scope. Velocity, constraint/contact/sleep/island state, Geometry Collections, deformables and full solver restart remain open.

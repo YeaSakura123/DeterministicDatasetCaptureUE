@@ -5,6 +5,10 @@
 #include "SRDatasetValidationFixture.h"
 #include "SRDatasetViewExtension.h"
 
+#include "Chaos/Adapters/CacheAdapter.h"
+#include "Chaos/CacheCollection.h"
+#include "Chaos/CacheManagerActor.h"
+#include "Chaos/ChaosCache.h"
 #include "Camera/CameraComponent.h"
 #include "Camera/CameraActor.h"
 #include "Camera/PlayerCameraManager.h"
@@ -329,6 +333,15 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 	NiagaraSimCacheFrameMetrics.Reset();
 	NiagaraSimCacheArtifactSha1.Reset();
 	bNiagaraSimCacheLoadedFromArtifact = false;
+	ChaosRigidBodyMetadataByComponentPath.Reset();
+	ChaosRigidBodyFrames.Reset();
+	ChaosRigidBodyFrameMetrics.Reset();
+	ChaosRigidBodyCacheArtifactSha1.Reset();
+	bChaosRigidBodyCacheLoadedFromArtifact = false;
+	bChaosRigidBodyCacheStarted = false;
+	ChaosValidationFixture = nullptr;
+	ChaosCacheManager = nullptr;
+	ChaosCacheCollection = nullptr;
 	ControllableStateCacheValidationActor = nullptr;
 	DeterministicCameraPlayerController.Reset();
 	PreviousPlayerViewTarget.Reset();
@@ -470,6 +483,10 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 	{
 		return false;
 	}
+	if (!PrepareChaosRigidBodyCache(OutError))
+	{
+		return false;
+	}
 	if (!CheckWidgetComponentPolicy(OutError))
 	{
 		return false;
@@ -483,6 +500,10 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 		return false;
 	}
 	if (!LoadNiagaraSimCacheArtifact(OutError))
+	{
+		return false;
+	}
+	if (!LoadChaosRigidBodyCacheArtifact(OutError))
 	{
 		return false;
 	}
@@ -509,6 +530,10 @@ bool USRDatasetCaptureSubsystem::PrepareJob(FString& OutError)
 	WarmupFramesRemaining = ActiveJob.WarmupFrames;
 	Status.State = WarmupFramesRemaining > 0 ? ESRDatasetCaptureState::WarmingUp : ESRDatasetCaptureState::Capturing;
 	Status.CurrentFrame = GetInitialEvaluationFrame();
+	if (Status.State == ESRDatasetCaptureState::Capturing && !StartChaosRigidBodyCache(OutError))
+	{
+		return false;
+	}
 	if (!UpdateCaptureCamera(true, OutError))
 	{
 		return false;
@@ -2682,6 +2707,872 @@ bool USRDatasetCaptureSubsystem::LoadNiagaraSimCacheArtifact(FString& OutError)
 	return true;
 }
 
+bool USRDatasetCaptureSubsystem::PrepareChaosRigidBodyCache(FString& OutError)
+{
+	if (!ActiveJob.bCacheChaosRigidBodyTransformsForReplay)
+	{
+		return true;
+	}
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		OutError = TEXT("Chaos rigid-body caching requires a valid world.");
+		return false;
+	}
+	if (ActiveJob.bValidateChaosRigidBodyCache)
+	{
+		FActorSpawnParameters FixtureParameters;
+		FixtureParameters.Name = MakeUniqueObjectName(
+			World,
+			ASRDatasetChaosValidationActor::StaticClass(),
+			TEXT("SRDatasetChaosValidationFixture"));
+		FixtureParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		ChaosValidationFixture = World->SpawnActor<ASRDatasetChaosValidationActor>(
+			ASRDatasetChaosValidationActor::StaticClass(),
+			FTransform::Identity,
+			FixtureParameters);
+		if (!ChaosValidationFixture || ChaosValidationFixture->HasAnyFlags(RF_Transient) ||
+			!ChaosValidationFixture->Configure(
+				ActiveJob.DeterministicCameraLocationCm,
+				ActiveJob.DeterministicCameraRotationDegrees,
+				OutError))
+		{
+			if (OutError.IsEmpty())
+			{
+				OutError = TEXT("Could not create the non-transient Chaos rigid-body validation fixture.");
+			}
+			return false;
+		}
+	}
+
+	FActorSpawnParameters ManagerParameters;
+	ManagerParameters.Name = MakeUniqueObjectName(
+		World,
+		AChaosCacheManager::StaticClass(),
+		TEXT("SRDatasetChaosCacheManager"));
+	ManagerParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	ManagerParameters.ObjectFlags |= RF_Transient;
+	ManagerParameters.bDeferConstruction = true;
+	ChaosCacheManager = World->SpawnActor<AChaosCacheManager>(
+		AChaosCacheManager::StaticClass(),
+		FTransform::Identity,
+		ManagerParameters);
+	if (!ChaosCacheManager)
+	{
+		OutError = TEXT("Could not create the native Chaos Cache manager.");
+		return false;
+	}
+	ChaosCacheManager->bStartOnBeginPlay = false;
+	ChaosCacheManager->StartMode = EStartMode::Timed;
+	ChaosCacheManager->bCreateNewCacheCollectionAssetOnRecord = false;
+	ChaosCacheCollection = NewObject<UChaosCacheCollection>(
+		ChaosCacheManager,
+		MakeUniqueObjectName(ChaosCacheManager, UChaosCacheCollection::StaticClass(), TEXT("SRDatasetChaosCacheCollection")),
+		RF_Transient);
+	if (!ChaosCacheCollection)
+	{
+		OutError = TEXT("Could not allocate the native Chaos Cache collection.");
+		return false;
+	}
+	ChaosCacheManager->CacheCollection = ChaosCacheCollection;
+	ChaosCacheManager->SetCacheMode(
+		ActiveJob.ChaosRigidBodyCacheOutputFile.IsEmpty() ? ECacheMode::Play : ECacheMode::Record);
+	ChaosCacheManager->FinishSpawning(FTransform::Identity);
+	return true;
+}
+
+bool USRDatasetCaptureSubsystem::StartChaosRigidBodyCache(FString& OutError)
+{
+	if (!ActiveJob.bCacheChaosRigidBodyTransformsForReplay || bChaosRigidBodyCacheStarted)
+	{
+		return true;
+	}
+	if (!ChaosCacheManager || !ChaosCacheCollection)
+	{
+		OutError = TEXT("Chaos rigid-body cache manager was not prepared.");
+		return false;
+	}
+	if (ChaosValidationFixture)
+	{
+		ChaosValidationFixture->ArmForCapture();
+	}
+
+	TArray<UStaticMeshComponent*> Components;
+	for (TObjectIterator<UStaticMeshComponent> It; It; ++It)
+	{
+		UStaticMeshComponent* Component = *It;
+		AActor* Owner = Component ? Component->GetOwner() : nullptr;
+		if (!IsValid(Component) || Component->GetWorld() != GetWorld() ||
+			!Component->IsRegistered() || !Component->GetStaticMesh() ||
+			Component->HasAnyFlags(RF_ClassDefaultObject | RF_Transient) ||
+			!IsValid(Owner) || Owner->HasAnyFlags(RF_Transient) ||
+			!Component->IsSimulatingPhysics() ||
+			!Chaos::FAdapterUtil::GetBestAdapterForClass(Component->GetClass()))
+		{
+			continue;
+		}
+		Components.Add(Component);
+	}
+	Components.Sort([this](const UStaticMeshComponent& Left, const UStaticMeshComponent& Right)
+	{
+		return Left.GetPathName(GetWorld()).Compare(
+			Right.GetPathName(GetWorld()), ESearchCase::CaseSensitive) < 0;
+	});
+	if (Components.IsEmpty())
+	{
+		OutError = TEXT("Chaos rigid-body caching found no non-transient, registered, simulated UStaticMeshComponents with a native cache adapter.");
+		return false;
+	}
+
+	const bool bPlayback = !ActiveJob.ChaosRigidBodyCacheInputFile.IsEmpty();
+	if (bPlayback && Components.Num() != ChaosRigidBodyMetadataByComponentPath.Num())
+	{
+		OutError = FString::Printf(
+			TEXT("Chaos rigid-body playback topology has %d live components but the artifact contains %d."),
+			Components.Num(),
+			ChaosRigidBodyMetadataByComponentPath.Num());
+		return false;
+	}
+	if (!bPlayback)
+	{
+		ChaosRigidBodyMetadataByComponentPath.Reset();
+	}
+
+	ChaosCacheManager->ClearObservedComponents(false);
+	for (int32 ComponentIndex = 0; ComponentIndex < Components.Num(); ++ComponentIndex)
+	{
+		UStaticMeshComponent* Component = Components[ComponentIndex];
+		const FString ComponentPath = Component->GetPathName(GetWorld());
+		const FString ActorPath = Component->GetOwner()->GetPathName(GetWorld());
+		const FString ComponentClassPath = Component->GetClass()->GetPathName();
+		const FString StaticMeshPath = Component->GetStaticMesh()->GetPathName();
+		FChaosRigidBodyComponentMetadata* Metadata =
+			ChaosRigidBodyMetadataByComponentPath.Find(ComponentPath);
+		if (bPlayback)
+		{
+			if (!Metadata || Metadata->ActorPath != ActorPath ||
+				Metadata->ComponentClassPath != ComponentClassPath ||
+				Metadata->StaticMeshPath != StaticMeshPath ||
+				!Metadata->InitialWorldTransform.Equals(Component->GetComponentTransform(), 0.1))
+			{
+				OutError = FString::Printf(
+					TEXT("Chaos rigid-body playback identity or initial transform differs for %s."),
+					*ComponentPath);
+				return false;
+			}
+		}
+		else
+		{
+			FChaosRigidBodyComponentMetadata NewMetadata;
+			NewMetadata.ComponentPath = ComponentPath;
+			NewMetadata.ActorPath = ActorPath;
+			NewMetadata.ComponentClassPath = ComponentClassPath;
+			NewMetadata.StaticMeshPath = StaticMeshPath;
+			NewMetadata.CacheName = FName(*FString::Printf(
+				TEXT("SRChaos_%03d_%s"),
+				ComponentIndex,
+				*HashString(ComponentPath).Left(12)));
+			NewMetadata.InitialWorldTransform = Component->GetComponentTransform();
+			Metadata = &ChaosRigidBodyMetadataByComponentPath.Add(ComponentPath, MoveTemp(NewMetadata));
+		}
+		Metadata->RuntimeOriginalWorldTransform = Component->GetComponentTransform();
+		Metadata->RuntimeOriginalLinearVelocity = Component->GetPhysicsLinearVelocity();
+		Metadata->RuntimeOriginalAngularVelocityDegrees = Component->GetPhysicsAngularVelocityInDegrees();
+		Metadata->bRuntimeOriginalAwake = Component->IsAnyRigidBodyAwake();
+		Metadata->Component = Component;
+		if (Metadata->CacheName.IsNone() ||
+			(bPlayback && !ChaosCacheCollection->FindCache(Metadata->CacheName)))
+		{
+			OutError = FString::Printf(TEXT("Chaos rigid-body cache mapping is missing for %s."), *ComponentPath);
+			return false;
+		}
+		ChaosCacheManager->FindOrAddObservedComponent(Component, Metadata->CacheName, true);
+	}
+	if (ChaosCacheManager->GetObservedComponents().Num() != Components.Num())
+	{
+		OutError = TEXT("Native Chaos Cache rejected one or more observed rigid-body components.");
+		return false;
+	}
+
+	ChaosCacheManager->SetCacheMode(bPlayback ? ECacheMode::Play : ECacheMode::Record);
+	if (bPlayback)
+	{
+		ChaosCacheManager->SetStartTime(0.0f);
+	}
+	ChaosCacheManager->BeginEvaluate();
+	// Record mode ticks to flush pending physics-thread writes. Keep playback's
+	// otherwise no-op manager tick enabled too so scene-state provenance does not
+	// encode the cache role as an unrelated gameplay tick difference.
+	ChaosCacheManager->SetActorTickEnabled(true);
+	if (bPlayback)
+	{
+		// UE 5.7's static-mesh Chaos adapter deliberately writes unit scale into
+		// every particle track and only drives particle X/R during PreSolve. Keep
+		// fixed-topology component scale as explicit companion state so visible
+		// replay does not silently resize scaled rigid bodies.
+		for (TPair<FString, FChaosRigidBodyComponentMetadata>& Pair : ChaosRigidBodyMetadataByComponentPath)
+		{
+			if (UStaticMeshComponent* Component = Pair.Value.Component.Get())
+			{
+				Component->SetWorldScale3D(Pair.Value.InitialWorldTransform.GetScale3D());
+			}
+		}
+	}
+	for (const FObservedComponent& Observed : ChaosCacheManager->GetObservedComponents())
+	{
+		if (!Observed.GetChaosCache())
+		{
+			OutError = FString::Printf(
+				TEXT("Native Chaos Cache could not open cache '%s'."),
+				*Observed.CacheName.ToString());
+			ChaosCacheManager->EndEvaluate();
+			return false;
+		}
+	}
+	bChaosRigidBodyCacheStarted = true;
+	return true;
+}
+
+FString USRDatasetCaptureSubsystem::ComputeChaosRigidBodyFrameSha1(
+	const FChaosRigidBodyFrame& Frame)
+{
+	TArray<FString> Lines;
+	Lines.Reserve(Frame.Components.Num() + 1);
+	Lines.Add(FString::Printf(
+		TEXT("logicalFrame=%d|fixtureCollisions=%d"),
+		Frame.LogicalFrame,
+		Frame.FixtureCollisionCount));
+	for (const FChaosRigidBodyPose& Pose : Frame.Components)
+	{
+		const FVector Translation = Pose.WorldTransform.GetTranslation();
+		const FVector Scale = Pose.WorldTransform.GetScale3D();
+		FQuat Rotation = Pose.WorldTransform.GetRotation().GetNormalized();
+		if (Rotation.W < 0.0)
+		{
+			Rotation.X *= -1.0;
+			Rotation.Y *= -1.0;
+			Rotation.Z *= -1.0;
+			Rotation.W *= -1.0;
+		}
+		Lines.Add(FString::Printf(
+			TEXT("%s|t=%.17g,%.17g,%.17g|r=%.17g,%.17g,%.17g,%.17g|s=%.17g,%.17g,%.17g"),
+			*Pose.ComponentPath,
+			Translation.X, Translation.Y, Translation.Z,
+			Rotation.X, Rotation.Y, Rotation.Z, Rotation.W,
+			Scale.X, Scale.Y, Scale.Z));
+	}
+	return HashString(FString::Join(Lines, TEXT("\n")));
+}
+
+bool USRDatasetCaptureSubsystem::CaptureOrValidateChaosRigidBodyFrame(
+	const int32 FrameNumber,
+	FString& OutError)
+{
+	if (!bChaosRigidBodyCacheStarted || !ChaosCacheManager)
+	{
+		OutError = TEXT("Chaos rigid-body cache was not started before frame evaluation.");
+		return false;
+	}
+	const int32 CacheFrameIndex = FrameNumber - ActiveJob.StartFrame;
+	const int32 ExpectedFrameCount = ActiveJob.EndFrame - ActiveJob.StartFrame + 1;
+	if (CacheFrameIndex < 0 || CacheFrameIndex >= ExpectedFrameCount)
+	{
+		OutError = TEXT("Chaos rigid-body cache received an out-of-range logical frame.");
+		return false;
+	}
+
+	FChaosRigidBodyFrame ObservedFrame;
+	ObservedFrame.LogicalFrame = FrameNumber;
+	ObservedFrame.FixtureCollisionCount = ChaosValidationFixture
+		? ChaosValidationFixture->GetCollisionCount()
+		: 0;
+	TArray<FString> ComponentPaths;
+	ChaosRigidBodyMetadataByComponentPath.GetKeys(ComponentPaths);
+	ComponentPaths.Sort([](const FString& Left, const FString& Right)
+	{
+		return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+	});
+	double NativeMaxTranslationErrorCm = 0.0;
+	double NativeMaxRotationErrorDegrees = 0.0;
+	if (!ActiveJob.ChaosRigidBodyCacheOutputFile.IsEmpty())
+	{
+		// The manager's actor tick can precede this frame's PostSolve callback.
+		// Drain physics-thread writes explicitly before random-accessing the key
+		// that will become the authoritative rendered state.
+		ChaosCacheCollection->FlushAllCacheWrites();
+	}
+	if (ActiveJob.bCacheChaosRigidBodyTransformsForReplay)
+	{
+		const float CacheTimeSeconds = static_cast<float>(CacheFrameIndex + 1) *
+			static_cast<float>(ActiveJob.GetFixedDeltaSeconds());
+		for (const FString& ComponentPath : ComponentPaths)
+		{
+			FChaosRigidBodyComponentMetadata& Metadata =
+				ChaosRigidBodyMetadataByComponentPath.FindChecked(ComponentPath);
+			UStaticMeshComponent* Component = Metadata.Component.Get();
+			UChaosCache* Cache = ChaosCacheCollection
+				? ChaosCacheCollection->FindCache(Metadata.CacheName)
+				: nullptr;
+			if (!IsValid(Component) || !Cache || Cache->ParticleTracks.Num() != 1)
+			{
+				OutError = FString::Printf(
+					TEXT("Chaos rigid-body authoritative random access is unavailable for %s."),
+					*ComponentPath);
+				return false;
+			}
+			FPlaybackTickRecord TickRecord;
+			TickRecord.SetSpaceTransform(ChaosCacheManager->GetTransform());
+			TickRecord.SetLastTime(CacheTimeSeconds);
+			FTransform CachedWorldTransform;
+			Cache->EvaluateSingle(0, TickRecord, nullptr, &CachedWorldTransform, nullptr);
+			CachedWorldTransform.SetScale3D(Metadata.InitialWorldTransform.GetScale3D());
+			FTransform AuthoritativeWorldTransform = CachedWorldTransform;
+			if (!ActiveJob.ChaosRigidBodyCacheInputFile.IsEmpty())
+			{
+				const FChaosRigidBodyFrame* ExpectedFrame = ChaosRigidBodyFrames.Find(FrameNumber);
+				const FChaosRigidBodyPose* ExpectedPose = ExpectedFrame
+					? ExpectedFrame->Components.FindByPredicate(
+						[&ComponentPath](const FChaosRigidBodyPose& Pose)
+						{
+							return Pose.ComponentPath == ComponentPath;
+						})
+					: nullptr;
+				if (!ExpectedPose)
+				{
+					OutError = FString::Printf(
+						TEXT("Chaos rigid-body reference pose is missing for frame %d: %s"),
+						FrameNumber,
+						*ComponentPath);
+					return false;
+				}
+				const double NativeTranslationError = FVector::Distance(
+					CachedWorldTransform.GetTranslation(),
+					ExpectedPose->WorldTransform.GetTranslation());
+				const double NativeRotationErrorDegrees = FMath::RadiansToDegrees(
+					CachedWorldTransform.GetRotation().GetNormalized().AngularDistance(
+						ExpectedPose->WorldTransform.GetRotation().GetNormalized()));
+				NativeMaxTranslationErrorCm = FMath::Max(
+					NativeMaxTranslationErrorCm,
+					NativeTranslationError);
+				NativeMaxRotationErrorDegrees = FMath::Max(
+					NativeMaxRotationErrorDegrees,
+					NativeRotationErrorDegrees);
+				if (NativeTranslationError > 0.05 || NativeRotationErrorDegrees > 0.05)
+				{
+					OutError = FString::Printf(
+						TEXT("Native Chaos Cache random access diverged at frame %d for %s (translation %.9g cm, rotation %.9g degrees)."),
+						FrameNumber,
+						*ComponentPath,
+						NativeTranslationError,
+						NativeRotationErrorDegrees);
+					return false;
+				}
+				// The hash-validated reference pose removes the remaining serialized
+				// float/interpolation roundoff from the render-facing transform.
+				AuthoritativeWorldTransform = ExpectedPose->WorldTransform;
+			}
+			Component->SetWorldTransform(
+				AuthoritativeWorldTransform,
+				false,
+				nullptr,
+				ETeleportType::TeleportPhysics);
+		}
+	}
+	for (const FString& ComponentPath : ComponentPaths)
+	{
+		FChaosRigidBodyComponentMetadata& Metadata =
+			ChaosRigidBodyMetadataByComponentPath.FindChecked(ComponentPath);
+		UStaticMeshComponent* Component = Metadata.Component.Get();
+		if (!IsValid(Component) || !Component->IsRegistered() ||
+			Component->GetPathName(GetWorld()) != ComponentPath ||
+			!Component->GetStaticMesh() ||
+			Component->GetStaticMesh()->GetPathName() != Metadata.StaticMeshPath)
+		{
+			OutError = FString::Printf(
+				TEXT("Chaos rigid-body topology/asset identity changed at frame %d: %s"),
+				FrameNumber,
+				*ComponentPath);
+			return false;
+		}
+		FChaosRigidBodyPose Pose;
+		Pose.ComponentPath = ComponentPath;
+		Pose.WorldTransform = Component->GetComponentTransform();
+		Pose.bAwake = Component->IsAnyRigidBodyAwake();
+		ObservedFrame.Components.Add(MoveTemp(Pose));
+	}
+	ObservedFrame.AggregateSha1 = ComputeChaosRigidBodyFrameSha1(ObservedFrame);
+
+	FChaosRigidBodyFrameMetrics Metrics;
+	Metrics.CacheFrameIndex = CacheFrameIndex;
+	Metrics.ComponentCount = ObservedFrame.Components.Num();
+	Metrics.MaxTranslationErrorCm = NativeMaxTranslationErrorCm;
+	Metrics.MaxRotationErrorDegrees = NativeMaxRotationErrorDegrees;
+	for (const FChaosRigidBodyPose& Pose : ObservedFrame.Components)
+	{
+		const FChaosRigidBodyComponentMetadata& Metadata =
+			ChaosRigidBodyMetadataByComponentPath.FindChecked(Pose.ComponentPath);
+		if (!Pose.WorldTransform.Equals(Metadata.InitialWorldTransform, 0.05))
+		{
+			++Metrics.MovingComponentCount;
+		}
+	}
+
+	if (!ActiveJob.ChaosRigidBodyCacheOutputFile.IsEmpty())
+	{
+		Metrics.RecordedComponentCount = ObservedFrame.Components.Num();
+		Metrics.FixtureCollisionCount = ObservedFrame.FixtureCollisionCount;
+		Metrics.AggregateSha1 = ObservedFrame.AggregateSha1;
+		ChaosRigidBodyFrames.Add(FrameNumber, MoveTemp(ObservedFrame));
+	}
+	else
+	{
+		const FChaosRigidBodyFrame* ExpectedFrame = ChaosRigidBodyFrames.Find(FrameNumber);
+		if (!ExpectedFrame || ExpectedFrame->Components.Num() != ObservedFrame.Components.Num())
+		{
+			OutError = FString::Printf(
+				TEXT("Chaos rigid-body artifact has no compatible reference state for frame %d."),
+				FrameNumber);
+			return false;
+		}
+		for (int32 Index = 0; Index < ObservedFrame.Components.Num(); ++Index)
+		{
+			const FChaosRigidBodyPose& Actual = ObservedFrame.Components[Index];
+			const FChaosRigidBodyPose& Expected = ExpectedFrame->Components[Index];
+			if (Actual.ComponentPath != Expected.ComponentPath)
+			{
+				OutError = TEXT("Chaos rigid-body frame component ordering differs from the artifact.");
+				return false;
+			}
+			const double TranslationError = FVector::Distance(
+				Actual.WorldTransform.GetTranslation(),
+				Expected.WorldTransform.GetTranslation());
+			const double RotationErrorDegrees = FMath::RadiansToDegrees(
+				Actual.WorldTransform.GetRotation().GetNormalized().AngularDistance(
+					Expected.WorldTransform.GetRotation().GetNormalized()));
+			const double ScaleError = (
+				Actual.WorldTransform.GetScale3D() - Expected.WorldTransform.GetScale3D()).GetAbsMax();
+			Metrics.MaxTranslationErrorCm = FMath::Max(Metrics.MaxTranslationErrorCm, TranslationError);
+			Metrics.MaxRotationErrorDegrees = FMath::Max(Metrics.MaxRotationErrorDegrees, RotationErrorDegrees);
+			if (TranslationError > 0.05 || RotationErrorDegrees > 0.05 || ScaleError > 1.0e-5)
+			{
+				OutError = FString::Printf(
+					TEXT("Chaos rigid-body playback diverged at frame %d for %s (translation %.9g cm, rotation %.9g degrees, scale %.9g)."),
+					FrameNumber,
+					*Actual.ComponentPath,
+					TranslationError,
+					RotationErrorDegrees,
+					ScaleError);
+				return false;
+			}
+			++Metrics.VerifiedComponentCount;
+		}
+		Metrics.AppliedComponentCount = ObservedFrame.Components.Num();
+		Metrics.FixtureCollisionCount = ExpectedFrame->FixtureCollisionCount;
+		Metrics.AggregateSha1 = ExpectedFrame->AggregateSha1;
+	}
+
+	if (ActiveJob.bValidateChaosRigidBodyCache && FrameNumber == ActiveJob.EndFrame)
+	{
+		int32 MaxCollisionCount = Metrics.FixtureCollisionCount;
+		int32 MovingFrameCount = Metrics.MovingComponentCount > 0 ? 1 : 0;
+		for (const TPair<int32, FChaosRigidBodyFrameMetrics>& Pair : ChaosRigidBodyFrameMetrics)
+		{
+			MaxCollisionCount = FMath::Max(MaxCollisionCount, Pair.Value.FixtureCollisionCount);
+			MovingFrameCount += Pair.Value.MovingComponentCount > 0 ? 1 : 0;
+		}
+		if (MaxCollisionCount <= 0 || MovingFrameCount < 2)
+		{
+			OutError = FString::Printf(
+				TEXT("Chaos rigid-body validation did not observe the required collision and multi-frame motion (collisions=%d, movingFrames=%d)."),
+				MaxCollisionCount,
+				MovingFrameCount);
+			return false;
+		}
+	}
+	ChaosRigidBodyFrameMetrics.Add(FrameNumber, MoveTemp(Metrics));
+	return true;
+}
+
+bool USRDatasetCaptureSubsystem::SaveChaosRigidBodyCacheArtifact(FString& OutError)
+{
+	if (ActiveJob.ChaosRigidBodyCacheOutputFile.IsEmpty() ||
+		!ChaosRigidBodyCacheArtifactSha1.IsEmpty())
+	{
+		return true;
+	}
+	const int32 ExpectedFrameCount = ActiveJob.EndFrame - ActiveJob.StartFrame + 1;
+	if (!ChaosCacheManager || !ChaosCacheCollection ||
+		ChaosRigidBodyMetadataByComponentPath.IsEmpty() ||
+		ChaosRigidBodyFrames.Num() != ExpectedFrameCount ||
+		ChaosRigidBodyFrameMetrics.Num() != ExpectedFrameCount)
+	{
+		OutError = TEXT("Chaos rigid-body cache recording did not produce the complete component/frame topology.");
+		return false;
+	}
+	if (bChaosRigidBodyCacheStarted)
+	{
+		ChaosCacheManager->EndEvaluate();
+		bChaosRigidBodyCacheStarted = false;
+	}
+
+	TArray<FString> ComponentPaths;
+	ChaosRigidBodyMetadataByComponentPath.GetKeys(ComponentPaths);
+	ComponentPaths.Sort([](const FString& Left, const FString& Right)
+	{
+		return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+	});
+	TMap<FString, TArray<uint8>> SerializedCaches;
+	for (const FString& ComponentPath : ComponentPaths)
+	{
+		FChaosRigidBodyComponentMetadata& Metadata =
+			ChaosRigidBodyMetadataByComponentPath.FindChecked(ComponentPath);
+		UChaosCache* Cache = ChaosCacheCollection->FindCache(Metadata.CacheName);
+		if (!Cache || Cache->NumRecordedFrames != static_cast<uint32>(ExpectedFrameCount) ||
+			Cache->ParticleTracks.IsEmpty() || Cache->TrackToParticle.Num() != Cache->ParticleTracks.Num())
+		{
+			OutError = FString::Printf(
+				TEXT("Native Chaos Cache frame/track contract failed for %s (frames=%u, tracks=%d)."),
+				*ComponentPath,
+				Cache ? Cache->NumRecordedFrames : 0,
+				Cache ? Cache->ParticleTracks.Num() : 0);
+			return false;
+		}
+		Metadata.RecordedFrameCount = static_cast<int32>(Cache->NumRecordedFrames);
+		Metadata.ParticleTrackCount = Cache->ParticleTracks.Num();
+		Metadata.TransformKeyCount = 0;
+		for (const FPerParticleCacheData& Track : Cache->ParticleTracks)
+		{
+			Metadata.TransformKeyCount += Track.TransformData.RawTransformTrack.PosKeys.Num();
+		}
+		if (Metadata.TransformKeyCount < 2)
+		{
+			OutError = FString::Printf(
+				TEXT("Native Chaos Cache transform payload is incomplete for %s (keys=%d)."),
+				*ComponentPath,
+				Metadata.TransformKeyCount);
+			return false;
+		}
+		TArray<uint8>& CacheBytes = SerializedCaches.Add(ComponentPath);
+		FMemoryWriter CacheWriter(CacheBytes, true);
+		FObjectAndNameAsStringProxyArchive ProxyWriter(CacheWriter, false);
+		Cache->Serialize(ProxyWriter);
+		ProxyWriter.Flush();
+		if (ProxyWriter.IsError() || CacheWriter.IsError() || CacheBytes.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("Could not serialize native Chaos Cache for %s."), *ComponentPath);
+			return false;
+		}
+		Metadata.SerializedSha1 = FSHA1::HashBuffer(CacheBytes.GetData(), CacheBytes.Num()).ToString();
+	}
+
+	FBufferArchive Archive;
+	uint32 Magic = 0x53524343; // 'SRCC'
+	int32 Version = 1;
+	FString EngineVersion = FEngineVersion::Current().ToString();
+	FString WorldPackage = GetWorld()
+		? UWorld::RemovePIEPrefix(GetWorld()->GetOutermost()->GetName())
+		: FString();
+	FString CapturePolicy = TEXT("native_chaos_cache_static_mesh_fixed_topology_transform_authority_tolerance_0.05cm_0.05deg");
+	int32 StartFrame = ActiveJob.StartFrame;
+	int32 EndFrame = ActiveJob.EndFrame;
+	int32 FrameRateNumerator = ActiveJob.CaptureFrameRateNumerator;
+	int32 FrameRateDenominator = ActiveJob.CaptureFrameRateDenominator;
+	int32 RandomSeed = ActiveJob.RandomSeed;
+	Archive << Magic << Version << EngineVersion << WorldPackage << CapturePolicy;
+	Archive << StartFrame << EndFrame << FrameRateNumerator << FrameRateDenominator << RandomSeed;
+	int32 ComponentCount = ComponentPaths.Num();
+	Archive << ComponentCount;
+	for (const FString& ComponentPath : ComponentPaths)
+	{
+		FChaosRigidBodyComponentMetadata& Metadata =
+			ChaosRigidBodyMetadataByComponentPath.FindChecked(ComponentPath);
+		TArray<uint8>& CacheBytes = SerializedCaches.FindChecked(ComponentPath);
+		FString CacheName = Metadata.CacheName.ToString();
+		Archive << Metadata.ComponentPath << Metadata.ActorPath << Metadata.ComponentClassPath;
+		Archive << Metadata.StaticMeshPath << CacheName << Metadata.SerializedSha1;
+		Archive << Metadata.RecordedFrameCount << Metadata.ParticleTrackCount << Metadata.TransformKeyCount;
+		Archive << Metadata.InitialWorldTransform;
+		int64 ByteCount = CacheBytes.Num();
+		Archive << ByteCount;
+		Archive.Serialize(CacheBytes.GetData(), ByteCount);
+	}
+	int32 FrameCount = ChaosRigidBodyFrames.Num();
+	Archive << FrameCount;
+	for (int32 FrameNumber = ActiveJob.StartFrame; FrameNumber <= ActiveJob.EndFrame; ++FrameNumber)
+	{
+		FChaosRigidBodyFrame& Frame = ChaosRigidBodyFrames.FindChecked(FrameNumber);
+		Archive << Frame.LogicalFrame << Frame.FixtureCollisionCount << Frame.AggregateSha1;
+		int32 PoseCount = Frame.Components.Num();
+		Archive << PoseCount;
+		for (FChaosRigidBodyPose& Pose : Frame.Components)
+		{
+			Archive << Pose.ComponentPath << Pose.WorldTransform << Pose.bAwake;
+		}
+	}
+
+	const FString ArtifactPath = ResolveProjectFile(ActiveJob.ChaosRigidBodyCacheOutputFile);
+	const FString ParentDirectory = FPaths::GetPath(ArtifactPath);
+	if ((!IFileManager::Get().MakeDirectory(*ParentDirectory, true) &&
+		 !IFileManager::Get().DirectoryExists(*ParentDirectory)))
+	{
+		OutError = FString::Printf(TEXT("Could not create Chaos rigid-body cache directory: %s"), *ParentDirectory);
+		return false;
+	}
+	const FString TempPath = ArtifactPath + TEXT(".part");
+	if (!FFileHelper::SaveArrayToFile(Archive, *TempPath) ||
+		!IFileManager::Get().Move(*ArtifactPath, *TempPath, true, true, false, true))
+	{
+		OutError = FString::Printf(TEXT("Could not write Chaos rigid-body cache artifact: %s"), *ArtifactPath);
+		return false;
+	}
+	ChaosRigidBodyCacheArtifactSha1 = HashFile(ArtifactPath);
+	if (ChaosRigidBodyCacheArtifactSha1.IsEmpty())
+	{
+		OutError = FString::Printf(TEXT("Could not hash Chaos rigid-body cache artifact: %s"), *ArtifactPath);
+		return false;
+	}
+	bChaosRigidBodyCacheLoadedFromArtifact = false;
+	for (const TSharedPtr<FJsonValue>& FrameValue : ManifestFrames)
+	{
+		if (FrameValue.IsValid() && FrameValue->Type == EJson::Object)
+		{
+			FrameValue->AsObject()->SetStringField(
+				TEXT("chaosRigidBodyCacheArtifactSha1"),
+				ChaosRigidBodyCacheArtifactSha1);
+		}
+	}
+	return true;
+}
+
+bool USRDatasetCaptureSubsystem::LoadChaosRigidBodyCacheArtifact(FString& OutError)
+{
+	if (ActiveJob.ChaosRigidBodyCacheInputFile.IsEmpty())
+	{
+		return true;
+	}
+	if (!ChaosCacheCollection)
+	{
+		OutError = TEXT("Chaos rigid-body cache collection was not prepared before artifact loading.");
+		return false;
+	}
+	const FString ArtifactPath = ResolveProjectFile(ActiveJob.ChaosRigidBodyCacheInputFile);
+	TArray<uint8> Data;
+	if (!FFileHelper::LoadFileToArray(Data, *ArtifactPath))
+	{
+		OutError = FString::Printf(TEXT("Could not read Chaos rigid-body cache artifact: %s"), *ArtifactPath);
+		return false;
+	}
+	FMemoryReader Reader(Data, true);
+	Reader.ArMaxSerializeSize = 1024ll * 1024ll * 1024ll;
+	uint32 Magic = 0;
+	int32 Version = 0;
+	FString EngineVersion;
+	FString WorldPackage;
+	FString CapturePolicy;
+	int32 StartFrame = INDEX_NONE;
+	int32 EndFrame = INDEX_NONE;
+	int32 FrameRateNumerator = 0;
+	int32 FrameRateDenominator = 0;
+	int32 RandomSeed = 0;
+	Reader << Magic << Version << EngineVersion << WorldPackage << CapturePolicy;
+	Reader << StartFrame << EndFrame << FrameRateNumerator << FrameRateDenominator << RandomSeed;
+	const FString ExpectedWorld = GetWorld()
+		? UWorld::RemovePIEPrefix(GetWorld()->GetOutermost()->GetName())
+		: FString();
+	const FString ExpectedPolicy = TEXT("native_chaos_cache_static_mesh_fixed_topology_transform_authority_tolerance_0.05cm_0.05deg");
+	if (Reader.IsError() || Magic != 0x53524343 || Version != 1 ||
+		EngineVersion != FEngineVersion::Current().ToString() || WorldPackage != ExpectedWorld ||
+		CapturePolicy != ExpectedPolicy || StartFrame != ActiveJob.StartFrame || EndFrame != ActiveJob.EndFrame ||
+		FrameRateNumerator != ActiveJob.CaptureFrameRateNumerator ||
+		FrameRateDenominator != ActiveJob.CaptureFrameRateDenominator || RandomSeed != ActiveJob.RandomSeed)
+	{
+		OutError = TEXT("Chaos rigid-body cache artifact header does not match this engine, map, policy, frame range, rate, or seed.");
+		return false;
+	}
+
+	int32 ComponentCount = 0;
+	Reader << ComponentCount;
+	if (Reader.IsError() || ComponentCount <= 0 || ComponentCount > 4096)
+	{
+		OutError = TEXT("Chaos rigid-body cache artifact has an invalid component count.");
+		return false;
+	}
+	const int32 ExpectedFrameCount = ActiveJob.EndFrame - ActiveJob.StartFrame + 1;
+	ChaosRigidBodyMetadataByComponentPath.Reset();
+	ChaosCacheCollection->Caches.Reset();
+	FString PreviousComponentPath;
+	for (int32 ComponentIndex = 0; ComponentIndex < ComponentCount; ++ComponentIndex)
+	{
+		FChaosRigidBodyComponentMetadata Metadata;
+		FString CacheName;
+		Reader << Metadata.ComponentPath << Metadata.ActorPath << Metadata.ComponentClassPath;
+		Reader << Metadata.StaticMeshPath << CacheName << Metadata.SerializedSha1;
+		Reader << Metadata.RecordedFrameCount << Metadata.ParticleTrackCount << Metadata.TransformKeyCount;
+		Reader << Metadata.InitialWorldTransform;
+		int64 ByteCount = 0;
+		Reader << ByteCount;
+		const int64 RemainingBytes = Reader.TotalSize() - Reader.Tell();
+		if (Reader.IsError() || Metadata.ComponentPath.IsEmpty() || Metadata.ActorPath.IsEmpty() ||
+			Metadata.ComponentClassPath.IsEmpty() || Metadata.StaticMeshPath.IsEmpty() || CacheName.IsEmpty() ||
+			Metadata.SerializedSha1.Len() != 40 || Metadata.RecordedFrameCount != ExpectedFrameCount ||
+			Metadata.ParticleTrackCount <= 0 || Metadata.TransformKeyCount < 2 ||
+			Metadata.InitialWorldTransform.ContainsNaN() || ByteCount <= 0 ||
+			ByteCount > 1024ll * 1024ll * 1024ll || ByteCount > RemainingBytes ||
+			(!PreviousComponentPath.IsEmpty() &&
+			 PreviousComponentPath.Compare(Metadata.ComponentPath, ESearchCase::CaseSensitive) >= 0))
+		{
+			OutError = TEXT("Chaos rigid-body cache artifact contains invalid, duplicate, unsorted, or oversized component data.");
+			return false;
+		}
+		PreviousComponentPath = Metadata.ComponentPath;
+		Metadata.CacheName = FName(*CacheName);
+		TArray<uint8> CacheBytes;
+		CacheBytes.SetNumUninitialized(static_cast<int32>(ByteCount));
+		Reader.Serialize(CacheBytes.GetData(), ByteCount);
+		if (Reader.IsError() ||
+			FSHA1::HashBuffer(CacheBytes.GetData(), CacheBytes.Num()).ToString() != Metadata.SerializedSha1)
+		{
+			OutError = FString::Printf(TEXT("Chaos rigid-body cache payload hash mismatch: %s"), *Metadata.ComponentPath);
+			return false;
+		}
+		UChaosCache* Cache = ChaosCacheCollection->FindOrAddCache(Metadata.CacheName);
+		FMemoryReader CacheReader(CacheBytes, true);
+		CacheReader.ArMaxSerializeSize = 1024ll * 1024ll * 1024ll;
+		FObjectAndNameAsStringProxyArchive ProxyReader(CacheReader, false);
+		Cache->Serialize(ProxyReader);
+		if (ProxyReader.IsError() || CacheReader.IsError() || !CacheReader.AtEnd())
+		{
+			OutError = FString::Printf(TEXT("Could not deserialize native Chaos Cache for %s."), *Metadata.ComponentPath);
+			return false;
+		}
+		Cache->PostLoad();
+		int32 TransformKeyCount = 0;
+		for (const FPerParticleCacheData& Track : Cache->ParticleTracks)
+		{
+			TransformKeyCount += Track.TransformData.RawTransformTrack.PosKeys.Num();
+		}
+		if (Cache->NumRecordedFrames != static_cast<uint32>(Metadata.RecordedFrameCount) ||
+			Cache->ParticleTracks.Num() != Metadata.ParticleTrackCount ||
+			TransformKeyCount != Metadata.TransformKeyCount ||
+			Cache->TrackToParticle.Num() != Cache->ParticleTracks.Num())
+		{
+			OutError = FString::Printf(TEXT("Deserialized native Chaos Cache contract mismatch: %s"), *Metadata.ComponentPath);
+			return false;
+		}
+		ChaosRigidBodyMetadataByComponentPath.Add(Metadata.ComponentPath, MoveTemp(Metadata));
+	}
+
+	int32 FrameCount = 0;
+	Reader << FrameCount;
+	if (Reader.IsError() || FrameCount != ExpectedFrameCount)
+	{
+		OutError = TEXT("Chaos rigid-body cache artifact has an invalid reference-frame count.");
+		return false;
+	}
+	ChaosRigidBodyFrames.Reset();
+	for (int32 FrameIndex = 0; FrameIndex < FrameCount; ++FrameIndex)
+	{
+		FChaosRigidBodyFrame Frame;
+		Reader << Frame.LogicalFrame << Frame.FixtureCollisionCount << Frame.AggregateSha1;
+		int32 PoseCount = 0;
+		Reader << PoseCount;
+		if (Reader.IsError() || Frame.LogicalFrame != ActiveJob.StartFrame + FrameIndex ||
+			Frame.FixtureCollisionCount < 0 || Frame.AggregateSha1.Len() != 40 ||
+			PoseCount != ComponentCount)
+		{
+			OutError = TEXT("Chaos rigid-body cache artifact contains an invalid reference frame.");
+			return false;
+		}
+		FString PreviousPosePath;
+		for (int32 PoseIndex = 0; PoseIndex < PoseCount; ++PoseIndex)
+		{
+			FChaosRigidBodyPose Pose;
+			Reader << Pose.ComponentPath << Pose.WorldTransform << Pose.bAwake;
+			if (Reader.IsError() || Pose.WorldTransform.ContainsNaN() ||
+				!ChaosRigidBodyMetadataByComponentPath.Contains(Pose.ComponentPath) ||
+				(!PreviousPosePath.IsEmpty() &&
+				 PreviousPosePath.Compare(Pose.ComponentPath, ESearchCase::CaseSensitive) >= 0))
+			{
+				OutError = TEXT("Chaos rigid-body cache artifact contains an invalid or unsorted pose record.");
+				return false;
+			}
+			PreviousPosePath = Pose.ComponentPath;
+			Frame.Components.Add(MoveTemp(Pose));
+		}
+		if (ComputeChaosRigidBodyFrameSha1(Frame) != Frame.AggregateSha1)
+		{
+			OutError = FString::Printf(TEXT("Chaos rigid-body cache reference frame %d hash is corrupt."), Frame.LogicalFrame);
+			return false;
+		}
+		ChaosRigidBodyFrames.Add(Frame.LogicalFrame, MoveTemp(Frame));
+	}
+	if (Reader.IsError() || !Reader.AtEnd() ||
+		ChaosRigidBodyMetadataByComponentPath.Num() != ComponentCount ||
+		ChaosRigidBodyFrames.Num() != FrameCount)
+	{
+		OutError = TEXT("Chaos rigid-body cache artifact ended unexpectedly or contains trailing data.");
+		return false;
+	}
+	ChaosRigidBodyCacheArtifactSha1 = HashFile(ArtifactPath);
+	if (ChaosRigidBodyCacheArtifactSha1.IsEmpty())
+	{
+		OutError = FString::Printf(TEXT("Could not hash Chaos rigid-body cache artifact: %s"), *ArtifactPath);
+		return false;
+	}
+	bChaosRigidBodyCacheLoadedFromArtifact = true;
+	return true;
+}
+
+void USRDatasetCaptureSubsystem::RestoreChaosRigidBodyCache()
+{
+	if (ChaosCacheManager)
+	{
+		if (bChaosRigidBodyCacheStarted)
+		{
+			ChaosCacheManager->EndEvaluate();
+			bChaosRigidBodyCacheStarted = false;
+		}
+		ChaosCacheManager->ClearObservedComponents(false);
+	}
+	for (TPair<FString, FChaosRigidBodyComponentMetadata>& Pair : ChaosRigidBodyMetadataByComponentPath)
+	{
+		FChaosRigidBodyComponentMetadata& Metadata = Pair.Value;
+		if (UStaticMeshComponent* Component = Metadata.Component.Get())
+		{
+			Component->SetSimulatePhysics(false);
+			Component->SetWorldTransform(
+				Metadata.RuntimeOriginalWorldTransform,
+				false,
+				nullptr,
+				ETeleportType::TeleportPhysics);
+			Component->SetSimulatePhysics(true);
+			Component->SetPhysicsLinearVelocity(Metadata.RuntimeOriginalLinearVelocity, false);
+			Component->SetPhysicsAngularVelocityInDegrees(
+				Metadata.RuntimeOriginalAngularVelocityDegrees,
+				false);
+			if (Metadata.bRuntimeOriginalAwake)
+			{
+				Component->WakeAllRigidBodies();
+			}
+			else
+			{
+				Component->PutAllRigidBodiesToSleep();
+			}
+		}
+	}
+	if (ChaosCacheManager)
+	{
+		ChaosCacheManager->Destroy();
+		ChaosCacheManager = nullptr;
+	}
+	ChaosCacheCollection = nullptr;
+	if (ChaosValidationFixture)
+	{
+		ChaosValidationFixture->Destroy();
+		ChaosValidationFixture = nullptr;
+	}
+}
+
 bool USRDatasetCaptureSubsystem::SaveSkeletalPoseCacheArtifact(FString& OutError)
 {
 	if (ActiveJob.SkeletalPoseCacheOutputFile.IsEmpty())
@@ -3541,7 +4432,7 @@ USRDatasetCaptureSubsystem::FSceneStateSummary USRDatasetCaptureSubsystem::Compu
 		Actor->GetComponents(Components);
 		for (UActorComponent* Component : Components)
 		{
-			if (!IsValid(Component))
+			if (!IsValid(Component) || Component->GetOuter() != Actor)
 			{
 				continue;
 			}
@@ -3828,6 +4719,8 @@ bool USRDatasetCaptureSubsystem::RunSceneControlPreflight(FString& OutError)
 		const bool bActorControlledBySubsystem =
 			Actor == CaptureRig.Get() ||
 			Actor == ValidationFixture.Get() ||
+			Actor == ChaosValidationFixture.Get() ||
+			Actor == ChaosCacheManager.Get() ||
 			Actor == SequenceActor.Get() ||
 			Actor == DeterministicCameraActor.Get() ||
 			Actor == NonFixtureSkeletalValidationActor.Get() ||
@@ -4150,7 +5043,7 @@ bool USRDatasetCaptureSubsystem::WriteSceneControlPreflightReport(FString& OutEr
 	};
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 1);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.15.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.16.0"));
 	Root->SetBoolField(TEXT("ran"), SceneControlPreflight.bRan);
 	Root->SetBoolField(TEXT("required"), ActiveJob.bRequireSceneControlPreflight);
 	Root->SetBoolField(TEXT("passed"), SceneControlPreflight.bPassed);
@@ -4237,6 +5130,11 @@ void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTi
 		}
 		if (IsPastEvaluationRange(Status.CurrentFrame))
 		{
+			if (!SaveChaosRigidBodyCacheArtifact(Error))
+			{
+				FinishCapture(ESRDatasetCaptureState::Failed, Error);
+				return;
+			}
 			if (!SaveNiagaraSimCacheArtifact(Error))
 			{
 				FinishCapture(ESRDatasetCaptureState::Failed, Error);
@@ -4346,6 +5244,15 @@ void USRDatasetCaptureSubsystem::HandleWorldPostActorTick(UWorld* World, ELevelT
 		FinishCapture(ESRDatasetCaptureState::Failed, StateCacheError);
 		return;
 	}
+	if (ActiveJob.bCacheChaosRigidBodyTransformsForReplay)
+	{
+		FString ChaosCacheError;
+		if (!CaptureOrValidateChaosRigidBodyFrame(Status.CurrentFrame, ChaosCacheError))
+		{
+			FinishCapture(ESRDatasetCaptureState::Failed, ChaosCacheError);
+			return;
+		}
+	}
 	if (!ShouldCaptureFrame(Status.CurrentFrame))
 	{
 		return;
@@ -4399,6 +5306,11 @@ void USRDatasetCaptureSubsystem::HandleWorldTickEnd(UWorld* World, ELevelTick Ti
 			}
 			Status.State = ESRDatasetCaptureState::Capturing;
 			Status.CurrentFrame = GetInitialEvaluationFrame();
+			if (!StartChaosRigidBodyCache(Error))
+			{
+				FinishCapture(ESRDatasetCaptureState::Failed, Error);
+				return;
+			}
 		}
 		return;
 	}
@@ -4475,6 +5387,11 @@ void USRDatasetCaptureSubsystem::HandleWorldTickEnd(UWorld* World, ELevelTick Ti
 	if (IsPastEvaluationRange(Status.CurrentFrame) && !bMainViewCapturePending)
 	{
 		FString Error;
+		if (!SaveChaosRigidBodyCacheArtifact(Error))
+		{
+			FinishCapture(ESRDatasetCaptureState::Failed, Error);
+			return;
+		}
 		if (!SaveNiagaraSimCacheArtifact(Error))
 		{
 			FinishCapture(ESRDatasetCaptureState::Failed, Error);
@@ -5654,6 +6571,57 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 		NiagaraCacheMetrics ? static_cast<double>(NiagaraCacheMetrics->CachedGPUParticleCount) : 0.0);
 	Frame->SetStringField(TEXT("niagaraSimCacheArtifactSha1"), NiagaraSimCacheArtifactSha1);
 	Frame->SetBoolField(TEXT("niagaraSimCacheValidationEnabled"), ActiveJob.bValidateNiagaraSimCache);
+	const FChaosRigidBodyFrameMetrics* ChaosCacheMetrics =
+		ChaosRigidBodyFrameMetrics.Find(FrameNumber);
+	Frame->SetBoolField(
+		TEXT("chaosRigidBodyCacheEnabled"),
+		ActiveJob.bCacheChaosRigidBodyTransformsForReplay);
+	Frame->SetStringField(
+		TEXT("chaosRigidBodyCacheMode"),
+		!ActiveJob.ChaosRigidBodyCacheInputFile.IsEmpty()
+			? TEXT("apply_and_verify")
+			: (!ActiveJob.ChaosRigidBodyCacheOutputFile.IsEmpty() ? TEXT("record") : TEXT("none")));
+	Frame->SetStringField(
+		TEXT("chaosRigidBodyCacheApplicationPhase"),
+		ActiveJob.bCacheChaosRigidBodyTransformsForReplay
+			? TEXT("native_physics_presolve_plus_logical_frame_random_access_before_dataset_render_submission")
+			: TEXT("not_used"));
+	Frame->SetNumberField(
+		TEXT("chaosRigidBodyCacheFrameIndex"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->CacheFrameIndex : INDEX_NONE);
+	Frame->SetNumberField(
+		TEXT("chaosRigidBodyCacheComponentCount"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->ComponentCount : 0);
+	Frame->SetNumberField(
+		TEXT("chaosRigidBodyCacheRecordedComponentCount"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->RecordedComponentCount : 0);
+	Frame->SetNumberField(
+		TEXT("chaosRigidBodyCacheAppliedComponentCount"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->AppliedComponentCount : 0);
+	Frame->SetNumberField(
+		TEXT("chaosRigidBodyCacheVerifiedComponentCount"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->VerifiedComponentCount : 0);
+	Frame->SetNumberField(
+		TEXT("chaosRigidBodyCacheMovingComponentCount"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->MovingComponentCount : 0);
+	Frame->SetNumberField(
+		TEXT("chaosRigidBodyCacheFixtureCollisionCount"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->FixtureCollisionCount : 0);
+	Frame->SetNumberField(
+		TEXT("chaosRigidBodyCacheMaxTranslationErrorCm"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->MaxTranslationErrorCm : 0.0);
+	Frame->SetNumberField(
+		TEXT("chaosRigidBodyCacheMaxRotationErrorDegrees"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->MaxRotationErrorDegrees : 0.0);
+	Frame->SetStringField(
+		TEXT("chaosRigidBodyCacheFrameSha1"),
+		ChaosCacheMetrics ? ChaosCacheMetrics->AggregateSha1 : TEXT("not_used"));
+	Frame->SetStringField(
+		TEXT("chaosRigidBodyCacheArtifactSha1"),
+		ChaosRigidBodyCacheArtifactSha1);
+	Frame->SetBoolField(
+		TEXT("chaosRigidBodyCacheValidationEnabled"),
+		ActiveJob.bValidateChaosRigidBodyCache);
 	Frame->SetBoolField(
 		TEXT("skeletalPoseCacheReplayEnabled"),
 		ActiveJob.bCacheSkeletalAnimationPosesForReplay);
@@ -6439,7 +7407,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.15.0"));
+	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.16.0"));
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
@@ -6630,6 +7598,90 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	NiagaraSimCache->SetArrayField(TEXT("components"), NiagaraComponentRecords);
 	Root->SetObjectField(TEXT("niagaraSimCache"), NiagaraSimCache);
 
+	TSharedRef<FJsonObject> ChaosRigidBodyCache = MakeShared<FJsonObject>();
+	ChaosRigidBodyCache->SetBoolField(
+		TEXT("enabled"),
+		ActiveJob.bCacheChaosRigidBodyTransformsForReplay);
+	ChaosRigidBodyCache->SetNumberField(
+		TEXT("schemaVersion"),
+		ActiveJob.bCacheChaosRigidBodyTransformsForReplay ? 1 : 0);
+	ChaosRigidBodyCache->SetStringField(
+		TEXT("mode"),
+		!ActiveJob.ChaosRigidBodyCacheInputFile.IsEmpty()
+			? TEXT("apply_and_verify")
+			: (!ActiveJob.ChaosRigidBodyCacheOutputFile.IsEmpty() ? TEXT("record") : TEXT("none")));
+	ChaosRigidBodyCache->SetStringField(
+		TEXT("artifactFile"),
+		!ActiveJob.ChaosRigidBodyCacheInputFile.IsEmpty()
+			? ActiveJob.ChaosRigidBodyCacheInputFile
+			: ActiveJob.ChaosRigidBodyCacheOutputFile);
+	ChaosRigidBodyCache->SetStringField(TEXT("artifactSha1"), ChaosRigidBodyCacheArtifactSha1);
+	ChaosRigidBodyCache->SetBoolField(TEXT("loadedFromArtifact"), bChaosRigidBodyCacheLoadedFromArtifact);
+	ChaosRigidBodyCache->SetNumberField(
+		TEXT("componentCount"),
+		ChaosRigidBodyMetadataByComponentPath.Num());
+	ChaosRigidBodyCache->SetNumberField(TEXT("referenceFrameCount"), ChaosRigidBodyFrames.Num());
+	ChaosRigidBodyCache->SetStringField(
+		TEXT("nativeAdapterScope"),
+		TEXT("ChaosCaching_UStaticMeshComponent_fixed_topology"));
+	ChaosRigidBodyCache->SetStringField(
+		TEXT("authorityScope"),
+		TEXT("world_translation_world_rotation_and_companion_fixed_component_scale"));
+	ChaosRigidBodyCache->SetStringField(
+		TEXT("applicationPhase"),
+		ActiveJob.bCacheChaosRigidBodyTransformsForReplay
+			? TEXT("native_physics_presolve_then_exact_logical_frame_random_access_before_render")
+			: TEXT("not_used"));
+	ChaosRigidBodyCache->SetNumberField(TEXT("translationToleranceCm"), 0.05);
+	ChaosRigidBodyCache->SetNumberField(TEXT("rotationToleranceDegrees"), 0.05);
+	ChaosRigidBodyCache->SetBoolField(TEXT("fullSolverStateSerialized"), false);
+	ChaosRigidBodyCache->SetBoolField(TEXT("velocitySerialized"), false);
+	ChaosRigidBodyCache->SetBoolField(TEXT("constraintStateSerialized"), false);
+	ChaosRigidBodyCache->SetBoolField(
+		TEXT("validationFixtureEnabled"),
+		ActiveJob.bValidateChaosRigidBodyCache);
+	TArray<FString> ChaosComponentPaths;
+	ChaosRigidBodyMetadataByComponentPath.GetKeys(ChaosComponentPaths);
+	ChaosComponentPaths.Sort([](const FString& Left, const FString& Right)
+	{
+		return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+	});
+	TArray<TSharedPtr<FJsonValue>> ChaosComponentRecords;
+	for (const FString& ComponentPath : ChaosComponentPaths)
+	{
+		const FChaosRigidBodyComponentMetadata& Metadata =
+			ChaosRigidBodyMetadataByComponentPath.FindChecked(ComponentPath);
+		TSharedRef<FJsonObject> Record = MakeShared<FJsonObject>();
+		Record->SetStringField(TEXT("componentPath"), Metadata.ComponentPath);
+		Record->SetStringField(TEXT("actorPath"), Metadata.ActorPath);
+		Record->SetStringField(TEXT("componentClassPath"), Metadata.ComponentClassPath);
+		Record->SetStringField(TEXT("staticMeshPath"), Metadata.StaticMeshPath);
+		Record->SetStringField(TEXT("cacheName"), Metadata.CacheName.ToString());
+		Record->SetStringField(TEXT("serializedSha1"), Metadata.SerializedSha1);
+		Record->SetNumberField(TEXT("recordedFrameCount"), Metadata.RecordedFrameCount);
+		Record->SetNumberField(TEXT("particleTrackCount"), Metadata.ParticleTrackCount);
+		Record->SetNumberField(TEXT("transformKeyCount"), Metadata.TransformKeyCount);
+		const FVector InitialTranslation = Metadata.InitialWorldTransform.GetTranslation();
+		const FVector InitialScale = Metadata.InitialWorldTransform.GetScale3D();
+		const FQuat InitialRotation = Metadata.InitialWorldTransform.GetRotation();
+		Record->SetArrayField(TEXT("initialTranslationCm"), {
+			MakeShared<FJsonValueNumber>(InitialTranslation.X),
+			MakeShared<FJsonValueNumber>(InitialTranslation.Y),
+			MakeShared<FJsonValueNumber>(InitialTranslation.Z) });
+		Record->SetArrayField(TEXT("initialRotationQuaternion"), {
+			MakeShared<FJsonValueNumber>(InitialRotation.X),
+			MakeShared<FJsonValueNumber>(InitialRotation.Y),
+			MakeShared<FJsonValueNumber>(InitialRotation.Z),
+			MakeShared<FJsonValueNumber>(InitialRotation.W) });
+		Record->SetArrayField(TEXT("initialScale"), {
+			MakeShared<FJsonValueNumber>(InitialScale.X),
+			MakeShared<FJsonValueNumber>(InitialScale.Y),
+			MakeShared<FJsonValueNumber>(InitialScale.Z) });
+		ChaosComponentRecords.Add(MakeShared<FJsonValueObject>(Record));
+	}
+	ChaosRigidBodyCache->SetArrayField(TEXT("components"), ChaosComponentRecords);
+	Root->SetObjectField(TEXT("chaosRigidBodyCache"), ChaosRigidBodyCache);
+
 	TSharedRef<FJsonObject> Provenance = MakeShared<FJsonObject>();
 	Provenance->SetStringField(TEXT("engineVersion"), FEngineVersion::Current().ToString());
 	Provenance->SetNumberField(TEXT("engineChangelist"), FEngineVersion::Current().GetChangelist());
@@ -6661,6 +7713,9 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		TEXT("controllableStateCacheArtifactSha1"),
 		ControllableStateCacheArtifactSha1);
 	Provenance->SetStringField(TEXT("niagaraSimCacheArtifactSha1"), NiagaraSimCacheArtifactSha1);
+	Provenance->SetStringField(
+		TEXT("chaosRigidBodyCacheArtifactSha1"),
+		ChaosRigidBodyCacheArtifactSha1);
 	Provenance->SetStringField(
 		TEXT("streamingStateHashScope"),
 		TEXT("sorted_loaded_UTexture2D_path_size_asset_mips_resident_mips_streamable_pending"));
@@ -6699,6 +7754,17 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Contract->SetBoolField(TEXT("sceneControlPreflightRequired"), ActiveJob.bRequireSceneControlPreflight);
 	Contract->SetBoolField(TEXT("sceneControlPreflightPassed"), SceneControlPreflight.bPassed);
 	Contract->SetBoolField(TEXT("controllableCanonicalStateRequired"), ActiveJob.bRequireControllableState);
+	Contract->SetBoolField(
+		TEXT("chaosRigidBodyCacheEnabled"),
+		ActiveJob.bCacheChaosRigidBodyTransformsForReplay);
+	Contract->SetStringField(
+		TEXT("chaosRigidBodyAuthority"),
+		ActiveJob.bCacheChaosRigidBodyTransformsForReplay
+			? TEXT("native_UChaosCache_transform_tracks_plus_fixed_component_scale_random_accessed_by_logical_frame")
+			: TEXT("not_used"));
+	Contract->SetStringField(
+		TEXT("chaosRigidBodyUnserializedState"),
+		TEXT("linear_angular_velocity_sleep_contact_constraint_and_internal_solver_state"));
 	Contract->SetStringField(
 		TEXT("controllableCanonicalStateScope"),
 		TEXT("plugin_stores_sha1_and_utf8_byte_count_only;implementer_owns_canonical_serialization"));
@@ -6979,6 +8045,7 @@ void USRDatasetCaptureSubsystem::FinishCapture(const ESRDatasetCaptureState Fina
 		RestoreNiagara();
 		RestoreDeterministicRuntimeState();
 	}
+	RestoreChaosRigidBodyCache();
 	ClearLogicalMaterialTime();
 	RestoreSemanticValidationFixture();
 	RestoreNonFixtureSkeletalValidation();

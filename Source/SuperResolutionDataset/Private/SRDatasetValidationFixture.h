@@ -14,6 +14,7 @@ class UNiagaraSystem;
 class UPoseableMeshComponent;
 class UPrimitiveComponent;
 class UStaticMeshComponent;
+struct FHitResult;
 
 struct FSRDatasetValidationFixtureFrame
 {
@@ -193,5 +194,52 @@ private:
 	uint64 ProcessNonce = 0;
 	uint32 PrivateValue = 0;
 	int32 LogicalFrame = INDEX_NONE;
+	bool bConfigured = false;
+};
+
+/**
+ * Non-transient, validation-only Chaos fixture. ChaosCaching intentionally
+ * rejects RF_Transient components, so the subsystem owns and destroys this
+ * actor explicitly instead of relying on transient object flags.
+ */
+UCLASS(NotBlueprintable)
+class ASRDatasetChaosValidationActor final : public AActor
+{
+	GENERATED_BODY()
+
+public:
+	ASRDatasetChaosValidationActor();
+
+	bool Configure(const FVector& CameraLocationCm, const FRotator& CameraRotationDegrees, FString& OutError);
+	void ArmForCapture();
+	TArray<UStaticMeshComponent*> GetDynamicComponents() const;
+	int32 GetCollisionCount() const { return CollisionCount; }
+
+private:
+	UFUNCTION()
+	void HandlePhysicsHit(
+		UPrimitiveComponent* HitComponent,
+		AActor* OtherActor,
+		UPrimitiveComponent* OtherComponent,
+		FVector NormalImpulse,
+		const FHitResult& Hit);
+
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<USceneComponent> PhysicsRoot;
+
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UStaticMeshComponent> Ground;
+
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UStaticMeshComponent> DynamicCubeA;
+
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UStaticMeshComponent> DynamicCubeB;
+
+	FTransform InitialTransformA = FTransform::Identity;
+	FTransform InitialTransformB = FTransform::Identity;
+	FVector InitialVelocityA = FVector::ZeroVector;
+	FVector InitialVelocityB = FVector::ZeroVector;
+	int32 CollisionCount = 0;
 	bool bConfigured = false;
 };

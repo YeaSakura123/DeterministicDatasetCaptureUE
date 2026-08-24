@@ -353,6 +353,42 @@ bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 		OutError = TEXT("Niagara Sim Cache validation requires CPU/GPU semantic fixtures, a fixed deterministic camera, and at least two consecutive selected frames with offset zero.");
 		return false;
 	}
+	if ((!ChaosRigidBodyCacheInputFile.IsEmpty() || !ChaosRigidBodyCacheOutputFile.IsEmpty()) &&
+		!bCacheChaosRigidBodyTransformsForReplay)
+	{
+		OutError = TEXT("Chaos rigid-body cache input/output files require bCacheChaosRigidBodyTransformsForReplay=true.");
+		return false;
+	}
+	if (bCacheChaosRigidBodyTransformsForReplay && !bEnableChaosDeterminism)
+	{
+		OutError = TEXT("Chaos rigid-body cache replay requires bEnableChaosDeterminism=true.");
+		return false;
+	}
+	if (bCacheChaosRigidBodyTransformsForReplay && ReplayPass != ESRDatasetReplayPass::Standard)
+	{
+		OutError = TEXT("Chaos rigid-body cache replay currently requires the forward Standard replay role.");
+		return false;
+	}
+	if (bCacheChaosRigidBodyTransformsForReplay &&
+		ChaosRigidBodyCacheInputFile.IsEmpty() == ChaosRigidBodyCacheOutputFile.IsEmpty())
+	{
+		OutError = TEXT("Chaos rigid-body cache replay requires exactly one input or output artifact.");
+		return false;
+	}
+	if (!ChaosRigidBodyCacheOutputFile.IsEmpty() &&
+		(ReplayPass != ESRDatasetReplayPass::Standard || bResume))
+	{
+		OutError = TEXT("A Chaos rigid-body cache artifact must be recorded by a non-resume Standard replay.");
+		return false;
+	}
+	if (bValidateChaosRigidBodyCache &&
+		(!bCacheChaosRigidBodyTransformsForReplay || FrameStep != 1 || CaptureFrameOffset != 0 ||
+		 EndFrame - StartFrame < 11 || !bUseDeterministicCameraTransform ||
+		 !DeterministicCameraTranslationPerLogicalFrameCm.IsNearlyZero(UE_SMALL_NUMBER)))
+	{
+		OutError = TEXT("Chaos rigid-body cache validation requires native cache replay, a fixed deterministic camera, and at least twelve consecutive selected frames with offset zero.");
+		return false;
+	}
 	if (bCacheSkeletalAnimationPosesForReplay && WarmupFrames < PoseCacheFrameCount)
 	{
 		OutError = FString::Printf(

@@ -6,8 +6,10 @@
 #include "SRDatasetCaptureSubsystem.generated.h"
 
 class ASRDatasetCaptureRig;
+class ASRDatasetChaosValidationActor;
 class ASRDatasetValidationFixture;
 class ASRDatasetStateCacheValidationActor;
+class AChaosCacheManager;
 class ACameraActor;
 class AActor;
 class APlayerController;
@@ -17,7 +19,10 @@ class ULevelSequencePlayer;
 class UNiagaraComponent;
 class UNiagaraSimCache;
 class UNiagaraSystem;
+class UChaosCache;
+class UChaosCacheCollection;
 class USceneComponent;
+class UStaticMeshComponent;
 class USkinnedMeshComponent;
 class SWidget;
 
@@ -232,6 +237,54 @@ private:
 		int64 CachedGPUParticleCount = 0;
 	};
 
+	struct FChaosRigidBodyComponentMetadata
+	{
+		FString ComponentPath;
+		FString ActorPath;
+		FString ComponentClassPath;
+		FString StaticMeshPath;
+		FName CacheName = NAME_None;
+		FString SerializedSha1;
+		int32 RecordedFrameCount = 0;
+		int32 ParticleTrackCount = 0;
+		int32 TransformKeyCount = 0;
+		FTransform InitialWorldTransform = FTransform::Identity;
+		FTransform RuntimeOriginalWorldTransform = FTransform::Identity;
+		FVector RuntimeOriginalLinearVelocity = FVector::ZeroVector;
+		FVector RuntimeOriginalAngularVelocityDegrees = FVector::ZeroVector;
+		bool bRuntimeOriginalAwake = false;
+		TWeakObjectPtr<UStaticMeshComponent> Component;
+	};
+
+	struct FChaosRigidBodyPose
+	{
+		FString ComponentPath;
+		FTransform WorldTransform = FTransform::Identity;
+		bool bAwake = false;
+	};
+
+	struct FChaosRigidBodyFrame
+	{
+		int32 LogicalFrame = INDEX_NONE;
+		int32 FixtureCollisionCount = 0;
+		FString AggregateSha1;
+		TArray<FChaosRigidBodyPose> Components;
+	};
+
+	struct FChaosRigidBodyFrameMetrics
+	{
+		int32 CacheFrameIndex = INDEX_NONE;
+		int32 ComponentCount = 0;
+		int32 RecordedComponentCount = 0;
+		int32 AppliedComponentCount = 0;
+		int32 VerifiedComponentCount = 0;
+		int32 MovingComponentCount = 0;
+		int32 FixtureCollisionCount = 0;
+		double MaxTranslationErrorCm = 0.0;
+		double MaxRotationErrorDegrees = 0.0;
+		FString AggregateSha1;
+	};
+
 	void HandleWorldPreActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	void HandleWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	void HandleWorldTickEnd(UWorld* World, ELevelTick TickType, float DeltaSeconds);
@@ -266,6 +319,13 @@ private:
 	bool ValidateNiagaraSimCachePlaybackFrame(int32 FrameNumber, FString& OutError);
 	bool LoadNiagaraSimCacheArtifact(FString& OutError);
 	bool SaveNiagaraSimCacheArtifact(FString& OutError);
+	bool PrepareChaosRigidBodyCache(FString& OutError);
+	bool StartChaosRigidBodyCache(FString& OutError);
+	bool CaptureOrValidateChaosRigidBodyFrame(int32 FrameNumber, FString& OutError);
+	bool LoadChaosRigidBodyCacheArtifact(FString& OutError);
+	bool SaveChaosRigidBodyCacheArtifact(FString& OutError);
+	void RestoreChaosRigidBodyCache();
+	static FString ComputeChaosRigidBodyFrameSha1(const FChaosRigidBodyFrame& Frame);
 	FString ResolveProjectFile(const FString& InPath) const;
 	void PositionNonFixtureSkeletalValidationActor();
 	bool PrepareProjectAnimatedMaterialValidation(FString& OutError);
@@ -367,6 +427,9 @@ private:
 	bool bControllableStateCacheLoadedFromArtifact = false;
 	FString NiagaraSimCacheArtifactSha1;
 	bool bNiagaraSimCacheLoadedFromArtifact = false;
+	FString ChaosRigidBodyCacheArtifactSha1;
+	bool bChaosRigidBodyCacheLoadedFromArtifact = false;
+	bool bChaosRigidBodyCacheStarted = false;
 	FDelegateHandle PreActorTickHandle;
 	FDelegateHandle PostActorTickHandle;
 	FDelegateHandle WorldTickEndHandle;
@@ -376,6 +439,15 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<ASRDatasetValidationFixture> ValidationFixture;
+
+	UPROPERTY(Transient)
+	TObjectPtr<ASRDatasetChaosValidationActor> ChaosValidationFixture;
+
+	UPROPERTY(Transient)
+	TObjectPtr<AChaosCacheManager> ChaosCacheManager;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UChaosCacheCollection> ChaosCacheCollection;
 
 	UPROPERTY(Transient)
 	TObjectPtr<ASRDatasetStateCacheValidationActor> ControllableStateCacheValidationActor;
@@ -434,6 +506,9 @@ private:
 	TMap<int32, FControllableStateCacheFrameMetrics> ControllableStateCacheFrameMetrics;
 	TMap<FString, FNiagaraSimCacheMetadata> NiagaraSimCacheMetadataByComponentPath;
 	TMap<int32, FNiagaraSimCacheFrameMetrics> NiagaraSimCacheFrameMetrics;
+	TMap<FString, FChaosRigidBodyComponentMetadata> ChaosRigidBodyMetadataByComponentPath;
+	TMap<int32, FChaosRigidBodyFrame> ChaosRigidBodyFrames;
+	TMap<int32, FChaosRigidBodyFrameMetrics> ChaosRigidBodyFrameMetrics;
 	TMap<TWeakObjectPtr<USkinnedMeshComponent>, int32> NonFixtureSkeletalObjectIds;
 	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FPrimitiveStencilState> NonFixtureSkeletalStencilStates;
 	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FPrimitiveStencilState> StableInstanceStencilStates;

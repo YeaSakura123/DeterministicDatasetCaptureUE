@@ -374,6 +374,23 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	FString NiagaraSimCacheOutputFile;
 
 	/**
+	 * Record or replay fixed-topology simulated UStaticMeshComponents through
+	 * UE's native Chaos Cache adapter. The cache is authoritative for visible
+	 * rigid-body transforms; velocity, constraints and full solver internals are
+	 * deliberately outside this versioned contract.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Chaos Rigid Body Cache")
+	bool bCacheChaosRigidBodyTransformsForReplay = false;
+
+	/** Native Chaos rigid-body cache bundle loaded before deterministic replay. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Chaos Rigid Body Cache", meta = (EditCondition = "bCacheChaosRigidBodyTransformsForReplay"))
+	FString ChaosRigidBodyCacheInputFile;
+
+	/** Native Chaos rigid-body cache bundle written after a complete Standard replay. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism|Chaos Rigid Body Cache", meta = (EditCondition = "bCacheChaosRigidBodyTransformsForReplay"))
+	FString ChaosRigidBodyCacheOutputFile;
+
+	/**
 	 * Bind the non-shipping Temporal AA/TSR jitter phase to logical frame ID.
 	 * Required by FG replay so forward, reverse and intermediate processes sample
 	 * the same logical frame on the same raster grid.
@@ -443,6 +460,10 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	/** Spawn CPU and GPU Niagara probes and require native Sim Cache record/apply evidence. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheNiagaraSimForReplay"))
 	bool bValidateNiagaraSimCache = false;
+
+	/** Spawn two colliding rigid bodies and require native Chaos Cache record/apply evidence. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheChaosRigidBodyTransformsForReplay"))
+	bool bValidateChaosRigidBodyCache = false;
 
 	/** Assign temporary Custom Stencil IDs to non-fixture skeletal components and require their production-scene pose/motion gate. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCacheSkeletalAnimationPosesForReplay"))
