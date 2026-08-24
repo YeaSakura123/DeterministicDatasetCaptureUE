@@ -11,6 +11,7 @@ public class SuperResolutionDataset : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+			"ChaosCaching",
 			"ImageCore",
 			"LevelSequence",
 			"MovieScene",

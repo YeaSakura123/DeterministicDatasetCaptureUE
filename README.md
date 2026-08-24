@@ -1,7 +1,7 @@
 # Deterministic Dataset Capture for Unreal Engine
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.7-0E1128?logo=unrealengine)](https://www.unrealengine.com/)
-[![Release](https://img.shields.io/badge/release-0.15.0-blue)](SuperResolutionDataset.uplugin)
+[![Release](https://img.shields.io/badge/release-0.16.0-blue)](SuperResolutionDataset.uplugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
 
@@ -11,7 +11,7 @@ Deterministic Dataset Capture is a UE runtime plugin for synchronized HR, LR, de
 
 ## Certification status
 
-Version 0.15.0 deliberately separates implemented output from certified training contracts:
+Version 0.16.0 deliberately separates implemented output from certified training contracts:
 
 | Scope | Status | Meaning |
 |---|---|---|
@@ -19,6 +19,7 @@ Version 0.15.0 deliberately separates implemented output from certified training
 | Main View temporal buffers | Experimental, validated fixture | Real AfterDOF HDR, motion, depth, jitter, matrices, masks, same-pixel deferred GBuffer attributes and reason-coded, validity-gated disocclusion/history rejection are captured. Cross-instance and static-depth decisions are independently reconstructed; uncertain dynamic same-instance pixels are rejected with validity zero. A same-stage Main View/native-LR SceneCapture pixel-domain gate passes, but `nr-sr-data-v2` remains disabled until every production gate passes. |
 | FG forward/reverse endpoint plus intermediate replay | Experimental, uncertified | `motion_1_to_0` and `motion_0_to_1` come from independent processes and assemble with a real `tau=0.5` frame. Controlled skinning/WPO fixtures, project AnimBP replay, project animated-material logical time, bidirectional skeletal disocclusion, independent UI RGBA and zero visible `UWidgetComponent` residue have passed. The checked project has no project-authored WPO asset, so that external-content gate remains open. |
 | Native Niagara CPU/GPU Sim Cache replay | Experimental, validated fixture | Fixed-topology systems record all particle attributes; GPU emitters use immediate readback. A portable binary binds engine/map/rate/seed plus exact component, system and CPU/GPU emitter topology, and replay verifies the attached cache and payload counts before rendering. Custom Data Interface storage is deliberately excluded and remains a preflight/project-adapter obligation. |
+| Native Chaos rigid-body transform replay | Experimental, validated fixture | Fixed-topology simulated `UStaticMeshComponent` bodies record native `UChaosCache` transform tracks plus fixed component scale. Replay random-accesses the exact logical frame, checks native output within `0.05 cm`/`0.05 degrees`, applies the hash-validated reference pose before dataset renders and proves real collision/motion in a two-body fixture. Velocity, constraints, contacts, sleep state and full solver internals are not serialized. |
 
 The plugin rejects `nr-sr-data-v2` and direct `nr-fg-data-v1` capture jobs. Missing fields are never filled with guesses. The experimental FG assembler emits `nr-fg-data-v1` only with `frameGenerationCertified=false` and an explicit `missingRequirements` list.
 
@@ -84,7 +85,7 @@ The experimental v2 history-rejection/disocclusion policy first compares motion-
 - Continuous Level Sequence evaluation for transforms, camera cuts, skeletal animation, events and Sequencer-driven VFX.
 - Niagara Desired Age, stable seed offsets, forced solo mode and temporary deterministic/fixed-step system configuration.
 - Optional native Niagara Sim Cache recording/replay for fixed-topology CPU and GPU emitters. It captures all attributes, performs immediate GPU readback, binds exact component/system identity and verifies per-frame cached payload before any dataset render submission.
-- Chaos enhanced determinism through `p.Chaos.Solver.Deterministic`.
+- Chaos enhanced determinism through `p.Chaos.Solver.Deterministic`, plus optional native fixed-topology `UStaticMeshComponent` rigid transform recording/replay through `ChaosCaching`.
 - `SRDatasetControllable` Blueprint/C++ interface for gameplay and third-party systems.
 - Optional portable per-logical-frame `SRDatasetControllable` state artifacts. Replay applies each canonical payload after Actor ticks, before render-data submission, then requires byte-exact state readback.
 - Separate logical-frame and render-submission IDs; reference renders do not advance simulation.
@@ -102,7 +103,7 @@ The experimental v2 history-rejection/disocclusion policy first compares motion-
 - A pre-warmup scene-control preflight that inventories every registered ticking Actor/component, loaded Niagara Data Interface, and known time/per-instance/particle-random material input. It writes a canonical SHA-1 report and can reject any unclassified record before frame zero.
 - Optional stable instance IDs finalized after warmup and the streaming barrier. Fixed mode assigns collision-free Custom Stencil IDs in sorted component-path order and fails on topology drift. Dynamic mode monotonically allocates never-reused IDs to newly registered component paths, permits removal/path-stable respawn, retains a final hashed ID→component/Actor/class/first-seen map and publishes per-frame active/new ID sets. Both modes restore every prior stencil state and reject more than 255 identities.
 
-“Absolute control” is an explicit protocol, not a claim that arbitrary live input becomes deterministic automatically. The plugin can cache and reapply evaluated skeletal poses and adapter-owned canonical gameplay/VFX state, lock ordinary game-time material expressions to the logical frame, explicitly drive supported Niagara systems and record/replay native fixed-topology CPU/GPU Sim Caches. Network traffic, audio-driven state, nondeterministic or custom-storage Niagara Data Interfaces, custom async work, Material Parameter Collections, Chaos solver state and project-authored WPO without an explicit previous-frame contract still require a specialized adapter/cache and project validation. The included fixtures and project-asset probes prove the declared paths, not every possible asset.
+“Absolute control” is an explicit protocol, not a claim that arbitrary live input becomes deterministic automatically. The plugin can cache and reapply evaluated skeletal poses and adapter-owned canonical gameplay/VFX state, lock ordinary game-time material expressions to the logical frame, explicitly drive supported Niagara systems, record/replay native fixed-topology CPU/GPU Sim Caches and authoritatively replay visible fixed-topology Chaos static-mesh transforms. Network traffic, audio-driven state, nondeterministic or custom-storage Niagara Data Interfaces, custom async work, Material Parameter Collections, Chaos velocities/constraints/contacts/sleep/full solver state and project-authored WPO without an explicit previous-frame contract still require a specialized adapter/cache and project validation. The included fixtures and project-asset probes prove the declared paths, not every possible asset.
 
 ## Requirements
 
@@ -210,7 +211,7 @@ python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
   --compare '.\Saved\SRDataset\run_a'
 ```
 
-Validator v20 requires exact provenance and temporal/native-HR/reference-HR/HUD-less/UI/semantic/streaming metadata. It independently reconstructs the scene-control report, stable instance-map SHA-1 and v2 disocclusion reason grids, checks every count and exact allowlist/ID record, and enforces the requested zero-unclassified and fixed-topology gates. It also verifies the effective material texture Mip bias, logical material time, signed reverse-time delta, logical View State frame index, zero visible `UWidgetComponent` residue, native Niagara cache artifact/header/payload evidence and the optional Main View/SceneCapture pixel-domain contract. Geometry, depth, motion, validity, masks and IDs remain numerically exact. Color and the quantized deferred attributes use separate narrow numeric contracts and produce heatmaps whenever hashes differ; GBuffer validity itself remains exact.
+Validator v21 requires exact provenance and temporal/native-HR/reference-HR/HUD-less/UI/semantic/streaming metadata. It independently reconstructs the scene-control report, stable instance-map SHA-1 and v2 disocclusion reason grids, checks every count and exact allowlist/ID record, and enforces the requested zero-unclassified and fixed-topology gates. It also verifies the effective material texture Mip bias, logical material time, signed reverse-time delta, logical View State frame index, zero visible `UWidgetComponent` residue, native Niagara cache evidence, native Chaos cache artifact/topology/frame/collision/motion/error evidence and the optional Main View/SceneCapture pixel-domain contract. Geometry, depth, motion, validity, masks and IDs remain numerically exact. Color and the quantized deferred attributes use separate narrow numeric contracts and produce heatmaps whenever hashes differ; GBuffer validity itself remains exact.
 
 ### Main View / SceneCapture LR pixel-domain gate
 
@@ -355,6 +356,33 @@ python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
   --compare-mode niagara-cache
 ```
 
+### Native Chaos rigid-body transform replay
+
+Enable `bCacheChaosRigidBodyTransformsForReplay` and choose exactly one of `chaosRigidBodyCacheOutputFile` or `chaosRigidBodyCacheInputFile`. The supported UE 5.7 scope is registered, simulating, fixed-topology `UStaticMeshComponent` bodies. Recording uses the native Chaos static-mesh cache adapter and writes each serialized `UChaosCache`, exact component/Actor/class/static-mesh identity, initial pose/fixed scale and a sorted reference pose for every logical frame into one atomic schema-v1 `.srcache`.
+
+Replay requires exact engine, world, policy, frame range, rational rate, seed and component topology. It keeps the native kinematic pre-solve path, random-accesses the cache at `(frameIndex + 1) * fixedDelta`, verifies native translation/rotation within `0.05 cm`/`0.05 degrees`, preserves fixed scale and applies the artifact's exact hash-validated pose before any dataset render submission. Native cache key compression is valid: logical-frame count, not raw transform-key count, defines completeness.
+
+This is authoritative visible rigid transform replay, not a full Chaos solver snapshot. The artifact explicitly declares velocity, constraint and full solver serialization false. Forces, linear/angular velocity, contacts, sleep/island state, Geometry Collections and deformables require a future engine-specific adapter.
+
+The supplied 18-frame two-body collision workflow is intentionally low resolution for fast regression:
+
+```powershell
+& '.\Plugins\DeterministicDatasetCaptureUE\Scripts\RunDatasetCapture.ps1' `
+  -Map '/Game/FirstPerson/Lvl_FirstPerson' `
+  -Job '.\Plugins\DeterministicDatasetCaptureUE\Config\job.chaos-rigid-body-cache-record-validation.json' `
+  -Project '.\YourProject.uproject'
+
+& '.\Plugins\DeterministicDatasetCaptureUE\Scripts\RunDatasetCapture.ps1' `
+  -Map '/Game/FirstPerson/Lvl_FirstPerson' `
+  -Job '.\Plugins\DeterministicDatasetCaptureUE\Config\job.chaos-rigid-body-cache-replay-validation.json' `
+  -Project '.\YourProject.uproject'
+
+python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
+  '.\Saved\SRDataset\chaos_rigid_body_cache_replay_validation' `
+  --compare '.\Saved\SRDataset\chaos_rigid_body_cache_record_validation' `
+  --compare-mode chaos-cache
+```
+
 ## LR and HR choices
 
 `DownsampleFromHR` captures HR once and creates LR on the CPU with Box, Bilinear, Cubic Mitchell or Lanczos4. It is the strictest spatial-pair baseline but does not reproduce renderer-dependent Mip/LOD behavior.
@@ -364,6 +392,8 @@ python '.\Plugins\DeterministicDatasetCaptureUE\Scripts\ValidateDataset.py' `
 `color_hr_reference_scene_hdr` first renders at `HRResolution * ReferenceHRScale`, then downsamples to the fixed non-jittered HR grid. For example, a 1920x1080 HR target with scale 2 renders internally at 3840x2160 but still writes a 1920x1080 EXR.
 
 ## Verified release evidence
+
+Version 0.16.0 adds native fixed-topology Chaos static-mesh rigid transform recording/replay. The checked UE 5.7 D3D12 fixture recorded two moving bodies over 18 logical frames into a 13,006-byte `.srcache`; the native tracks contained one particle track each and legally compressed their transform keys to 13 and 18. Replay loaded the exact artifact SHA-1, applied and verified both bodies on all 18 frames, observed 44 accumulated hit events, and kept maximum native error below `0.000023 cm` translation and `0.000046 degrees` rotation. Validator v21 passed `499/499` for recording, `499/499` for replay and `2360/2360` for the dedicated `chaos-cache` comparison. Depth was byte exact; HR/LR color was within its narrow numeric rendering contract but not universally byte exact. Semantic capture retained `583/583`, and native Niagara record/apply regression retained `833/833`. This closes authoritative visible translation/rotation/fixed-scale replay for fixed-topology simulated `UStaticMeshComponent` bodies, not velocities, constraints, contacts, sleep/island state, Geometry Collections, deformables or full Chaos solver restart.
 
 Version 0.15.0 adds native fixed-topology Niagara Sim Cache recording/replay. The checked UE 5.7 D3D12 fixture recorded one CPU and one GPU emitter across two logical frames. Each frame exposed 1,024 cached particles in total, including 512 GPU particles; the final component payloads contained 2,048 particle-frame samples, including 1,024 GPU samples. The 287,461-byte artifact carried a manifest/provenance SHA-1, and the replay process required that exact hash while applying and verifying both components on both frames. Validator v20 passed `522/522` for recording, `522/522` for replay and `819/819` for the dedicated record/apply comparison. HR, depth, motion, masks, IDs, GBuffer and scene/cache metadata satisfied their gates; two LR scene-HDR files differed bytewise but passed the narrow numeric color contract. A separate repeated-live-record diagnostic showed byte-identical CPU payloads but different GPU payload SHA-1 values, so the certified workflow persists one authoritative cache instead of promising deterministic regeneration of live GPU simulation. Regression datasets retained `583/583` semantic, `694/694` dynamic-ID, `474/474` stable-ID and `293/293` controllable-state record/apply checks. This closes replay of one recorded native CPU/GPU particle state for the declared fixed-topology/no-custom-DI policy, not Chaos solver caching, arbitrary external Data Interface state or byte-identical re-recording of GPUComputeSim.
 
@@ -427,7 +457,7 @@ The validation Main View used a 50% render fraction. Its GPU View Uniform report
 
 The known reveal fixture rejected all 174/174 revealed pixels with valid evidence and retained 734 stable background pixels. Both history-rejection EXRs were byte-exact across the two replay processes. This validates the declared scope; it does not extend production certification to unlabeled moving, skeletal or WPO geometry.
 
-The fixture process recorded 81 actors, 105 components, three skeletal components and 180 component-space bones in the formal run. Its pure-skinning gate measured the analytic endpoint displacement within 0.02 display pixels. Its WPO object had 100% native velocity coverage in both endpoint directions: expected `-17.23077/+17.23077` pixels and measured `-17.23032/+17.23033` pixels. The project AnimBP probe produced 17–18 revealed/occluded pixels per direction and rejected every valid revealed pixel. The project material probe showed a maximum mean-RGB logical-time change of `0.421563`, while matching the same logical frame across opposite traversal directions within the numeric color gate. Seven ticking actors lacked `SRDatasetControllable`; v0.6.0 moved this audit to a dedicated pre-warmup report and made zero unclassified records a configurable hard gate. Native fixed-topology CPU/GPU payload readback is covered by the newer v0.15 gate; project-authored WPO coverage remains outside certification.
+The fixture process recorded 81 actors, 105 components, three skeletal components and 180 component-space bones in the formal run. Its pure-skinning gate measured the analytic endpoint displacement within 0.02 display pixels. Its WPO object had 100% native velocity coverage in both endpoint directions: expected `-17.23077/+17.23077` pixels and measured `-17.23032/+17.23033` pixels. The project AnimBP probe produced 17–18 revealed/occluded pixels per direction and rejected every valid revealed pixel. The project material probe showed a maximum mean-RGB logical-time change of `0.421563`, while matching the same logical frame across opposite traversal directions within the numeric color gate. Seven ticking actors lacked `SRDatasetControllable`; v0.6.0 moved this audit to a dedicated pre-warmup report and made zero unclassified records a configurable hard gate. Native fixed-topology CPU/GPU Niagara payload readback is covered by v0.15, visible fixed-topology Chaos rigid transforms by v0.16; project-authored WPO coverage remains outside certification.
 
 Five color files were not byte-identical in the standard replay, but remained inside the numeric gate (HUD-less PSNR at least 61.6 dB in that run). Depth, motion, validity, masks and IDs were exact. Cross-GPU or cross-driver bit identity is not promised.
 
