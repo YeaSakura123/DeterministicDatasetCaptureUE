@@ -718,6 +718,7 @@ def assemble(
     project_skeletal_reverse_dir: Path | None = None,
     project_animated_material_forward_dir: Path | None = None,
     project_animated_material_reverse_dir: Path | None = None,
+    project_wpo_dirs: list[Path] | None = None,
 ) -> None:
     endpoint, endpoint_report = require_capture(endpoint_dir, ENDPOINT_ROLE)
     reverse_endpoint, reverse_endpoint_report = require_capture(
@@ -748,6 +749,16 @@ def assemble(
     )
     compatibility = compatible(endpoint, reverse_endpoint, intermediate)
     endpoint_job = endpoint["job"]
+    project_wpo_report = None
+    if project_wpo_dirs is not None:
+        from VerifyProjectWPO import verify
+        for directory, role in zip(project_wpo_dirs, (ENDPOINT_ROLE, REVERSE_ENDPOINT_ROLE, INTERMEDIATE_ROLE)):
+            proof_manifest, _ = require_capture(directory, role)
+            if proof_manifest["provenance"]["pluginBinarySha1"] != endpoint["provenance"]["pluginBinarySha1"]:
+                raise ValueError("Project WPO proof uses a different plugin binary")
+        project_wpo_report = verify(project_wpo_dirs)
+        if not project_wpo_report["passed"]:
+            raise ValueError("Project WPO physical proof failed")
     if (project_skeletal_forward_dir is None) != (project_skeletal_reverse_dir is None):
         raise ValueError(
             "--project-skeletal-forward and --project-skeletal-reverse must be supplied together"
@@ -797,6 +808,24 @@ def assemble(
     pairs: list[dict[str, Any]] = []
     try:
         validation_evidence: dict[str, Any] = {}
+        if project_wpo_dirs is not None:
+            from VerifyProjectWPO import PROOF_MODALITIES
+            proof_files, proof_hashes = {}, {}
+            for role, directory in zip(("forward", "reverse", "midpoint"), project_wpo_dirs):
+                proof_manifest = load_json(directory / "manifest.json")
+                relative_files = {"manifest.json", "validation_report.json"}
+                for frame in proof_manifest["frames"]:
+                    for modality in PROOF_MODALITIES:
+                        source_file(directory, frame, modality)
+                        relative_files.add(frame["files"][modality])
+                for relative in sorted(relative_files):
+                    destination = staging / "evidence" / "project_wpo" / role / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(directory / relative, destination)
+                    key = role + "/" + relative
+                    proof_files[key] = destination.relative_to(staging).as_posix()
+                    proof_hashes[key] = sha1(destination)
+            validation_evidence["projectWPO"] = {"schemaVersion": 1, "files": proof_files, "sha1": proof_hashes, "physicalReport": project_wpo_report, "scope": "original_generated_Gallery_sinusoidal_panel; real forward/reverse motion and midpoint silhouette; proof modalities only"}
         if project_skeletal_evidence is not None:
             evidence_dir = staging / "validation_evidence" / "project_skeletal"
             evidence_dir.mkdir(parents=True)
@@ -1081,7 +1110,7 @@ def assemble(
         manifest = {
             "schemaVersion": 1,
             "contractVersion": "nr-fg-data-v1",
-            "certificationStatus": "experimental_uncertified",
+            "certificationStatus": "pending_dataset_validation" if project_wpo_report is not None and project_skeletal_evidence is not None and project_animated_material_evidence is not None and world_space_widget_residue_rejected else "experimental_uncertified",
             "frameGenerationCertified": False,
             "tau": 0.5,
             "renderSize": [endpoint_job["lRResolution"]["x"], endpoint_job["lRResolution"]["y"]],
@@ -1181,6 +1210,7 @@ def assemble(
                 "semanticFixturePreviousFrameSwitchWPOMotion": wpo_fixture_validated,
                 "semanticFixtureUIColorAlpha": wpo_fixture_validated,
                 "ordinarySceneCaptureValidated": not endpoint_job.get("bEnableSemanticValidationFixture", False),
+                "projectAuthoredWPOEndpointMotion": project_wpo_report is not None,
                 "projectAuthoredAnimBlueprintEndpointMotion": project_skeletal_evidence
                 is not None,
                 "projectAuthoredAnimBlueprintExactForwardReverseReplay": project_skeletal_evidence
@@ -1196,6 +1226,10 @@ def assemble(
                 "hudlessWorldSpaceWidgetResidueRejected": world_space_widget_residue_rejected,
             },
             "validationEvidence": validation_evidence,
+            "sourceCaptureControls": {
+                role: {"job": source["job"], "sceneControlPreflight": source.get("sceneControlPreflight", {})}
+                for role, source in (("forward", endpoint), ("reverse", reverse_endpoint), ("midpoint", intermediate))
+            },
             "provenance": {
                 **compatibility,
                 "endpointReplay": endpoint.get("provenance", {}),
@@ -1216,7 +1250,7 @@ def assemble(
                     if project_animated_material_evidence is not None
                     else ["project_animated_material_logical_time_validation"]
                 ),
-                "project_authored_wpo_endpoint_motion_validation",
+                *([] if project_wpo_report is not None else ["project_authored_wpo_endpoint_motion_validation"]),
                 *(
                     []
                     if world_space_widget_residue_rejected
@@ -1239,6 +1273,7 @@ def main() -> int:
     parser.add_argument("--reverse-endpoints", type=Path, required=True)
     parser.add_argument("--intermediate", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--project-wpo-replays", nargs=3, type=Path, metavar=("FORWARD", "REVERSE", "MIDPOINT"), help="Optional matching-binary generated Gallery WPO captures; physical proof and its images are included in the assembled output")
     parser.add_argument(
         "--project-skeletal-forward",
         type=Path,
@@ -1284,11 +1319,12 @@ def main() -> int:
             args.project_animated_material_reverse.resolve()
             if args.project_animated_material_reverse
             else None,
+            [path.resolve() for path in args.project_wpo_replays] if args.project_wpo_replays else None,
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print(f"Assembled experimental FG dataset: {args.output.resolve()}")
+    print(f"Assembled FG dataset; run ValidateFrameGenerationDataset.py before admission: {args.output.resolve()}")
     return 0
 
 

@@ -1,4 +1,5 @@
 #include "SRDatasetCaptureSubsystem.h"
+#include "SRDatasetFileIO.h"
 
 #include "SRDatasetCaptureRig.h"
 #include "SRDatasetControllable.h"
@@ -471,7 +472,7 @@ bool USRDatasetCaptureSubsystem::TryReuseCompletedSpatialDataset(
 	const FString TempPath = ManifestPath + TEXT(".part");
 	if (!FFileHelper::LoadFileToArray(OriginalBytes, *ManifestPath) ||
 		!FFileHelper::SaveArrayToFile(OriginalBytes, *TempPath) ||
-		!IFileManager::Get().Move(*ManifestPath, *TempPath, true, true, false, true))
+		!SRDataset::PublishFileAtomically(ManifestPath, TempPath, OutError))
 	{
 		OutError = TEXT("Failed to atomically preserve the verified original manifest.");
 		return false;
@@ -8223,13 +8224,12 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 
 	const FString ManifestPath = FPaths::Combine(ResolvedOutputDirectory, TEXT("manifest.json"));
 	const FString TempPath = ManifestPath + TEXT(".part");
-	if (!FFileHelper::SaveStringToFile(Json, *TempPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ||
-		!IFileManager::Get().Move(*ManifestPath, *TempPath, true, true, false, true))
+	if (!FFileHelper::SaveStringToFile(Json, *TempPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
 	{
-		OutError = FString::Printf(TEXT("Could not write manifest: %s"), *ManifestPath);
+		OutError = FString::Printf(TEXT("Could not write temporary manifest: %s"), *TempPath);
 		return false;
 	}
-	return true;
+	return SRDataset::PublishFileAtomically(ManifestPath, TempPath, OutError);
 }
 
 void USRDatasetCaptureSubsystem::CancelCapture()

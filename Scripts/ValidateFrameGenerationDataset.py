@@ -855,6 +855,55 @@ def skeletal_history_valid(state):
     return state.get("skeletalBoneSkippedComponents") == [] and ((count > 0 and state.get("skeletalBoneOverride") is True and components > 0 and bones > 0) or (count == 0 and state.get("skeletalBoneOverride") is False and components == 0 and bones == 0))
 
 
+def validate_project_wpo_evidence(checks, dataset, evidence, binary_sha1):
+    """Recompute the physical check from the included original proof images."""
+    start = len(checks)
+    try:
+        from VerifyProjectWPO import verify
+        files, hashes = evidence["files"], evidence["sha1"]
+        if evidence.get("schemaVersion") != 1 or set(files) != set(hashes):
+            raise ValueError("Invalid WPO evidence schema")
+        for key, relative in files.items():
+            path = safe_dataset_file(dataset, relative)
+            if sha1(path) != str(hashes[key]).upper():
+                raise ValueError(f"WPO proof hash mismatch: {key}")
+        roots = []
+        source_hash = hashlib.sha256(Path(__file__).with_name("ValidateDataset.py").read_bytes() + Path(__file__).with_name("TemporalGeometry.py").read_bytes()).hexdigest()
+        for role in ("forward", "reverse", "midpoint"):
+            path = safe_dataset_file(dataset, files[role + "/manifest.json"])
+            source = json.loads(path.read_text(encoding="utf-8"))
+            report = json.loads(safe_dataset_file(dataset, files[role + "/validation_report.json"]).read_text(encoding="utf-8"))
+            valid = report_complete(report) and report.get("manifestSha256") == hashlib.sha256(path.read_bytes()).hexdigest() and report.get("validatorSourceSha256") == source_hash and source["provenance"]["pluginBinarySha1"] == binary_sha1
+            add_check(checks, f"evidence.project_wpo.{role}.source_validation", valid, "Current validator, original manifest and matching capture binary")
+            roots.append(path.parent)
+        physical = verify(roots)
+        add_check(checks, "evidence.project_wpo.physical_recomputed", physical["passed"] and physical == evidence.get("physicalReport"), "Recomputed signed forward/reverse motion, coverage and real midpoint silhouette")
+    except Exception as exc:
+        add_check(checks, "evidence.project_wpo.valid", False, str(exc))
+    return len(checks) > start and all(c["passed"] for c in checks[start:])
+
+
+def validate_evidence_binding(checks, dataset, evidence, binary_sha1, label):
+    """Bind portable comparison reports to both source manifests and this build."""
+    try:
+        paths = {k: safe_dataset_file(dataset, v) for k, v in evidence["files"].items()}
+        source_hash = hashlib.sha256(Path(__file__).with_name("ValidateDataset.py").read_bytes() + Path(__file__).with_name("TemporalGeometry.py").read_bytes()).hexdigest()
+        for role in ("forward", "reverse"):
+            path = paths[role + "Manifest"]
+            source = json.loads(path.read_text(encoding="utf-8"))
+            report = json.loads(paths[role + "Validation"].read_text(encoding="utf-8"))
+            if report.get("manifestSha256") != hashlib.sha256(path.read_bytes()).hexdigest() or report.get("validatorSourceSha256") != source_hash or source["provenance"]["pluginBinarySha1"] != binary_sha1:
+                raise ValueError(f"{role} evidence is stale or from a different binary")
+        comparison = json.loads(paths["reverseComparison"].read_text(encoding="utf-8"))
+        if comparison.get("manifestSha256") != hashlib.sha256(paths["forwardManifest"].read_bytes()).hexdigest() or comparison.get("compareManifestSha256") != hashlib.sha256(paths["reverseManifest"].read_bytes()).hexdigest() or comparison.get("validatorSourceSha256") != source_hash:
+            raise ValueError("Comparison is not bound to these manifests and validator")
+        add_check(checks, f"evidence.{label}.source_binding", True, "Both manifests, current validator and matching capture binary")
+        return True
+    except Exception as exc:
+        add_check(checks, f"evidence.{label}.source_binding", False, str(exc))
+        return False
+
+
 def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
     dataset = dataset.resolve()
     manifest_path = dataset / "manifest.json"
@@ -896,10 +945,11 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         required_uncertified_gaps.update(PROJECT_SKELETAL_GAPS)
     if not hudless_world_widget_rejection_claimed:
         required_uncertified_gaps.add(WORLD_SPACE_WIDGET_GAP)
-    wpo_gap_ok = PROJECT_WPO_GAP in declared_gaps or (
+    project_wpo_claimed = validation_coverage.get("projectAuthoredWPOEndpointMotion") is True
+    wpo_gap_ok = (project_wpo_claimed and PROJECT_WPO_GAP not in declared_gaps and LEGACY_WPO_AND_MATERIAL_GAP not in declared_gaps) or (not project_wpo_claimed and (PROJECT_WPO_GAP in declared_gaps or (
         not project_animated_material_claimed
         and LEGACY_WPO_AND_MATERIAL_GAP in declared_gaps
-    )
+    )))
     animated_material_gap_ok = (
         project_animated_material_claimed
         and PROJECT_ANIMATED_MATERIAL_GAP not in declared_gaps
@@ -913,8 +963,8 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
     )
     add_check(
         checks,
-        "contract.honest_uncertified_state",
-        manifest.get("certificationStatus") == "experimental_uncertified"
+        "contract.honest_pending_or_uncertified_state",
+        (manifest.get("certificationStatus") == "experimental_uncertified" or (manifest.get("certificationStatus") == "pending_dataset_validation" and not declared_gaps))
         and manifest.get("frameGenerationCertified") is False
         and required_uncertified_gaps <= declared_gaps
         and wpo_gap_ok
@@ -995,6 +1045,13 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
         json.dumps(validation_coverage, sort_keys=True),
     )
     validation_evidence = manifest.get("validationEvidence", {})
+    binary_sha1 = manifest.get("provenance", {}).get("endpointReplay", {}).get("pluginBinarySha1")
+    project_wpo_evidence = validation_evidence.get("projectWPO")
+    project_wpo_passed = validate_project_wpo_evidence(checks, dataset, project_wpo_evidence, binary_sha1) if project_wpo_evidence is not None else False
+    add_check(checks, "sources.project_wpo_claim_matches_portable_evidence", project_wpo_claimed == project_wpo_passed, f"claimed={project_wpo_claimed} evidencePassed={project_wpo_passed}")
+    for key in ("projectSkeletalAnimation", "projectAnimatedMaterial"):
+        if validation_evidence.get(key) is not None:
+            validate_evidence_binding(checks, dataset, validation_evidence[key], binary_sha1, key)
     project_skeletal_evidence = (
         validation_evidence.get("projectSkeletalAnimation")
         if isinstance(validation_evidence, dict)
@@ -1551,15 +1608,36 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
                     f"maxAbs(motion0To1+motion1To0)={max_same_pixel_negation_error}",
                 )
 
+    complete_coverage = not declared_gaps and project_wpo_claimed and project_skeletal_claimed and project_animated_material_claimed and hudless_world_widget_rejection_claimed
+    if complete_coverage:
+        required_controls = ("bRunSceneControlPreflight", "bRequireSceneControlPreflight", "bLockExposure", "bLockMaterialTimeToLogicalFrame", "bLockTemporalJitterToLogicalFrame", "bRejectVisibleWidgetComponents", "bDisableMotionBlur", "bBlockOnStreamingBeforeCapture")
+        for role in ("forward", "reverse", "midpoint"):
+            controls = manifest.get("sourceCaptureControls", {}).get(role, {})
+            job, preflight = controls.get("job", {}), controls.get("sceneControlPreflight", {})
+            valid = all(job.get(k) is True for k in required_controls) and job.get("bAllowDynamicInstanceIdTopology") is False and preflight.get("passed") is True and preflight.get("materialCompileErrorsChecked") is True
+            add_check(checks, f"contract.supported_scope_controls.{role}", valid, "Strict preflight, fixed component identity, logical time/jitter/exposure and isolated UI")
     passed = all(check["passed"] for check in checks)
+    admitted = passed and complete_coverage
+    scope = {
+        "contract": "nr-fg-data-v1",
+        "engineWorkflow": "UE 5.7 Windows Editor Main View; independent forward/reverse/midpoint replays",
+        "scenePolicy": "strict scene-control preflight, fixed topology, stable uint8 component identities",
+        "trainingPixelPolicy": "use motion/visibility only where their validity is one; exclude reactive/transparency risk pixels from opaque correspondence losses",
+        "visibilityLimit": "component correspondence and tested skeletal reveal; unknown same-component self-occlusion remains invalid",
+        "replayCoverage": "project AnimBP pose cache, controlled-lighting animated material, original sinusoidal WPO panel",
+        "exclusions": "arbitrary temporal lighting equality, external/random state and unvalidated custom simulation/WPO are not certified",
+    }
     report = {
-        "validatorVersion": 7,
+        "validatorVersion": 8,
+        "manifestSha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "validatorSourceSha256": hashlib.sha256(b"".join(Path(__file__).with_name(name).read_bytes() for name in ("ValidateFrameGenerationDataset.py", "VerifyProjectWPO.py", "ValidateTemporalAcceptance.py", "TemporalGeometry.py", "ValidateDataset.py"))).hexdigest(),
         "dataset": str(dataset),
         "contractVersion": manifest.get("contractVersion"),
-        "certificationStatus": manifest.get("certificationStatus"),
-        "frameGenerationCertified": bool(manifest.get("frameGenerationCertified", False)),
+        "certificationStatus": "validated_supported_scope" if admitted else "experimental_uncertified",
+        "frameGenerationCertified": admitted,
         "formatAndIntegrityGate": "pass" if passed else "fail",
-        "certificationGate": "not_certified",
+        "certificationGate": "supported_scope_pass" if admitted else "not_certified",
+        "certificationScope": scope if admitted else None,
         "checksPassed": sum(check["passed"] for check in checks),
         "checksTotal": len(checks),
         "checks": checks,
@@ -1569,7 +1647,7 @@ def validate(dataset: Path) -> tuple[dict[str, Any], bool]:
             "A passing integrity gate proves that the isolated forward-endpoint, reverse-endpoint, "
             "and intermediate replays were "
             "assembled without path, hash, shape, numeric, timing, matrix, or declared-provenance "
-            "violations. It does not certify nr-fg-data-v1 while the manifest lists missing requirements."
+            "violations. Admission applies only to certificationScope when every evidence and integrity gate passes; the producer manifest never certifies itself."
         ),
     }
     return report, passed
@@ -1589,7 +1667,7 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    state = "PASS (UNCERTIFIED)" if passed else "FAIL"
+    state = ("PASS (SUPPORTED SCOPE)" if report["frameGenerationCertified"] else "PASS (UNCERTIFIED)") if passed else "FAIL"
     print(f"{state}: {report['checksPassed']}/{report['checksTotal']} integrity checks; report={report_path}")
     return 0 if passed else 1
 

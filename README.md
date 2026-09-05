@@ -107,7 +107,7 @@ Current/previous matrices, jitter units/phases, pre-exposure, sizes, logical tim
 
 Dynamic same-component self-occlusion is rejected with decision validity zero where surface identity is unproven. Respect validity masks in losses and history reuse. Strict preflight rejects unsupported ticking/random state; an allowlist is an audited exception, not proof that the plugin controls that system. Arbitrary external state, custom Niagara Data Interfaces, full Chaos solver state and unrestricted project WPO are not automatically deterministic.
 
-FG uses independent forward endpoint, reverse endpoint and real midpoint processes. Reverse motion is rendered, never constructed by negating forward motion. Its assembler/validator currently retain explicit uncertified status and missing-evidence fields; current-version regression is tracked in the release checklist.
+FG uses independent forward endpoint, reverse endpoint and real midpoint processes. Reverse motion is rendered, never constructed by negating forward motion. The producer stays pending or explicitly uncertified; the validator admits a bounded capture contract only after all integrity, project WPO, skeletal and animated-material evidence passes. The report records that scope and preserves unknown-pixel validity limits. See [FG acceptance and evidence commands](Docs/FG_ACCEPTANCE.md).
 
 API details, specialized cache workflows and older evidence remain in [legacy reference](Docs/LEGACY_REFERENCE.md). Prior audit findings and limited temporal acceptance are documented in [temporal acceptance](Docs/TEMPORAL_ACCEPTANCE.md).
 

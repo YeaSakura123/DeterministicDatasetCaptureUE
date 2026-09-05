@@ -120,6 +120,7 @@ def main():
         sequence(name, a, b, mover, cm, om)
     sequence("CameraCut", a, b, mover, cut=True)
     sequence("CameraFast", a, b, mover, camera_motion=True, camera_range=96)
+    sequence("SameSpeed", a, b, mover, camera_motion=True, object_motion=True, camera_range=120)
     unreal.log("SR temporal acceptance assets ready: " + MAP)
 
 

@@ -15,6 +15,8 @@ import os
 import re
 import tarfile
 from collections import defaultdict
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 
@@ -106,25 +108,60 @@ def check_job(manifest, requested):
             raise ValueError(f"Captured job differs from requested {name}: {value}")
 
 
-def build_index(plan_path, project_path, output, purpose):
-    from ValidateDataset import validate
+def validate_clip(item, report_path, purpose, reuse_reports):
+    from ValidateDataset import validate, VALIDATOR_SOURCE_SHA256
+    manifest_path = item["root"] / "manifest.json"
+    manifest = read_json(manifest_path)
+    check_job(manifest, item["job"])
+    report = read_json(report_path) if reuse_reports and report_path.is_file() else None
+    reusable = report is not None and report.get("manifestSha256") == digest(manifest_path) and report.get("validatorSourceSha256") == VALIDATOR_SOURCE_SHA256 and report.get("formatAndIntegrityGate") == "pass" and report.get("checksTotal", 0) > 0 and report.get("checksPassed") == report.get("checksTotal") and all(c.get("passed") for c in report.get("checks", []))
+    if reusable:
+        print(f"Reusing current validation: {item['id']}; rechecking every source hash", flush=True)
+        passed = True
+    else:
+        print(f"Validating {item['id']} ({item['split']})", flush=True)
+        report, passed = validate(item["root"], None)
+        atomic_json(report_path, report)
+    if not passed or report["manifestSha256"] != digest(manifest_path):
+        raise ValueError(f"Validation failed or manifest changed: {item['id']}; {report_path}")
+    verify_manifest_files(item["root"], manifest)
+    if purpose == "temporal-sr" and not (manifest.get("contractVersion") == "nr-sr-data-v2" and report.get("temporalContractGate") == "pass"):
+        raise ValueError(f"{item['id']}: temporal admission requires the complete nr-sr-data-v2 controls and validation gate")
+    return manifest
+
+
+def validated_jobs(jobs, output, purpose, workers, reuse_reports):
+    def report_path(item):
+        return output.parent / "reports" / (item["id"] + ".json")
+    if workers == 1:
+        for item in jobs:
+            yield item, report_path(item), validate_clip(item, report_path(item), purpose, reuse_reports)
+        return
+    # Submit at most `workers` clips: large image/report data remains bounded.
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        pending = deque()
+        iterator = iter(jobs)
+        for _ in range(workers):
+            item = next(iterator, None)
+            if item is not None:
+                pending.append((item, pool.submit(validate_clip, item, report_path(item), purpose, reuse_reports)))
+        while pending:
+            item, future = pending.popleft()
+            yield item, report_path(item), future.result()
+            item = next(iterator, None)
+            if item is not None:
+                pending.append((item, pool.submit(validate_clip, item, report_path(item), purpose, reuse_reports)))
+
+
+def build_index(plan_path, project_path, output, purpose, workers=1, reuse_reports=False):
+    if not 1 <= workers <= 4:
+        raise ValueError("workers must be between 1 and 4")
     if output.exists():
         raise ValueError(f"An immutable index already exists: {output}")
     plan, jobs = load_plan(plan_path, project_path)
     entries, totals = [], defaultdict(lambda: {"frames": 0, "seconds": 0.0, "maps": set()})
-    for item in jobs:
-        print(f"Validating {item['id']} ({item['split']})", flush=True)
+    for item, report_path, manifest in validated_jobs(jobs, output, purpose, workers, reuse_reports):
         manifest_path = item["root"] / "manifest.json"
-        manifest = read_json(manifest_path)
-        check_job(manifest, item["job"])
-        report, passed = validate(item["root"], None)
-        report_path = output.parent / "reports" / (item["id"] + ".json")
-        atomic_json(report_path, report)
-        if not passed or report["manifestSha256"] != digest(manifest_path):
-            raise ValueError(f"Validation failed or manifest changed: {item['id']}; {report_path}")
-        verify_manifest_files(item["root"], manifest)
-        if purpose == "temporal-sr" and not (manifest.get("contractVersion") == "nr-sr-data-v2" and report.get("temporalContractGate") == "pass"):
-            raise ValueError(f"{item['id']}: temporal admission requires the complete nr-sr-data-v2 controls and validation gate")
         count = len(manifest["frames"])
         fps = manifest["job"]["captureFrameRateNumerator"] / manifest["job"]["captureFrameRateDenominator"]
         seconds = count * manifest["job"]["frameStep"] / fps
@@ -259,6 +296,8 @@ def main():
     index.add_argument("--project", required=True, type=Path)
     index.add_argument("--output", required=True, type=Path)
     index.add_argument("--purpose", choices=("diagnostic", "temporal-sr"), default="diagnostic")
+    index.add_argument("--workers", type=int, default=1, help="Independent validation processes (1-4); each keeps one clip's working images")
+    index.add_argument("--reuse-validation-reports", action="store_true", help="Reuse passing reports only for identical manifests/current validator; all source file hashes are checked again")
     packer = commands.add_parser("pack")
     packer.add_argument("index", type=Path)
     packer.add_argument("--output", required=True, type=Path)
@@ -267,7 +306,7 @@ def main():
     checker.add_argument("catalog", type=Path)
     args = parser.parse_args()
     if args.command == "index":
-        result = build_index(args.plan.resolve(), args.project.resolve(), args.output.resolve(), args.purpose)
+        result = build_index(args.plan.resolve(), args.project.resolve(), args.output.resolve(), args.purpose, args.workers, args.reuse_validation_reports)
         print(json.dumps(result["totals"], indent=2))
     elif args.command == "pack":
         result = pack(args.index.resolve(), args.output.resolve(), args.samples_per_shard)

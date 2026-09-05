@@ -14,15 +14,23 @@ import numpy as np
 
 from ValidateTemporalAcceptance import erode, read
 
+PROOF_MODALITIES = ("depth_view_linear_meters", "base_color_linear", "object_id", "motion_full_current_to_previous", "velocity_coverage")
+
 
 def verify(roots):
     rows, provenance, roles = [], [], set()
     for root in roots:
         path = root / "manifest.json"
         manifest = json.loads(path.read_text(encoding="utf-8"))
+        if manifest.get("state") != "Completed":
+            raise ValueError("WPO proof capture is incomplete")
         roles.add(manifest["replayPass"])
         provenance.append({k: manifest["provenance"][k] for k in ("pluginBinarySha1", "loadedContentSha1")})
         for frame in manifest["frames"]:
+            for modality in PROOF_MODALITIES:
+                source = (root / frame["files"][modality]).resolve()
+                if not source.is_relative_to(root.resolve()) or hashlib.sha1(source.read_bytes()).hexdigest().upper() != frame["sha1"][modality].upper():
+                    raise ValueError(f"WPO proof file changed or escapes its capture: {source}")
             camera, diag = frame["camera"], frame["temporalDiagnostics"]
             camera_ok = camera["locationCm"] == [0, -250, 170] and camera["rotationDeg"] == [0, 0, 0] and abs(camera["fovDegrees"] - 90) < 1e-4
             depth = read(root, frame, "depth_view_linear_meters", "R")[..., 0]

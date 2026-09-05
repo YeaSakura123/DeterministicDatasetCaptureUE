@@ -2615,6 +2615,10 @@ def aggregate_training_profile(frame_profiles: list[dict[str, Any]]) -> dict[str
     }
 
 
+# Bind reports to the source loaded by this process, including long batch runs.
+VALIDATOR_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("TemporalGeometry.py").read_bytes()).hexdigest()
+
+
 def validate(
     dataset: Path,
     compare: Path | None,
@@ -2626,7 +2630,7 @@ def validate(
         raise FileNotFoundError(f"manifest not found: {manifest_path}")
     manifest_bytes = manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
-    validator_source_sha256 = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("TemporalGeometry.py").read_bytes()).hexdigest()
+    validator_source_sha256 = VALIDATOR_SOURCE_SHA256
     checks: list[dict[str, Any]] = []
     stats: dict[str, list[dict[str, Any]]] = {}
 
@@ -4485,9 +4489,17 @@ def validate(
                 bool(finite.all()),
                 f"finite_fraction={finite.mean():.9f}",
             )
-            channel_min = np.nanmin(pixels, axis=(0, 1))
-            channel_max = np.nanmax(pixels, axis=(0, 1))
-            channel_mean = np.nanmean(pixels, axis=(0, 1), dtype=np.float64)
+            # Contiguous channel planes avoid NumPy's slow interleaved-channel
+            # reduction. Every pixel still participates; there is no sampling.
+            planes = np.ascontiguousarray(pixels.transpose(2, 0, 1)).reshape(pixels.shape[2], -1)
+            if finite.all():
+                channel_min = planes.min(axis=1)
+                channel_max = planes.max(axis=1)
+                channel_mean = planes.mean(axis=1, dtype=np.float64)
+            else:
+                channel_min = np.nanmin(planes, axis=1)
+                channel_max = np.nanmax(planes, axis=1)
+                channel_mean = np.nanmean(planes, axis=1, dtype=np.float64)
             entry = {
                 "logicalFrameId": frame_id,
                 "minRGBA": channel_min.tolist(),
@@ -5297,7 +5309,7 @@ def validate(
                 reset,
                 current_pixels,
             ) = nonfixture_skeletal_records[index]
-            _, previous_probe_states, _, previous_pixels = (
+            previous_frame_id, previous_probe_states, _, previous_pixels = (
                 nonfixture_skeletal_records[index - 1]
             )
             if reset:
@@ -5333,8 +5345,19 @@ def validate(
             ).astype(np.int32)
             previous_probe = np.isin(previous_ids, list(project_ids))
             current_probe = np.isin(current_ids, list(project_ids))
-            newly_revealed = previous_probe & ~current_probe
-            newly_occluded = ~previous_probe & current_probe
+            current_frame = next(f for f in frames if int(f["logicalFrameId"]) == frame_id)
+            previous_frame = next(f for f in frames if int(f["logicalFrameId"]) == previous_frame_id)
+            fixed_camera = current_frame["camera"] == previous_frame["camera"]
+            add_check(checks, f"frame_{frame_id:06d}.project_skeletal_visibility_fixed_camera", fixed_camera, "The authored pose probe uses a fixed camera; its silhouette comparison still requires raster jitter alignment")
+            height, width = current_ids.shape
+            offset = matrix_jitter_raster_offset(current_frame["temporalDiagnostics"], previous_frame["temporalDiagnostics"], (width, height))
+            yy, xx = np.mgrid[:height, :width]
+            px = np.floor(xx + .5 + offset[0]).astype(np.int32)
+            py = np.floor(yy + .5 + offset[1]).astype(np.int32)
+            inside = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+            previous_probe = previous_probe[py.clip(0, height - 1), px.clip(0, width - 1)]
+            newly_revealed = previous_probe & ~current_probe & inside
+            newly_occluded = ~previous_probe & current_probe & inside
             rejection = current_pixels["history_rejection_mask"][..., 0]
             rejection_valid = current_pixels["history_rejection_valid"][..., 0]
             transition_detail: dict[str, Any] = {}

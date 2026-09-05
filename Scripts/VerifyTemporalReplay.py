@@ -43,7 +43,9 @@ def verify(base_path, comparison_path, reverse_order):
                 mismatches.append(dict(frame=a["frame"], temporalField=field))
         first_order = [s["modality"] for s in a["renderSubmissions"]]
         second_order = [s["modality"] for s in b["renderSubmissions"]]
-        expected = ["lr", "depth", "hr", "hr_reference", "main_view_temporal"] if reverse_order else first_order
+        reference = [name for name in first_order if name.startswith("hr_reference")]
+        other = [name for name in first_order if name not in {"hr", "lr", "depth"} and name not in reference]
+        expected = ["lr", "depth", "hr"] + reference + other if reverse_order else first_order
         if second_order != expected or (reverse_order and first_order == second_order):
             mismatches.append(dict(frame=a["frame"], field="actual_submission_order"))
     return dict(base=str(base_path.resolve()), comparison=str(comparison_path.resolve()),
