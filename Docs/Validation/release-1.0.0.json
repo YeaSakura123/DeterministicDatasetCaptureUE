@@ -1,0 +1,142 @@
+{
+  "schema": "sr-release-validation-v1",
+  "version": "1.0.0",
+  "date": "2026-09-06",
+  "validationPassed": true,
+  "releaseUrl": "https://github.com/YeaSakura123/DeterministicDatasetCaptureUE/releases/tag/v1.0.0",
+  "engine": "UE 5.7.4 CL 51494982 / Windows Editor / D3D12 SM6",
+  "fullCorpus": {
+    "schema": "sr-formal-delivery-acceptance-v1",
+    "passed": true,
+    "indexSha256": "22d75b3f5f536cba45535b8c832922eb1cdbe455337cf47d7f34b3a2358e2c2e",
+    "catalogSha256": "4e3ac902d874431fb607557dbcd940e4b19bc54c2a229c97ce63772d5c904481",
+    "framesRead": 18000,
+    "clipsRead": 30,
+    "splitFrames": {
+      "train": 14400,
+      "validation": 1800,
+      "test": 1800
+    },
+    "sampledSeconds": 600,
+    "trainMaps": [
+      "/Game/SRFormalV1/Courtyard",
+      "/Game/SRFormalV1/Gallery",
+      "/Game/SRFormalV1/Workshop"
+    ],
+    "unseenTestMaps": [
+      "/Game/SRFormalV1/AtriumTest"
+    ],
+    "packingProfile": "temporal-sr",
+    "shardCount": 144,
+    "shardBytes": 264333998080,
+    "allShardAndSampleHashesVerified": true,
+    "clipBoundariesAndResetPreserved": true,
+    "trainingModalitiesComplete": true,
+    "checksPassed": 3945814,
+    "checksTotal": 3945814,
+    "nativeHRFrames": 18000,
+    "referenceHR16SampleFrames": 2400,
+    "renderSize": [
+      960,
+      540
+    ],
+    "displaySize": [
+      1920,
+      1080
+    ],
+    "delivery": "Local master captures and training shards; public release contains a 32-frame sample and all admission reports",
+    "validatorVersion": 23,
+    "validatorSourceSha256": "1d6b7e23145e5555b252fa8b71c1d65c5172bcb216941a6e1d0337bf44c2dcde"
+  },
+  "portableEvidence": {
+    "FGFixture": {
+      "passed": 199,
+      "total": 199,
+      "validatorSourceSha256": "8179e8c89cd3d3b65273d7971548fa0ae4e5194c400dce3c1319333eca0e6262",
+      "manifestSha256": "b1d7942b2c94928f2940fd3f40feabf2793ae2ed2e3bb516706a379dd9e30b9b"
+    },
+    "FGProject": {
+      "passed": 192,
+      "total": 192,
+      "validatorSourceSha256": "8179e8c89cd3d3b65273d7971548fa0ae4e5194c400dce3c1319333eca0e6262",
+      "manifestSha256": "e6056c88c2c064da029ab2e1db4a744345fbfe9a48260476e036aa0b4dbde988"
+    },
+    "MainView": {
+      "passed": 2072,
+      "total": 2072,
+      "validatorSourceSha256": "7536814c7738cceb9b8162d17bd575f8f74f22e355da28c0ae4a78086131bf0d",
+      "manifestSha256": "f2d18b627f03af8d1bd5680affb0b2de2ce383de71ea3b7b6c1d5d0f491f45a5"
+    },
+    "ReferenceArithmetic": {
+      "passed": 638,
+      "total": 638,
+      "validatorSourceSha256": "7536814c7738cceb9b8162d17bd575f8f74f22e355da28c0ae4a78086131bf0d",
+      "manifestSha256": "75abad6ed86ef5d3f21311e64c54f94dd54921a6c1cb25b6698ed22d21000c04"
+    }
+  },
+  "referenceArithmetic": {
+    "schema": "sr-reference-arithmetic-v1",
+    "manifestSha256": "75abad6ed86ef5d3f21311e64c54f94dd54921a6c1cb25b6698ed22d21000c04",
+    "passed": true,
+    "checks": [
+      {
+        "logicalFrameId": 0,
+        "passed": true,
+        "maxAbs": 0.0,
+        "meanAbs": 0.0,
+        "samples": 16
+      },
+      {
+        "logicalFrameId": 1,
+        "passed": true,
+        "maxAbs": 0.0,
+        "meanAbs": 0.0,
+        "samples": 16
+      }
+    ]
+  },
+  "sourceEquivalence": {
+    "schema": "sr-release-source-equivalence-v1",
+    "scope": "Source and Shaders files; line endings normalized; descriptor and Python/docs tracked separately",
+    "files": {
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetBlueprintLibrary.cpp": "b9e78f95e6341293ac875f7ab404cfa77025651de391916cd1fa14144c74bb59",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetCaptureRig.cpp": "8d5b800dacf8d2d23a53afd6d706570b3b19de8e60bfa34e08eb10b28c298787",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetCaptureRig.h": "572f3f12bc86b93a86b75126db9dbcae06c4a49ce38d2efbf6ea68db84c41c9f",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetCaptureSubsystem.cpp": "1f92cf481a9f13d6ab4273a8a44feff58ad4cbfe61d8b86457cdea014fcf26b5",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetFileIO.cpp": "796a5c31654369180999227165fb18a72fc78c6a03c56ef346c86bd592e68f64",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetFileIO.h": "6b2eda46309ba8a7d63d3e352170692f796dde3d5174ed26f5989df73b59804f",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetImageWriter.cpp": "1da74789cbe7dee0519a9cf398bfe980ba9311e683f24917c19095848d764204",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetImageWriter.h": "8ecfa10ccf858e73e6f4fac4ddc77dbfd6b2aab50c50045f30e6eca241dd816f",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetTypes.cpp": "fec374d68a18a68328aa5faba2ff25f03464a1e981af845ac6be87372b314e3a",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetValidationFixture.cpp": "e4b5ccb4f97da85f0e1215b7ed8cbb8f919d456312ab03230ac927a77ac5851a",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetValidationFixture.h": "49b919fc7242dfa04988155e67b4e595673082f89bc1da84d5af257cd93fb09d",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetViewExtension.cpp": "de485af8b60f2aad49036e8d840ad925d8a0696b784fea339288d757257bc159",
+      "Source\\SuperResolutionDataset\\Private\\SRDatasetViewExtension.h": "f2960f683f2a805dd7a04f987d7d6bde303a7ce9732472d7767812c468723e5d",
+      "Source\\SuperResolutionDataset\\Private\\SuperResolutionDatasetModule.cpp": "294fe1868220a701c2a8eb3b9811bb9d5035b872b4c6e350b04d2d359760f2e2",
+      "Source\\SuperResolutionDataset\\Private\\Tests\\SRDatasetFileIOTests.cpp": "86f823ceb5e6231f0b1e1b794221d370bb7e094f32d760d5cd33d520555b4bbe",
+      "Source\\SuperResolutionDataset\\Private\\Tests\\SRDatasetTypesTests.cpp": "65fac92a87bc261dd41b3ab413cbcf55724a2d28d8b0abb975b38f49704de19b",
+      "Source\\SuperResolutionDataset\\Public\\SRDatasetBlueprintLibrary.h": "cbfbce9a3241c7d80027a85d9d7bfa71c00bb83825f287c28716aa947a7b7eae",
+      "Source\\SuperResolutionDataset\\Public\\SRDatasetCaptureSubsystem.h": "f6ae02e23fe0f16ddc433d0af0572860cd1dff5e51418df9ff30a54d401b8fcb",
+      "Source\\SuperResolutionDataset\\Public\\SRDatasetControllable.h": "2f93f3ff4eb03c3bb1a0ad7b5207ffc0e0f0a4ef38829c9a5f52352e9e12d660",
+      "Source\\SuperResolutionDataset\\Public\\SRDatasetTypes.h": "a3274a2f1d8f14831dc477f57a437c43e024e09c491cbfc6a1a379cab286792e",
+      "Source\\SuperResolutionDataset\\SuperResolutionDataset.Build.cs": "ff179a56bee1facd3f7edba4238be72c3ea4baf3f49cff51d6a0b9d9de12f34a",
+      "Shaders\\Private\\SRDatasetExtract.usf": "c401b0b83c63e8335c6d458ebe71434228c3ff6dc31df0a7ed122b0a0aa6832f"
+    },
+    "packagedSourceMatchesCaptureSource": true,
+    "captureBinarySha1": "57DF0B8BCF4E9087A4CA888B85EBBAA677348F11",
+    "releaseBinarySha1": "10CE36611AE1AF93B74A6887D42121C1F1BD199D"
+  },
+  "scope": [
+    "Fixed topology with at most 255 stable component IDs",
+    "Strict audited scene controls, locked logical time/exposure/jitter",
+    "Opaque correspondence only where validity masks permit",
+    "FG scope requires all portable project WPO, skeletal and animated-material proofs"
+  ],
+  "limitations": [
+    "Transparent composition is not opaque surface ground truth",
+    "Unknown dynamic same-component self-occlusion remains invalid",
+    "No universal deterministic claim for arbitrary historical GI, custom simulations or external state",
+    "Synchronous GPU readback; asynchronous bounded compression and disk writes",
+    "Cooked games, stereo and split-screen are outside verified support"
+  ]
+}

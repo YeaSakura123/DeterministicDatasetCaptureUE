@@ -1,35 +1,35 @@
 {
-	"FileVersion": 3,
-	"Version": 23,
-	"VersionName": "1.0.0-rc.1",
-	"FriendlyName": "Super Resolution Dataset",
-	"Description": "Deterministic scene replay with synchronized spatial, temporal, semantic and experimental frame-generation dataset capture.",
-	"Category": "Rendering",
-	"CreatedBy": "UnrealCodeDemo",
-	"CanContainContent": true,
-	"IsBetaVersion": true,
-	"Installed": false,
-	"Modules": [
-		{
-			"Name": "SuperResolutionDataset",
-			"Type": "Runtime",
-			"LoadingPhase": "PostConfigInit",
-			"TargetAllowList": [
-				"Editor"
-			]
-		}
-	],
-	"Plugins": [
-		{
-			"Name": "Niagara",
-			"Enabled": true
-		},
-		{
-			"Name": "ChaosCaching",
-			"Enabled": true
-		}
-	],
-	"SupportedTargetPlatforms": [
-		"Win64"
-	]
+  "FileVersion": 3,
+  "Version": 24,
+  "VersionName": "1.0.0",
+  "FriendlyName": "Super Resolution Dataset",
+  "Description": "Deterministic scene replay with synchronized super-resolution and frame-interpolation dataset capture, validation and training-data delivery.",
+  "Category": "Rendering",
+  "CreatedBy": "UnrealCodeDemo",
+  "CanContainContent": true,
+  "IsBetaVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "SuperResolutionDataset",
+      "Type": "Runtime",
+      "LoadingPhase": "PostConfigInit",
+      "TargetAllowList": [
+        "Editor"
+      ]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "Niagara",
+      "Enabled": true
+    },
+    {
+      "Name": "ChaosCaching",
+      "Enabled": true
+    }
+  ],
+  "SupportedTargetPlatforms": [
+    "Win64"
+  ]
 }

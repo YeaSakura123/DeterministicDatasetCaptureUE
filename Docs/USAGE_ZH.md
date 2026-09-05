@@ -1,6 +1,8 @@
 # 使用说明
 
-当前是 1.0 候选版。实际验收和未完成项目见 [交付核对](RELEASE_PLAN.md)，旧 API 与专项缓存说明见 [历史文档](LEGACY_USAGE_ZH.md)。
+当前正式版为 1.0.0。下载入口见 [GitHub Release](https://github.com/YeaSakura123/DeterministicDatasetCaptureUE/releases/tag/v1.0.0)，实际交付和支持范围见 [正式版验收](RELEASE_VALIDATION.md)。旧 API 与专项缓存说明见 [历史文档](LEGACY_USAGE_ZH.md)。
+
+首次使用可下载独立 Demo，安装 Python 依赖后运行 `CaptureDemo.ps1 -Editor "<UE>/Engine/Binaries/Win64/UnrealEditor-Cmd.exe"`。它已在干净宿主上完成 8 帧 1080p/ref16 采集和验证。完整本地语料为 30 段、18,000 帧、10 分钟；GitHub 另提供 32 帧训练示例和可离线复验的证据包。
 
 ## 安装与采集
 
@@ -47,7 +49,7 @@ python Scripts/RunDatasetBatch.py Jobs/v1/plan.json `
   --status Jobs/v1/status.json --workspace-ddc
 python Scripts/DatasetDelivery.py index Jobs/v1/plan.json `
   --project "D:/Project/Project.uproject" --purpose temporal-sr --output Delivery/v1/index.json
-python Scripts/DatasetDelivery.py pack Delivery/v1/index.json --output Delivery/v1/shards
+python Scripts/DatasetDelivery.py pack Delivery/v1/index.json --output Delivery/v1/shards --profile temporal-sr
 python Scripts/DatasetDelivery.py verify-shards Delivery/v1/shards/shards.json
 ```
 

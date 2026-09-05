@@ -4,12 +4,16 @@ Capture synchronized engine data for super resolution and frame interpolation: r
 
 用于神经超分与插帧的数据采集插件：固定时间重放 → 同步采集 → 检查数据 → 按地图/轨迹划分 → 发布带哈希的索引和训练分片。
 
-**Release status:** development toward 1.0. The current descriptor is 1.0.0-rc.1 while the [formal release checklist](Docs/RELEASE_PLAN.md) is open. The writer, reference accumulation and delivery tools below are implemented; this is not a completed formal-release claim.
+**1.0.0 formal release:** synchronized capture, frozen reference, bounded asynchronous writing, strict validation and training-data delivery. [Download the release](https://github.com/YeaSakura123/DeterministicDatasetCaptureUE/releases/tag/v1.0.0) · [中文使用说明](Docs/USAGE_ZH.md) · [Acceptance results](Docs/RELEASE_VALIDATION.md).
+
+The full local delivery contains **18,000 frames / 10 sampled minutes**, with three training maps and one unseen test map. All 3,945,814 input checks passed, and every training shard and sample was read back with its hashes verified. GitHub provides the plugin, an original runnable demo, a 32-frame training sample and portable validation evidence; the full corpus remains a separate local delivery.
 
 ## Requirements and installation
 
 - Tested: **UE 5.7.4, Windows, DX12/SM6**. UE 5.8 is a future project target.
-- Copy this repository to `<Project>/Plugins/SuperResolutionDataset` in a C++ project, then build its Editor target.
+- Fastest start: download `DeterministicCaptureDemo-1.0.0-UE5.7-Win64.zip`, extract it, install the Python requirements below and run `CaptureDemo.ps1 -Editor "<UE>/Engine/Binaries/Win64/UnrealEditor-Cmd.exe"`. It captures and validates eight frames using the included original maps.
+- Existing projects: extract `SuperResolutionDataset-1.0.0-UE5.7-Win64.zip` into `<Project>/Plugins`. The prebuilt binary was tested on UE 5.7.4 CL 51494982. For another engine build, copy this source repository to `<Project>/Plugins/SuperResolutionDataset` in a C++ project and build its Editor target.
+- Check release downloads against `SHA256SUMS.txt`; source archives do not include prebuilt binaries or the demo maps.
 - Offline tools: Python 3.10+ and `python -m pip install -r Scripts/requirements-validation.txt`.
 - Asset generation enables PythonScriptPlugin, EditorScriptingUtilities and SequencerScripting.
 
@@ -83,7 +87,7 @@ python Scripts/DatasetDelivery.py pack Delivery/dataset-v1/index.json `
 python Scripts/DatasetDelivery.py verify-shards Delivery/dataset-v1/shards/shards.json
 ```
 
-The default plan is 30 × 600 frames at 30 fps: **10 minutes**. This is a planned size, not a claim that the full dataset has already been delivered. Use `--frames-per-clip 8` and a new version/output for a smoke test. Every clip has native HR; the first trajectory per map also has multi-sample reference. Three maps supply train and separate validation trajectories; the fourth appears only in test.
+The default plan is 30 × 600 frames at 30 fps: **10 sampled minutes**, completed and fully verified for 1.0.0. Train contains 14,400 frames, separate validation trajectories contain 1,800, and the unseen AtriumTest map contains 1,800 test frames. All 18,000 frames retain native HR; the first trajectory of each map adds 16-sample reference HR, covering 2,400 frames. `trainingInputMapping.color_gt` selects reference where present and native HR otherwise. Use `--frames-per-clip 8` and a new version/output for a smoke test. These generated validation scenes establish capture and delivery correctness; broader game-scene diversity remains future dataset work.
 
 Use `--reuse-completed` with the same batch status to verify and skip completed clips. Partial/failed outputs are preserved; recapture into a new output directory.
 
