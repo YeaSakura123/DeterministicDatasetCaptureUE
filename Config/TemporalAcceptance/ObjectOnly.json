@@ -1,0 +1,74 @@
+{
+  "contractVersion": "spatial-sr-data-v1",
+  "jobName": "temporal_acceptance_ObjectOnly",
+  "expectedMap": "/Game/SRDatasetAcceptance/TemporalLab",
+  "bUseDeterministicCameraTransform": false,
+  "deterministicCameraLocationCm": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 200.0
+  },
+  "deterministicCameraRotationDegrees": {
+    "pitch": 0.0,
+    "yaw": 0.0,
+    "roll": 0.0
+  },
+  "deterministicCameraFOVDegrees": 90.0,
+  "deterministicCameraTranslationPerLogicalFrameCm": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.0
+  },
+  "startFrame": 0,
+  "endFrame": 63,
+  "frameStep": 1,
+  "captureFrameRateNumerator": 30,
+  "captureFrameRateDenominator": 1,
+  "warmupFrames": 32,
+  "hRResolution": {
+    "x": 1920,
+    "y": 1080
+  },
+  "lRResolution": {
+    "x": 960,
+    "y": 540
+  },
+  "lRMode": "NativeRender",
+  "resizeFilter": "CubicMitchell",
+  "bCaptureDepth": true,
+  "bCaptureTemporalDiagnostics": true,
+  "bCaptureMainViewTemporalDiagnostics": true,
+  "bCaptureReferenceHR": true,
+  "outputDirectory": "Saved/SRDataset/TemporalAcceptance/ObjectOnly",
+  "bResume": false,
+  "bWriteManifestEveryFrame": true,
+  "randomSeed": 1337,
+  "bControlNiagara": false,
+  "bForceNiagaraDeterminism": true,
+  "bEnableChaosDeterminism": true,
+  "bDisableMotionBlur": true,
+  "bLockExposure": true,
+  "bForceSynchronousRendering": true,
+  "bLockTemporalJitterToLogicalFrame": true,
+  "temporalJitterSequenceLength": 8,
+  "temporalJitterPhaseOffset": 3,
+  "bBlockOnStreamingBeforeCapture": true,
+  "streamingWaitSeconds": 60.0,
+  "bEnableSemanticValidationFixture": false,
+  "semanticMotionScenario": "LegacyCameraRelative",
+  "bValidateTemporalJitterSignCoverage": false,
+  "bAutoQuit": true,
+  "sequence": "/Game/SRDatasetAcceptance/ObjectOnly.ObjectOnly",
+  "bAssignStableInstanceIds": true,
+  "bRunSceneControlPreflight": true,
+  "bRequireSceneControlPreflight": true,
+  "sceneControlAllowedTickingActorClassPaths": [
+    "/Script/Engine.DefaultPawn",
+    "/Script/Engine.PlayerController"
+  ],
+  "sceneControlAllowedTickingComponentClassPaths": [
+    "/Script/Engine.CameraComponent",
+    "/Script/ChaosSolverEngine.ChaosDebugDrawComponent",
+    "/Script/Engine.FloatingPawnMovement"
+  ]
+}

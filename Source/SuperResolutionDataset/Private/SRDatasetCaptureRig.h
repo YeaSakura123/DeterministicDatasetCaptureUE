@@ -5,6 +5,7 @@
 #include "GameFramework/Actor.h"
 #include "SRDatasetViewExtension.h"
 #include "SRDatasetTypes.h"
+#include "SRDatasetImageWriter.h"
 #include "SRDatasetCaptureRig.generated.h"
 
 class USceneCaptureComponent2D;
@@ -18,9 +19,10 @@ class ASRDatasetCaptureRig : public AActor
 
 public:
 	ASRDatasetCaptureRig();
+	FSRDatasetImageWriter& GetImageWriter() { return ImageWriter; }
 
 	bool Configure(const FSRDatasetCaptureJob& Job, FString& OutError);
-	void ApplyCameraView(const FMinimalViewInfo& View, bool bDisableMotionBlur, bool bLockExposure);
+	void ApplyCameraView(const FMinimalViewInfo& View, bool bDisableMotionBlur, bool bLockExposure, const FMatrix* MainViewProjection = nullptr);
 	void WarmupRenderState(const FSRDatasetCaptureJob& Job);
 	void PrimeRendererState(const TArray<UPrimitiveComponent*>& Components);
 	const FMinimalViewInfo& GetLastCameraView() const { return LastCameraView; }
@@ -28,6 +30,8 @@ public:
 	const FSRDatasetTemporalFrameMetadata& GetLastNativeHRMetadata() const { return LastNativeHRMetadata; }
 	const FSRDatasetTemporalFrameMetadata& GetLastSceneCaptureLRMetadata() const { return LastSceneCaptureLRMetadata; }
 	const FSRDatasetTemporalFrameMetadata& GetLastReferenceHRMetadata() const { return LastReferenceHRMetadata; }
+	const TArray<FSRDatasetTemporalFrameMetadata>& GetLastReferenceSampleMetadata() const { return LastReferenceSampleMetadata; }
+	const TArray<FVector2f>& GetLastReferenceSampleOffsets() const { return LastReferenceSampleOffsets; }
 	const FSRDatasetTemporalFrameMetadata& GetLastHUDlessColorMetadata() const { return LastHUDlessColorMetadata; }
 	FIntPoint GetLastHUDlessColorSize() const { return LastHUDlessColorSize; }
 	FIntPoint GetLastUIColorAlphaSize() const { return LastUIColorAlphaSize; }
@@ -81,7 +85,7 @@ public:
 		FString& OutError);
 
 private:
-	static bool SaveImageAtomic(const FString& Path, const TCHAR* Format, const FImage& Image, FString& OutHash, FString& OutError);
+	bool SaveImageAtomic(const FString& Path, const TCHAR* Format, const FImage& Image, FString& OutHash, FString& OutError);
 	static bool LoadScalarImage(const FString& Path, FIntPoint ExpectedSize, TArray<FLinearColor>& OutPixels);
 	bool EnsurePreviousTemporalState(
 		const FString& OutputRoot,
@@ -91,22 +95,22 @@ private:
 	static FImageCore::EResizeImageFilter ToImageFilter(ESRDatasetResizeFilter Filter);
 	void ApplyViewToCapture(USceneCaptureComponent2D* Capture, const FMinimalViewInfo& View, bool bDisableMotionBlur, bool bLockExposure);
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<USceneComponent> SceneRoot;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<USceneCaptureComponent2D> HRCapture;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<USceneCaptureComponent2D> LRCapture;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<USceneCaptureComponent2D> ReferenceCapture;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<USceneCaptureComponent2D> DepthCapture;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<USceneCaptureComponent2D> RendererPrimeCapture;
 
 	UPROPERTY(Transient)
@@ -128,10 +132,13 @@ private:
 	TObjectPtr<UTextureRenderTarget2D> UIColorAlphaTarget;
 
 	FMinimalViewInfo LastCameraView;
+	FSRDatasetImageWriter ImageWriter;
 	FSRDatasetTemporalFrameMetadata LastTemporalMetadata;
 	FSRDatasetTemporalFrameMetadata LastNativeHRMetadata;
 	FSRDatasetTemporalFrameMetadata LastSceneCaptureLRMetadata;
 	FSRDatasetTemporalFrameMetadata LastReferenceHRMetadata;
+	TArray<FSRDatasetTemporalFrameMetadata> LastReferenceSampleMetadata;
+	TArray<FVector2f> LastReferenceSampleOffsets;
 	FSRDatasetTemporalFrameMetadata LastHUDlessColorMetadata;
 	FIntPoint LastHUDlessColorSize = FIntPoint::ZeroValue;
 	FIntPoint LastUIColorAlphaSize = FIntPoint::ZeroValue;

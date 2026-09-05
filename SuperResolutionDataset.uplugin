@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 21,
-	"VersionName": "0.16.0",
+	"Version": 23,
+	"VersionName": "1.0.0-rc.1",
 	"FriendlyName": "Super Resolution Dataset",
 	"Description": "Deterministic scene replay with synchronized spatial, temporal, semantic and experimental frame-generation dataset capture.",
 	"Category": "Rendering",
@@ -13,7 +13,10 @@
 		{
 			"Name": "SuperResolutionDataset",
 			"Type": "Runtime",
-			"LoadingPhase": "PostConfigInit"
+			"LoadingPhase": "PostConfigInit",
+			"TargetAllowList": [
+				"Editor"
+			]
 		}
 	],
 	"Plugins": [
@@ -25,5 +28,8 @@
 			"Name": "ChaosCaching",
 			"Enabled": true
 		}
+	],
+	"SupportedTargetPlatforms": [
+		"Win64"
 	]
 }

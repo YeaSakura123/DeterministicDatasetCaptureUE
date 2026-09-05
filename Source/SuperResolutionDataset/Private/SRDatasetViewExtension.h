@@ -13,6 +13,7 @@ enum class ESRDatasetViewCaptureStage : uint8
 struct FSRDatasetTemporalFrameMetadata
 {
 	bool bValid = false;
+	bool bCameraCut = false;
 	float PreExposure = 1.0f;
 	float OneOverPreExposure = 1.0f;
 	FVector2f JitterCurrentNDC = FVector2f::ZeroVector;
@@ -58,6 +59,7 @@ struct FSRDatasetTemporalFrameMetadata
 struct FSRDatasetTemporalCaptureResult
 {
 	FIntPoint Size = FIntPoint::ZeroValue;
+	FIntPoint DisplaySize = FIntPoint::ZeroValue;
 	TArray<FLinearColor> SceneColor;
 	TArray<FLinearColor> VelocityRaw;
 	TArray<FLinearColor> MotionFull;
@@ -75,7 +77,7 @@ class FSRDatasetViewExtension final : public FSceneViewExtensionBase
 public:
 	FSRDatasetViewExtension(const FAutoRegister& AutoRegister, ESRDatasetViewCaptureStage InCaptureStage);
 
-	bool RequestCapture(FIntPoint ExpectedSize, FIntPoint DisplaySize, bool bMainViewOnly, FString& OutError);
+	bool RequestCapture(FIntPoint ExpectedSize, FIntPoint DisplaySize, bool bMainViewOnly, FString& OutError, bool bColorOnly = false);
 	bool RequestTonemappedColorCapture(FIntPoint ExpectedSize, bool bMainViewOnly, FString& OutError);
 	bool WaitAndTakeCapture(FSRDatasetTemporalCaptureResult& OutResult, FString& OutError);
 	void CancelCapture();
@@ -97,6 +99,8 @@ private:
 	struct FPendingReadbacks
 	{
 		FIntPoint Size = FIntPoint::ZeroValue;
+		FIntPoint DisplaySize = FIntPoint::ZeroValue;
+		bool bCameraCut = false;
 		bool bColorOnly = false;
 		TUniquePtr<FRHIGPUTextureReadback> SceneColor;
 		TUniquePtr<FRHIGPUTextureReadback> VelocityRaw;
@@ -114,7 +118,7 @@ private:
 		FRDGBuilder& GraphBuilder,
 		const FSceneView& View,
 		const FPostProcessMaterialInputs& Inputs);
-	FScreenPassTexture CaptureAfterTonemap_RenderThread(
+	FScreenPassTexture CaptureColorOnly_RenderThread(
 		FRDGBuilder& GraphBuilder,
 		const FSceneView& View,
 		const FPostProcessMaterialInputs& Inputs);
@@ -128,6 +132,7 @@ private:
 	FIntPoint RequestedSize = FIntPoint::ZeroValue;
 	FIntPoint RequestedDisplaySize = FIntPoint::ZeroValue;
 	bool bRequestedMainViewOnly = false;
+	bool bRequestedColorOnly = false;
 	bool bDeterministicViewTimeEnabled = false;
 	double DeterministicCurrentTimeSeconds = 0.0;
 	float DeterministicDeltaTimeSeconds = 0.0f;

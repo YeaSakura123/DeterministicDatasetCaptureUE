@@ -1,5 +1,9 @@
 # Delivery roadmap
 
+## Current priority — 0.17.0
+
+The bounded temporal data correctness loop is implemented; see [acceptance evidence](TEMPORAL_ACCEPTANCE.md). Keep general cache/FG expansion on hold. Finish the remaining M1 reference-quality, non-fixture scene, dataset split/scale and asynchronous writer requirements before declaring M1 complete or moving to the full non-neural temporal reconstruction baseline.
+
 ## Phase 1 — implemented baseline
 
 - Runtime plugin isolated from the game module.
@@ -10,7 +14,7 @@
 - Extensible Blueprint/C++ deterministic-control interface.
 - Same-state HR, derived/native LR, float depth capture.
 - JSON job, command-line automation, PIE console and Blueprint API.
-- Atomic file writes, resumable frames, per-frame camera metadata and content hashes.
+- Atomic file writes, verified complete spatial reuse, per-frame camera metadata and content hashes.
 
 This phase is certified only as `spatial-sr-data-v1`. Its FinalColorLDR PNG and SceneCapture depth outputs are not certified temporal-upscaler or frame-generation inputs.
 

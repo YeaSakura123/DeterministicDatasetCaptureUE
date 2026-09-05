@@ -1,5 +1,5 @@
 {
-  "contractVersion": "spatial-sr-data-v1",
+  "contractVersion": "nr-sr-data-v2",
   "jobName": "production_2x_template",
   "replayPass": "Standard",
   "expectedMap": "/Game/Maps/YourCaptureMap",
@@ -43,5 +43,16 @@
   "bSuppressMainViewOnUncapturedFrames": false,
   "bUseLastCapturedEndpointTransforms": false,
   "bEnableSemanticValidationFixture": false,
-  "bAutoQuit": true
+  "bAutoQuit": true,
+  "bLockTemporalJitterToLogicalFrame": true,
+  "temporalJitterSequenceLength": 8,
+  "temporalJitterPhaseOffset": 0,
+  "bRequireSceneControlPreflight": true,
+  "bRunSceneControlPreflight": true,
+  "bAssignStableInstanceIds": true,
+  "bAllowDynamicInstanceIdTopology": false,
+  "bRejectVisibleWidgetComponents": true,
+  "referenceTemporalSamples": 16,
+  "bAsyncImageWrites": true,
+  "maxPendingImageWriteMB": 512
 }

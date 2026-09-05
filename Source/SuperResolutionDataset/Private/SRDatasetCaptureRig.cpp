@@ -11,6 +11,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/SecureHash.h"
+#include "Misc/ScopeExit.h"
 #include "Slate/SGameLayerManager.h"
 #include "Slate/WidgetRenderer.h"
 
@@ -51,6 +52,7 @@ ASRDatasetCaptureRig::ASRDatasetCaptureRig()
 
 bool ASRDatasetCaptureRig::Configure(const FSRDatasetCaptureJob& Job, FString& OutError)
 {
+	ImageWriter.Configure(Job.bAsyncImageWrites, static_cast<int64>(Job.MaxPendingImageWriteMB) * 1024 * 1024);
 	PreviousTemporalLogicalFrameId = INDEX_NONE;
 	PreviousTemporalSize = FIntPoint::ZeroValue;
 	PreviousTemporalDepth.Reset();
@@ -141,7 +143,8 @@ bool ASRDatasetCaptureRig::Configure(const FSRDatasetCaptureJob& Job, FString& O
 void ASRDatasetCaptureRig::ApplyCameraView(
 	const FMinimalViewInfo& View,
 	const bool bDisableMotionBlur,
-	const bool bLockExposure)
+	const bool bLockExposure,
+	const FMatrix* MainViewProjection)
 {
 	LastCameraView = View;
 	SetActorLocationAndRotation(View.Location, View.Rotation);
@@ -150,6 +153,14 @@ void ASRDatasetCaptureRig::ApplyCameraView(
 	ApplyViewToCapture(ReferenceCapture, View, bDisableMotionBlur, bLockExposure);
 	ApplyViewToCapture(DepthCapture, View, bDisableMotionBlur, bLockExposure);
 	ApplyViewToCapture(RendererPrimeCapture, View, bDisableMotionBlur, bLockExposure);
+	if (MainViewProjection)
+	{
+		for (USceneCaptureComponent2D* Capture : { HRCapture.Get(), LRCapture.Get(), ReferenceCapture.Get(), DepthCapture.Get(), RendererPrimeCapture.Get() })
+		{
+			Capture->bUseCustomProjectionMatrix = true;
+			Capture->CustomProjectionMatrix = *MainViewProjection;
+		}
+	}
 }
 
 void ASRDatasetCaptureRig::PrimeRendererState(const TArray<UPrimitiveComponent*>& Components)
@@ -246,6 +257,8 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 	LastNativeHRMetadata = FSRDatasetTemporalFrameMetadata();
 	LastSceneCaptureLRMetadata = FSRDatasetTemporalFrameMetadata();
 	LastReferenceHRMetadata = FSRDatasetTemporalFrameMetadata();
+	LastReferenceSampleMetadata.Reset();
+	LastReferenceSampleOffsets.Reset();
 	LastHUDlessColorMetadata = FSRDatasetTemporalFrameMetadata();
 	LastHUDlessColorSize = FIntPoint::ZeroValue;
 	LastUIColorAlphaSize = FIntPoint::ZeroValue;
@@ -269,7 +282,7 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 	const auto CaptureHighResolution = [&]() -> bool
 	{
 		if (Job.bCaptureTemporalDiagnostics &&
-			!ViewExtension->RequestCapture(Job.HRResolution, Job.HRResolution, false, OutError))
+			!ViewExtension->RequestCapture(Job.HRResolution, Job.HRResolution, false, OutError, true))
 		{
 			return false;
 		}
@@ -299,18 +312,82 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 		const FIntPoint ReferenceSize(
 			Job.HRResolution.X * Job.ReferenceHRScale,
 			Job.HRResolution.Y * Job.ReferenceHRScale);
-		if (!ViewExtension->RequestCapture(ReferenceSize, Job.HRResolution, false, OutError))
+		const bool bPreviousCustomProjection = ReferenceCapture->bUseCustomProjectionMatrix;
+		const FMatrix PreviousProjection = ReferenceCapture->CustomProjectionMatrix;
+		ON_SCOPE_EXIT
 		{
-			return false;
-		}
-		ReferenceCapture->CaptureScene();
-		FSRDatasetTemporalCaptureResult ReferenceResult;
-		if (!ViewExtension->WaitAndTakeCapture(ReferenceResult, OutError) ||
-			!SaveReferenceHDRColorResult(ReferenceResult, Job, HRPath, OutHashes, OutError))
+			ReferenceCapture->bUseCustomProjectionMatrix = bPreviousCustomProjection;
+			ReferenceCapture->CustomProjectionMatrix = PreviousProjection;
+		};
+		FSRDatasetTemporalCaptureResult Accumulated;
+		FMatrix44f FixedProjection = FMatrix44f::Identity;
+		for (int32 SampleIndex = 0; SampleIndex < Job.ReferenceTemporalSamples; ++SampleIndex)
 		{
-			return false;
+			FVector2f Offset = FVector2f::ZeroVector;
+			if (Job.ReferenceTemporalSamples > 1)
+			{
+				uint32 Bits = static_cast<uint32>(SampleIndex);
+				float RadicalInverse = 0.0f;
+				for (float Weight = 0.5f; Bits; Bits >>= 1, Weight *= 0.5f) RadicalInverse += (Bits & 1) * Weight;
+				Offset = FVector2f((SampleIndex + 0.5f) / Job.ReferenceTemporalSamples - 0.5f,
+					RadicalInverse + 0.5f / Job.ReferenceTemporalSamples - 0.5f);
+				FMinimalViewInfo ReferenceView = LastCameraView;
+				ReferenceView.AspectRatio = static_cast<float>(ReferenceSize.X) / ReferenceSize.Y;
+				FMatrix Projection = bPreviousCustomProjection ? PreviousProjection : ReferenceView.CalculateProjectionMatrix();
+				FixedProjection = FMatrix44f(Projection);
+				Projection.M[2][0] += 2.0f * Offset.X / ReferenceSize.X;
+				Projection.M[2][1] -= 2.0f * Offset.Y / ReferenceSize.Y;
+				ReferenceCapture->bUseCustomProjectionMatrix = true;
+				ReferenceCapture->CustomProjectionMatrix = Projection;
+				// Each sample observes the same scene time without inheriting a
+				// previous reference frame's temporal lighting or AA history.
+				ReferenceCapture->bCameraCutThisFrame = true;
+			}
+			if (!ViewExtension->RequestCapture(ReferenceSize, Job.HRResolution, false, OutError, true)) return false;
+			ReferenceCapture->CaptureScene();
+			FSRDatasetTemporalCaptureResult Sample;
+			if (!ViewExtension->WaitAndTakeCapture(Sample, OutError)) return false;
+			LastReferenceSampleMetadata.Add(Sample.Metadata);
+			LastReferenceSampleOffsets.Add(Offset);
+			if (Job.bSaveReferenceSubsamples)
+			{
+				FImage SourceImage;
+				SourceImage.Init(Sample.Size.X, Sample.Size.Y, 1, ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+				FMemory::Memcpy(SourceImage.RawData.GetData(), Sample.SceneColor.GetData(), Sample.SceneColor.Num() * sizeof(FLinearColor));
+				const FString Modality = FString::Printf(TEXT("reference_subsample_%02d"), SampleIndex);
+				const FString SourcePath = FPaths::Combine(FPaths::GetPath(FPaths::GetPath(HRPath)), Modality,
+					FPaths::ChangeExtension(FPaths::GetCleanFilename(HRPath), TEXT("exr")));
+				FString SourceHash;
+				if (!SaveImageAtomic(SourcePath, TEXT("exr"), SourceImage, SourceHash, OutError)) return false;
+				OutHashes.Add(Modality, SourceHash);
+			}
+			if (SampleIndex == 0)
+			{
+				Accumulated = MoveTemp(Sample);
+			}
+			else
+			{
+				if (Sample.SceneColor.Num() != Accumulated.SceneColor.Num() ||
+					!FMath::IsNearlyEqual(Sample.Metadata.GameTimeSeconds, Accumulated.Metadata.GameTimeSeconds, 1.e-6f) ||
+					!FMath::IsNearlyEqual(Sample.Metadata.PreExposure, Accumulated.Metadata.PreExposure, 1.e-6f))
+				{
+					OutError = TEXT("Reference subsamples changed dimensions, logical time or exposure.");
+					return false;
+				}
+				for (int32 Pixel = 0; Pixel < Sample.SceneColor.Num(); ++Pixel) Accumulated.SceneColor[Pixel] += Sample.SceneColor[Pixel];
+			}
 		}
-		return true;
+		if (Job.ReferenceTemporalSamples > 1)
+		{
+			for (FLinearColor& Pixel : Accumulated.SceneColor) Pixel /= static_cast<float>(Job.ReferenceTemporalSamples);
+			// These matrices describe the resolved fixed grid. Actual sample
+			// projections are preserved separately rather than mislabelled as it.
+			Accumulated.Metadata.ViewToClipJittered = FixedProjection;
+			Accumulated.Metadata.ViewToClipUnjittered = FixedProjection;
+			Accumulated.Metadata.JitterCurrentNDC = FVector2f::ZeroVector;
+			Accumulated.Metadata.JitterPreviousNDC = FVector2f::ZeroVector;
+		}
+		return SaveReferenceHDRColorResult(Accumulated, Job, HRPath, OutHashes, OutError);
 	};
 	const auto CaptureLowResolution = [&]() -> bool
 	{
@@ -322,7 +399,7 @@ bool ASRDatasetCaptureRig::CaptureFrame(
 			(!Job.bCaptureMainViewTemporalDiagnostics || Job.bCaptureSceneCaptureLRComparison);
 		if (bExtractSceneCaptureDiagnostics)
 		{
-			if (!ViewExtension->RequestCapture(Job.LRResolution, Job.HRResolution, false, OutError))
+			if (!ViewExtension->RequestCapture(Job.LRResolution, Job.HRResolution, false, OutError, Job.bCaptureMainViewTemporalDiagnostics))
 			{
 				return false;
 			}
@@ -704,7 +781,8 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 		return Image;
 	};
 
-	if (!bHistoryReset && !EnsurePreviousTemporalState(
+	const bool bReset = bHistoryReset || Result.Metadata.bCameraCut;
+	if (!bReset && !EnsurePreviousTemporalState(
 		OutputRoot,
 		MotionPreviousLogicalFrameId,
 		Result.Size,
@@ -719,9 +797,13 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 	HistoryRejection.SetNumUninitialized(PixelCount);
 	HistoryRejectionValid.SetNumUninitialized(PixelCount);
 	HistoryRejectionReason.SetNumUninitialized(PixelCount);
-	const float DisplayToRenderScale = FMath::IsFinite(Result.Metadata.ResolutionFraction)
-		? Result.Metadata.ResolutionFraction
-		: 0.0f;
+	const FVector2f DisplayToRenderScale(
+		Result.DisplaySize.X > 0 ? static_cast<float>(Result.Size.X) / Result.DisplaySize.X : 0.0f,
+		Result.DisplaySize.Y > 0 ? static_cast<float>(Result.Size.Y) / Result.DisplaySize.Y : 0.0f);
+	const FVector2f JitterDeltaNDC = Result.Metadata.JitterPreviousNDC - Result.Metadata.JitterCurrentNDC;
+	const FVector2f PreviousRasterOffset(
+		0.5f * Result.Size.X * JitterDeltaNDC.X,
+		-0.5f * Result.Size.Y * JitterDeltaNDC.Y);
 	for (int32 Y = 0; Y < Result.Size.Y; ++Y)
 	{
 		for (int32 X = 0; X < Result.Size.X; ++X)
@@ -730,7 +812,7 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 			float Reject = 1.0f;
 			float Valid = 0.0f;
 			float Reason = 2.0f; // Invalid current inputs.
-			if (bHistoryReset)
+			if (bReset)
 			{
 				// A reset has no reusable history by definition; rejecting every
 				// pixel is exact and therefore valid rather than an approximation.
@@ -742,14 +824,14 @@ bool ASRDatasetCaptureRig::SaveTemporalCaptureResult(
 				const FLinearColor& CurrentDepth = Result.Depth[Index];
 				const FLinearColor& CurrentMotion = Result.MotionFull[Index];
 				const bool bCurrentInputsValid = CurrentDepth.B >= 0.5f &&
-					CurrentMotion.A >= 0.5f && DisplayToRenderScale > 0.0f &&
+					CurrentMotion.A >= 0.5f && DisplayToRenderScale.X > 0.0f && DisplayToRenderScale.Y > 0.0f &&
 					FMath::IsFinite(CurrentMotion.R) && FMath::IsFinite(CurrentMotion.G);
 				if (bCurrentInputsValid)
 				{
 					const int32 PreviousX = FMath::RoundToInt(
-						X + CurrentMotion.R * DisplayToRenderScale);
+						X + CurrentMotion.R * DisplayToRenderScale.X + PreviousRasterOffset.X);
 					const int32 PreviousY = FMath::RoundToInt(
-						Y + CurrentMotion.G * DisplayToRenderScale);
+						Y + CurrentMotion.G * DisplayToRenderScale.Y + PreviousRasterOffset.Y);
 					if (PreviousX < 0 || PreviousY < 0 ||
 						PreviousX >= Result.Size.X || PreviousY >= Result.Size.Y)
 					{
@@ -940,28 +1022,7 @@ bool ASRDatasetCaptureRig::SaveImageAtomic(
 	FString& OutHash,
 	FString& OutError)
 {
-	TArray64<uint8> Encoded;
-	if (!FImageUtils::CompressImage(Encoded, Format, Image, 0))
-	{
-		OutError = FString::Printf(TEXT("Failed to encode image: %s"), *Path);
-		return false;
-	}
-
-	const FString TempPath = Path + TEXT(".part");
-	if (!FFileHelper::SaveArrayToFile(Encoded, *TempPath))
-	{
-		OutError = FString::Printf(TEXT("Failed to write image: %s"), *TempPath);
-		return false;
-	}
-	if (!IFileManager::Get().Move(*Path, *TempPath, true, true, false, true))
-	{
-		IFileManager::Get().Delete(*TempPath, false, true, true);
-		OutError = FString::Printf(TEXT("Failed to finalize image: %s"), *Path);
-		return false;
-	}
-
-	OutHash = FSHA1::HashBuffer(Encoded.GetData(), Encoded.Num()).ToString();
-	return true;
+	return ImageWriter.Enqueue(Path, Format, Image, OutHash, OutError);
 }
 
 FImageCore::EResizeImageFilter ASRDatasetCaptureRig::ToImageFilter(const ESRDatasetResizeFilter Filter)

@@ -2,7 +2,46 @@
 
 bool FSRDatasetCaptureJob::Validate(FString& OutError) const
 {
-	if (!ContractVersion.Equals(TEXT("spatial-sr-data-v1"), ESearchCase::CaseSensitive))
+	if (bSaveReferenceSubsamples && (!bCaptureReferenceHR ||
+		(bAsyncImageWrites && static_cast<int64>(HRResolution.X) * HRResolution.Y * ReferenceHRScale * ReferenceHRScale * 16 > static_cast<int64>(MaxPendingImageWriteMB) * 1024 * 1024)))
+	{
+		OutError = TEXT("Reference subsample export requires reference capture and a writer budget large enough for one source-resolution RGBA32F image.");
+		return false;
+	}
+	if (ReferenceTemporalSamples != 1 && ReferenceTemporalSamples != 16 && ReferenceTemporalSamples != 32 && ReferenceTemporalSamples != 64)
+	{
+		OutError = TEXT("ReferenceTemporalSamples must be 1, 16, 32 or 64.");
+		return false;
+	}
+	if (MaxPendingImageWriteMB < 16 || MaxPendingImageWriteMB > 8192 ||
+		(bAsyncImageWrites && static_cast<int64>(HRResolution.X) * HRResolution.Y * 16 > static_cast<int64>(MaxPendingImageWriteMB) * 1024 * 1024))
+	{
+		OutError = TEXT("MaxPendingImageWriteMB must be 16..8192 and hold at least one RGBA32F HR image.");
+		return false;
+	}
+	if (bCaptureTemporalDiagnostics && ReplayPass == ESRDatasetReplayPass::Standard && FrameStep != 1)
+	{
+		OutError = TEXT("Standard temporal capture requires FrameStep=1: skipped Main Views advance GPU history, so their motion cannot describe the previous saved frame.");
+		return false;
+	}
+	if (bResume && (bCaptureTemporalDiagnostics || ReplayPass != ESRDatasetReplayPass::Standard))
+	{
+		OutError = TEXT("Resume currently supports verified complete spatial datasets only; temporal history must be rebuilt by a fresh capture in an empty output directory.");
+		return false;
+	}
+	const bool bTemporalContract = ContractVersion.Equals(TEXT("nr-sr-data-v2"), ESearchCase::CaseSensitive);
+	if (bTemporalContract && (!bCaptureTemporalDiagnostics || !bCaptureMainViewTemporalDiagnostics || !bCaptureDepth ||
+		ExpectedMap.IsEmpty() || HRResolution.X != LRResolution.X * 2 || HRResolution.Y != LRResolution.Y * 2 ||
+		LRMode != ESRDatasetLRMode::NativeRender || ReplayPass != ESRDatasetReplayPass::Standard || FrameStep != 1 ||
+		!bRequireSceneControlPreflight || !bRunSceneControlPreflight || !bLockExposure || !bLockMaterialTimeToLogicalFrame ||
+		!bLockTemporalJitterToLogicalFrame || !bForceSynchronousRendering || !bAssignStableInstanceIds ||
+		bAllowDynamicInstanceIdTopology || !bRejectVisibleWidgetComponents || !bDisableMotionBlur || !bBlockOnStreamingBeforeCapture ||
+		(bCaptureReferenceHR && ReferenceTemporalSamples < 16)))
+	{
+		OutError = TEXT("nr-sr-data-v2 requires Standard consecutive Main View HDR/depth/motion, fixed stable IDs, strict scene preflight, locked exposure/material time/jitter/render order, a streaming barrier, no scene UI or motion blur, and 16..64 samples when reference HR is enabled. Capture still requires offline validation before dataset admission.");
+		return false;
+	}
+	if (!ContractVersion.Equals(TEXT("spatial-sr-data-v1"), ESearchCase::CaseSensitive) && !bTemporalContract)
 	{
 		OutError = FString::Printf(
 			TEXT("ContractVersion '%s' is not certified for direct capture. Use spatial-sr-data-v1; enable the experimental Main View diagnostics under that contract, and assemble validated FG replay passes offline without fabricating missing nr-fg-data-v1 buffers."),

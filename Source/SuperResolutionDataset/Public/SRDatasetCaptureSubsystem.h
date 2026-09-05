@@ -289,6 +289,7 @@ private:
 	void HandleWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	void HandleWorldTickEnd(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	bool PrepareJob(FString& OutError);
+	bool TryReuseCompletedSpatialDataset(const FSRDatasetCaptureJob& Job, bool& bReused, FString& OutError);
 	bool PrepareSemanticValidationFixture(FString& OutError);
 	void RestoreSemanticValidationFixture();
 	bool IsReverseEndpointReplay() const;
@@ -371,7 +372,6 @@ private:
 	bool UpdateCaptureCamera(bool bEvaluateValidationFixture, FString& OutError);
 	bool CaptureCurrentFrame(FString& OutError);
 	bool FinalizePendingMainViewCapture(FString& OutError);
-	bool IsFrameAlreadyComplete(int32 FrameNumber) const;
 	void AppendFrameManifest(int32 FrameNumber, double TimeSeconds, const TMap<FString, FString>& Hashes, const TMap<FString, int64>& RenderSubmissions, bool bResumed);
 	bool WriteManifest(FString& OutError) const;
 	void FinishCapture(ESRDatasetCaptureState FinalState, const FString& Error = FString());
@@ -414,6 +414,10 @@ private:
 	FString CaptureCVarProfileSha1;
 	FString CaptureCVarProfileCanonical;
 	FString ContentMapSha1;
+	FString PluginBinarySha1;
+	FString LoadedContentSha1;
+	bool bMaterialShadersReadyAfterWarmup = false;
+	TMap<FString, FString> LoadedContentPackageHashes;
 	FString ShaderSourceSha1;
 	FSceneControlPreflightReport SceneControlPreflight;
 	bool bStreamingBarrierComplete = false;

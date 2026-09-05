@@ -75,7 +75,7 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 {
 	GENERATED_BODY()
 
-	/** Versioned semantic contract. v0.1.x only certifies spatial-sr-data-v1. */
+	/** spatial-sr-data-v1, or strict nr-sr-data-v2 followed by offline dataset admission. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Identity")
 	FString ContractVersion = TEXT("spatial-sr-data-v1");
 
@@ -218,6 +218,14 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (ClampMin = "2", ClampMax = "4", EditCondition = "bCaptureReferenceHR"))
 	int32 ReferenceHRScale = 2;
 
+	/** Fixed-time jitter samples on the isolated reference view: 1 (legacy), 16, 32 or 64. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureReferenceHR"))
+	int32 ReferenceTemporalSamples = 1;
+
+	/** Optional source-resolution EXRs for independently auditing reference accumulation. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation", meta = (EditCondition = "bCaptureReferenceHR"))
+	bool bSaveReferenceSubsamples = false;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (EditCondition = "bCaptureReferenceHR"))
 	ESRDatasetResizeFilter ReferenceResizeFilter = ESRDatasetResizeFilter::Lanczos4;
 
@@ -238,10 +246,18 @@ struct SUPERRESOLUTIONDATASET_API FSRDatasetCaptureJob
 	FString OutputDirectory = TEXT("Saved/SRDataset/default");
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
-	bool bResume = true;
+	bool bResume = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
 	bool bWriteManifestEveryFrame = true;
+
+	/** Compress/write owned CPU images on workers; only completed frames enter the manifest. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
+	bool bAsyncImageWrites = true;
+
+	/** Bounds queued raw CPU image copies; backpressure never waits on the render thread. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output", meta = (ClampMin = "16", ClampMax = "8192"))
+	int32 MaxPendingImageWriteMB = 512;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Determinism")
 	int32 RandomSeed = 1337;

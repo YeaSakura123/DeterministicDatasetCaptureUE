@@ -82,6 +82,9 @@ def require_capture(dataset: Path, role: str) -> tuple[dict[str, Any], dict[str,
         raise ValueError(f"capture and validation report are required: {dataset}")
     manifest = load_json(manifest_path)
     report = load_json(report_path)
+    source_hash = hashlib.sha256(Path(__file__).with_name("ValidateDataset.py").read_bytes() + Path(__file__).with_name("TemporalGeometry.py").read_bytes()).hexdigest()
+    if report.get("manifestSha256") != hashlib.sha256(manifest_path.read_bytes()).hexdigest() or report.get("validatorSourceSha256") != source_hash:
+        raise ValueError(f"Stale capture validation; rerun ValidateDataset.py: {dataset}")
     if manifest.get("state") != "Completed":
         raise ValueError(f"capture is not complete: {dataset}")
     if manifest.get("replayPass") != role:
@@ -92,6 +95,8 @@ def require_capture(dataset: Path, role: str) -> tuple[dict[str, Any], dict[str,
     ]
     if report.get("formatAndIntegrityGate") != "pass" or required_failures:
         raise ValueError(f"validation gate did not pass: {dataset}")
+    if report.get("disocclusionGate") != "pass" or any(f.get("temporalDiagnostics", {}).get("historyRejectionSource") != "component_identity_and_static_camera_depth_on_jittered_rasters_v3" for f in manifest.get("frames", [])):
+        raise ValueError(f"Current jitter-aware history validation is required: {dataset}")
     return manifest, report
 
 
@@ -501,6 +506,9 @@ def compatible(
         "gpuDeviceId",
         "contentMapSha1",
         "shaderSourceSha1",
+        "pluginBinarySha1",
+        "loadedContentSha1",
+        "materialShadersReadyAfterWarmup",
         "streamingBarrierEnabled",
         "streamingBarrierWaitSeconds",
         "streamingBarrierComplete",
@@ -575,6 +583,8 @@ def source_file(dataset: Path, frame: dict[str, Any], modality: str) -> Path:
     if not relative:
         raise ValueError(f"frame {frame.get('logicalFrameId')} lacks modality {modality}")
     path = dataset / relative
+    if not path.resolve().is_relative_to(dataset.resolve()):
+        raise ValueError(f"source path escapes dataset: {relative}")
     if not path.is_file():
         raise ValueError(f"missing source file: {path}")
     expected_hash = str(frame.get("sha1", {}).get(modality, "")).upper()
@@ -868,20 +878,19 @@ def assemble(
                 ("forward", frame1),
                 ("reverse", reverse_frame0),
             ):
+                if endpoint_frame.get("reset") or endpoint_frame.get("motionTrainingUsable") is not True:
+                    raise ValueError(f"{role_name} endpoint motion is a reset or unusable")
                 skipped_skeletal = endpoint_frame.get(
                     "endpointPreviousSkeletalBoneSkippedComponents", []
                 )
+                has_skeleton = int(endpoint_frame.get("sceneSkeletalComponentCount", 0)) > 0
+                bone_components = int(endpoint_frame.get("endpointPreviousSkeletalBoneComponentCount", 0))
+                bone_count = int(endpoint_frame.get("endpointPreviousSkeletalBoneCount", 0))
                 if (
-                    endpoint_frame.get("endpointPreviousSkeletalBoneOverride") is not True
-                    or int(
-                        endpoint_frame.get(
-                            "endpointPreviousSkeletalBoneComponentCount", 0
-                        )
-                    )
-                    <= 0
-                    or int(endpoint_frame.get("endpointPreviousSkeletalBoneCount", 0)) <= 0
-                    or not isinstance(skipped_skeletal, list)
-                    or skipped_skeletal
+                    endpoint_frame.get("endpointPreviousSkeletalBoneOverride") is not has_skeleton
+                    or (has_skeleton and (bone_components <= 0 or bone_count <= 0))
+                    or (not has_skeleton and (bone_components != 0 or bone_count != 0))
+                    or not isinstance(skipped_skeletal, list) or skipped_skeletal
                 ):
                     raise ValueError(
                         f"{role_name} endpoint lacks complete cached skeletal-bone history: "
@@ -949,6 +958,7 @@ def assemble(
                     "t1PreviousLogicalFrameId": int(frame1["motionPreviousLogicalFrameId"]),
                     "timeSpanS": float(frame1["motionTimeSpanS"]),
                     "componentTransformOverride": bool(frame1["endpointPreviousTransformOverride"]),
+                    "sceneSkeletalComponentCount": int(frame1["sceneSkeletalComponentCount"]),
                     "skeletalBoneOverride": bool(
                         frame1["endpointPreviousSkeletalBoneOverride"]
                     ),
@@ -965,6 +975,7 @@ def assemble(
                     "t0PreviousLogicalFrameId": int(reverse_frame0["motionPreviousLogicalFrameId"]),
                     "timeSpanS": float(reverse_frame0["motionTimeSpanS"]),
                     "componentTransformOverride": bool(reverse_frame0["endpointPreviousTransformOverride"]),
+                    "sceneSkeletalComponentCount": int(reverse_frame0["sceneSkeletalComponentCount"]),
                     "skeletalBoneOverride": bool(
                         reverse_frame0["endpointPreviousSkeletalBoneOverride"]
                     ),
@@ -1010,7 +1021,7 @@ def assemble(
                             "semanticValidationFixture"
                         ]["expectedWPOMotionDisplayPixels"],
                     },
-                },
+                } if wpo_fixture_validated else {},
                 "reverseEndpointGridAlignment": {
                     "jitterCameraDepthObjectIdExact": True,
                     "sceneStateExactT0": scene_state_exact_t0,
@@ -1021,6 +1032,7 @@ def assemble(
                 },
                 "cameraT0Unjittered": unjittered_camera(frame0),
                 "cameraT1Unjittered": unjittered_camera(frame1),
+                "rasterGrids": {"t0": current_grid_signature(frame0), "tau": current_grid_signature(frame_tau), "t1": current_grid_signature(frame1)},
                 "exposure": {
                     "t0": frame0["temporalDiagnostics"]["exposure"],
                     "tau": frame_tau["temporalDiagnostics"]["exposure"],
@@ -1120,14 +1132,14 @@ def assemble(
                 },
                 "historyRejection1To0": {
                     "definition": "one_rejects_t0_history_at_t1_motion_reprojected_pixel",
-                    "source": "custom_stencil_identity_else_static_camera_depth_reprojection_v1",
+                    "source": "component_identity_and_static_camera_depth_on_jittered_rasters_v3",
                     "validity": "history_rejection_valid_1_to_0",
                     "resolution": "render",
                     "productionCertified": False,
                 },
                 "historyRejection0To1": {
                     "definition": "one_rejects_t1_history_at_t0_motion_reprojected_pixel",
-                    "source": "custom_stencil_identity_else_static_camera_depth_reprojection_v1",
+                    "source": "component_identity_and_static_camera_depth_on_jittered_rasters_v3",
                     "validity": "history_rejection_valid_0_to_1",
                     "resolution": "render",
                     "productionCertified": False,
@@ -1142,26 +1154,33 @@ def assemble(
                 "reverseEndpoints": str(reverse_endpoint_dir.resolve()),
                 "intermediate": str(intermediate_dir.resolve()),
                 "endpointValidation": {
+                    "manifestSha256": endpoint_report["manifestSha256"],
+                    "validatorSourceSha256": endpoint_report["validatorSourceSha256"],
                     "validatorVersion": endpoint_report.get("validatorVersion"),
                     "checksPassed": endpoint_report.get("checksPassed"),
                     "checksTotal": endpoint_report.get("checksTotal"),
                 },
                 "intermediateValidation": {
+                    "manifestSha256": intermediate_report["manifestSha256"],
+                    "validatorSourceSha256": intermediate_report["validatorSourceSha256"],
                     "validatorVersion": intermediate_report.get("validatorVersion"),
                     "checksPassed": intermediate_report.get("checksPassed"),
                     "checksTotal": intermediate_report.get("checksTotal"),
                 },
                 "reverseEndpointValidation": {
+                    "manifestSha256": reverse_endpoint_report["manifestSha256"],
+                    "validatorSourceSha256": reverse_endpoint_report["validatorSourceSha256"],
                     "validatorVersion": reverse_endpoint_report.get("validatorVersion"),
                     "checksPassed": reverse_endpoint_report.get("checksPassed"),
                     "checksTotal": reverse_endpoint_report.get("checksTotal"),
                 },
             },
             "validationCoverage": {
-                "semanticFixtureRigidComponentMotion": True,
-                "semanticFixtureDoubleBufferedSkeletalBoneMotion": True,
+                "semanticFixtureRigidComponentMotion": wpo_fixture_validated,
+                "semanticFixtureDoubleBufferedSkeletalBoneMotion": wpo_fixture_validated,
                 "semanticFixturePreviousFrameSwitchWPOMotion": wpo_fixture_validated,
-                "semanticFixtureUIColorAlpha": True,
+                "semanticFixtureUIColorAlpha": wpo_fixture_validated,
+                "ordinarySceneCaptureValidated": not endpoint_job.get("bEnableSemanticValidationFixture", False),
                 "projectAuthoredAnimBlueprintEndpointMotion": project_skeletal_evidence
                 is not None,
                 "projectAuthoredAnimBlueprintExactForwardReverseReplay": project_skeletal_evidence

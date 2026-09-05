@@ -64,7 +64,7 @@ Warmup ticks also submit each enabled SceneCapture without writing files. This i
 - `ui_color_alpha` is an independent display-size PNG from the Slate game-layer tree, with no scene backbuffer. RGB is premultiplied by coverage and Alpha is straight coverage.
 - `object_id` reads Custom Stencil as an integer in `[0,255]`; zero is unlabeled.
 - PNG and EXR writes use a temporary `.part` file followed by an atomic rename.
-- Resume skips a sample only if all required modality files exist; it recalculates their hashes into the new manifest.
+- Since 0.17, resume only reuses a complete spatial dataset after checking the original manifest, plugin/engine/world, normalized job (only `bResume` may differ), frame IDs and original file hashes. The original manifest is preserved byte-for-byte. Partial and temporal resume are rejected; fresh capture defaults to `bResume=false`.
 - The manifest records the complete normalized job, engine version, state, pairing rule, camera pose and SHA-1 of each encoded file.
 
 ## Reproducibility acceptance test

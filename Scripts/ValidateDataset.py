@@ -14,6 +14,7 @@ from typing import Any
 
 try:
     import numpy as np
+    from TemporalGeometry import HISTORY_V3, matrix_jitter_raster_offset, previous_view_matches_saved
     import OpenEXR
     from PIL import Image
 except ImportError as exc:
@@ -243,6 +244,7 @@ def expected_submission_modalities(job: dict[str, Any]) -> list[str]:
     high_resolution = ["hr"]
     if job.get("bCaptureReferenceHR", False):
         high_resolution.append("hr_reference")
+        high_resolution.extend(f"hr_reference_sample_{index:02d}" for index in range(1, int(job.get("referenceTemporalSamples", 1))))
     low_resolution: list[str] = []
     if job.get("lRMode") == "NativeRender":
         low_resolution.append("lr")
@@ -876,6 +878,40 @@ def validate_temporal_frame(
     reference_enabled = bool(frame.get("referenceHRDiagnostics"))
     if reference_enabled:
         reference = frame["referenceHRDiagnostics"]
+        if "temporalSamples" in reference:
+            sample_count = int(reference.get("temporalSamples", 0))
+            samples = reference.get("subsamples", [])
+            sample_checks = sample_count in (1, 16, 32, 64) and len(samples) == sample_count
+            expected_projection = matrix(reference.get("viewToClipCurrentUnjittered"))
+            offsets = []
+            for index, sample in enumerate(samples):
+                offset = np.asarray(sample.get("projectionOffsetRenderPixel", []), dtype=float)
+                source_size = np.asarray(reference.get("sourceRenderSize", []), dtype=float)
+                if offset.shape != (2,) or source_size.shape != (2,):
+                    sample_checks = False
+                    continue
+                actual_projection = matrix(sample.get("viewToClip"))
+                # Recover the actual sample raster shift through projection;
+                # do not accept a sampling-pattern label as evidence of jitter.
+                probe = np.array([0., 0., 100., 1.])
+                actual_clip, fixed_clip = probe @ actual_projection, probe @ expected_projection
+                actual_offset = (actual_clip[:2]/actual_clip[3] - fixed_clip[:2]/fixed_clip[3])*source_size*np.array([.5, -.5])
+                center_error = float(np.max(np.abs(actual_offset-offset)))
+                origin = np.asarray(sample.get("worldViewOriginHigh", [])) + np.asarray(sample.get("worldViewOriginLow", []))
+                expected_origin = np.asarray(reference["worldViewOriginHighCurrent"]) + np.asarray(reference["worldViewOriginLowCurrent"])
+                sample_checks &= sample.get("index") == index and center_error <= 1e-4 and np.allclose(origin, expected_origin, atol=1e-4, rtol=0)
+                sample_checks &= math.isclose(float(sample.get("renderGameTimeS", math.nan)), float(temporal["renderGameTimeS"]), abs_tol=1e-6, rel_tol=0)
+                sample_checks &= math.isclose(float(sample.get("preExposure", math.nan)), float(temporal["preExposure"]), abs_tol=1e-6, rel_tol=0)
+                if sample_count > 1:
+                    sample_checks &= sample.get("rendererCameraCut") is True
+                matching = [item for item in frame.get("renderSubmissions", []) if item.get("renderSubmissionId") == sample.get("renderSubmissionId")]
+                sample_checks &= len(matching) == 1 and matching[0].get("modality", "").startswith("hr_reference")
+                offsets.append(offset)
+            sample_checks &= bool(offsets) and np.max(np.abs(np.mean(offsets, axis=0))) < 1e-6
+            if sample_count > 1:
+                sample_checks &= len(set(tuple(item) for item in offsets)) == sample_count
+                sample_checks &= reference.get("subsampleHistoryReset") is True
+            add_check(checks, f"{prefix}.reference_frozen_subsamples", bool(sample_checks), f"count={sample_count} actual={len(samples)}")
         validate_mip_bias_metadata(
             checks,
             f"{prefix}.reference_hr",
@@ -1060,7 +1096,7 @@ def validate_temporal_frame(
     history_rejection_source = temporal.get("historyRejectionSource")
     history_rejection_v2 = (
         history_rejection_source
-        == "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
+        in {"component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2", HISTORY_V3}
     )
     add_check(
         checks,
@@ -1071,6 +1107,7 @@ def validate_temporal_frame(
         in {
             "custom_stencil_identity_else_static_camera_depth_reprojection_v1",
             "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2",
+            HISTORY_V3,
         }
         and temporal.get("historyRejectionTrainingUsable") is True
         and temporal.get("historyRejectionRequiresValidityMask") is True
@@ -1373,7 +1410,7 @@ def validate_history_rejection_v2_cross_frame(
         if (
             not isinstance(temporal, dict)
             or temporal.get("historyRejectionSource")
-            != "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
+            not in {"component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2", HISTORY_V3}
             or frame.get("reset") is True
         ):
             continue
@@ -1437,7 +1474,16 @@ def validate_history_rejection_v2_cross_frame(
         resolution_fraction = float(temporal.get("resolutionFraction", 0.0))
         reprojection_x = xx + motion[..., 0] * resolution_fraction
         reprojection_y = yy + motion[..., 1] * resolution_fraction
-        # FMath::RoundToInt uses nearest integer with half values away from zero.
+        if temporal.get("historyRejectionSource") == HISTORY_V3:
+            previous_frame = next(item for item in frames if int(item["logicalFrameId"]) == previous_frame_id)
+            display_size = np.asarray(temporal["displaySize"], dtype=np.float64)
+            scale = np.array([width, height]) / display_size
+            offset = matrix_jitter_raster_offset(temporal, previous_frame["temporalDiagnostics"], (width, height))
+            # Match the producer's float32 raster arithmetic; matrix derivation
+            # independently proves the offset instead of copying jitter fields.
+            reprojection_x = (xx.astype(np.float32) + motion[..., 0] * np.float32(scale[0]) + np.float32(offset[0]))
+            reprojection_y = (yy.astype(np.float32) + motion[..., 1] * np.float32(scale[1]) + np.float32(offset[1]))
+        # Preserve the historical v2 diagnostic reconstruction below; v3 uses the actual UE rule.
         previous_x = np.where(
             reprojection_x >= 0.0,
             np.floor(reprojection_x + 0.5),
@@ -1448,6 +1494,10 @@ def validate_history_rejection_v2_cross_frame(
             np.floor(reprojection_y + 0.5),
             np.ceil(reprojection_y - 0.5),
         ).astype(np.int64)
+        if temporal.get("historyRejectionSource") == HISTORY_V3:
+            # UE GenericPlatformMath rounds ties toward positive infinity.
+            previous_x = np.floor(reprojection_x + np.float32(.5)).astype(np.int64)
+            previous_y = np.floor(reprojection_y + np.float32(.5)).astype(np.int64)
 
         expected_reject = np.ones((height, width), dtype=np.float32)
         expected_valid = np.zeros((height, width), dtype=np.float32)
@@ -2574,7 +2624,9 @@ def validate(
     manifest_path = dataset / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"manifest not found: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    validator_source_sha256 = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("TemporalGeometry.py").read_bytes()).hexdigest()
     checks: list[dict[str, Any]] = []
     stats: dict[str, list[dict[str, Any]]] = {}
 
@@ -2582,13 +2634,37 @@ def validate(
     frames = manifest.get("frames", [])
     add_check(checks, "frames_present", bool(frames), f"count={len(frames)}")
     job = manifest.get("job", {})
+    temporal_contract = manifest.get("contractVersion") == "nr-sr-data-v2"
+    add_check(checks, "contract.supported_capture_schema", manifest.get("contractVersion") in {"spatial-sr-data-v1", "nr-sr-data-v2"}, str(manifest.get("contractVersion")))
+    if temporal_contract:
+        flags = ("bCaptureTemporalDiagnostics", "bCaptureMainViewTemporalDiagnostics", "bCaptureDepth", "bRequireSceneControlPreflight", "bRunSceneControlPreflight", "bLockExposure", "bLockMaterialTimeToLogicalFrame", "bLockTemporalJitterToLogicalFrame", "bForceSynchronousRendering", "bAssignStableInstanceIds", "bRejectVisibleWidgetComponents", "bDisableMotionBlur", "bBlockOnStreamingBeforeCapture")
+        controls_ok = all(job.get(k) is True for k in flags) and not job.get("bAllowDynamicInstanceIdTopology", False)
+        controls_ok &= job.get("lRMode") == "NativeRender" and job.get("replayPass") == "Standard" and job.get("frameStep") == 1 and bool(job.get("expectedMap"))
+        controls_ok &= all(job["hRResolution"][k] == 2 * job["lRResolution"][k] for k in ("x", "y"))
+        controls_ok &= not job.get("bCaptureReferenceHR") or job.get("referenceTemporalSamples") in (16, 32, 64)
+        add_check(checks, "contract.temporal_required_controls", bool(controls_ok), "Strict 2x Main View SR with explicit scene controls and complete inputs")
+        expected_mapping = {"color_lr": "color_lr_scene_hdr", "color_gt": "color_hr_reference_scene_hdr" if job.get("bCaptureReferenceHR") else "color_hr_native_scene_hdr", "depth": "depth_view_linear_meters", "motion": "motion_full_current_to_previous", **{name: name for name in ("motion_valid", "depth_valid", "velocity_coverage", "reactive_mask", "transparency_mask")}}
+        add_check(checks, "contract.training_input_mapping", manifest.get("trainingInputMapping") == expected_mapping, json.dumps(manifest.get("trainingInputMapping"), sort_keys=True))
+        add_check(checks, "contract.capture_awaits_admission", manifest.get("certificationStatus") == "pending_dataset_validation" and manifest.get("temporalTrainingCertified") is False, "A producer cannot self-certify before offline validation")
+        add_check(checks, "contract.material_shader_readiness", manifest.get("sceneControlPreflight", {}).get("materialCompileErrorsChecked") is True and manifest.get("provenance", {}).get("materialShadersReadyAfterWarmup") is True, "Compiler errors rejected by preflight; visible game material shader maps checked after warmup")
+    writer = manifest.get("imageWriter")
+    if isinstance(writer, dict):
+        writer_ok = writer.get("pendingImages") == 0 and writer.get("pendingRawBytes") == 0 and manifest.get("pendingSamples") == 0
+        writer_ok &= writer.get("renderThreadWrites") == 0
+        if job.get("bAsyncImageWrites", False):
+            writer_ok &= writer.get("asynchronous") is True and writer.get("gameThreadWrites") == 0
+        writer_ok &= 0 <= int(writer.get("peakPendingRawBytes", -1)) <= int(writer.get("memoryBudgetBytes", -1))
+        writer_ok &= int(writer.get("completedImages", -1)) == sum(len(f.get("files", {})) for f in frames)
+        add_check(checks, "image_writer.completed_atomic_frames", bool(writer_ok), json.dumps(writer, sort_keys=True))
+    if job.get("bCaptureReferenceHR", False) and "referenceTemporalSamples" in job:
+        add_check(checks, "reference.requested_sample_count", all(f.get("referenceHRDiagnostics", {}).get("temporalSamples") == int(job["referenceTemporalSamples"]) for f in frames), str(job["referenceTemporalSamples"]))
     hr_size = (int(job.get("hRResolution", {}).get("x", 0)), int(job.get("hRResolution", {}).get("y", 0)))
     lr_size = (int(job.get("lRResolution", {}).get("x", 0)), int(job.get("lRResolution", {}).get("y", 0)))
     temporal_enabled = bool(job.get("bCaptureTemporalDiagnostics", False))
     history_rejection_v2 = temporal_enabled and any(
         isinstance(frame.get("temporalDiagnostics"), dict)
         and frame["temporalDiagnostics"].get("historyRejectionSource")
-        == "component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"
+        in {"component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2", HISTORY_V3}
         for frame in frames
     )
     gbuffer_attributes_v3 = temporal_enabled and any(
@@ -2605,6 +2681,13 @@ def validate(
         else TEMPORAL_MODALITIES_V1
     )
     main_view = bool(job.get("bCaptureMainViewTemporalDiagnostics", False))
+    if temporal_enabled:
+        add_check(checks, "temporal.standard_consecutive_frames",
+                  job.get("replayPass", "Standard") != "Standard" or int(job.get("frameStep", 1)) == 1,
+                  "Standard Main View motion must refer to the previous saved frame, not a skipped render")
+        add_check(checks, "temporal.jittered_raster_contract",
+                  all(f.get("temporalDiagnostics", {}).get("historyRejectionSource") == HISTORY_V3 for f in frames),
+                  "Older rejection masks lack jitter compensation; recapture with the corrected producer")
     scene_capture_lr_comparison = bool(
         job.get("bCaptureSceneCaptureLRComparison", False)
     )
@@ -2860,6 +2943,13 @@ def validate(
             str(determinism_contract.get("uncapturedRendererPrime")),
         )
     provenance = manifest.get("provenance", {})
+    if temporal_contract or "pluginBinarySha1" in provenance:
+        binary_hash = str(provenance.get("pluginBinarySha1", ""))
+        add_check(checks, "provenance.plugin_binary", len(binary_hash) == 40 and all(c in "0123456789abcdefABCDEF" for c in binary_hash), binary_hash)
+        packages = provenance.get("loadedContentPackages", {})
+        content_hash = hashlib.sha1("\n".join(f"{name}={value}" for name, value in sorted(packages.items())).encode("utf-8")).hexdigest().upper()
+        packages_ok = bool(packages) and all((name.startswith("/Game/") or name.startswith("/SuperResolutionDataset/")) and len(value) == 40 and all(c in "0123456789ABCDEFabcdef" for c in value) for name, value in packages.items())
+        add_check(checks, "provenance.loaded_source_packages", packages_ok and content_hash == provenance.get("loadedContentSha1"), f"packages={len(packages)} sha1={content_hash}")
     add_check(checks, "provenance_present", isinstance(provenance, dict) and bool(provenance), "present")
     for name in ("captureConfigSha1", "cvarProfileSha1", "contentMapSha1", "shaderSourceSha1"):
         value = str(provenance.get(name, ""))
@@ -3704,7 +3794,7 @@ def validate(
     dataset_profile_frames: list[dict[str, Any]] = []
     previous_profile_frame: dict[str, Any] | None = None
     all_render_submission_ids: list[int] = []
-    for frame in frames:
+    for frame_index, frame in enumerate(frames):
         frame_id = int(frame["logicalFrameId"])
         frame_role = str(frame.get("replayPass") or "Standard")
         add_check(
@@ -3822,6 +3912,14 @@ def validate(
             )
         motion_training_usable = frame.get("motionTrainingUsable")
         expected_motion_training_usable = replay_role != "FrameGenerationIntermediate"
+        if "rendererCameraCut" in frame:
+            expected_motion_training_usable = expected_motion_training_usable and not frame.get("reset", False)
+            renderer_cut = frame["rendererCameraCut"]
+            expected_reset = frame_index == 0 or renderer_cut
+            add_check(checks, f"frame_{frame_id:06d}.renderer_reset_contract",
+                      frame.get("reset") is expected_reset
+                      and frame.get("resetReason") == ("job_start" if frame_index == 0 else "renderer_camera_cut" if renderer_cut else "none"),
+                      f"rendererCameraCut={renderer_cut} reset={frame.get('reset')} reason={frame.get('resetReason')}")
         add_check(
             checks,
             f"frame_{frame_id:06d}.motion_training_role",
@@ -3841,6 +3939,7 @@ def validate(
         )
         expected_skeletal_override = (
             expected_endpoint_override and int(frame.get("motionTimeSpanFrames", 0)) > 0
+            and int(frame.get("sceneSkeletalComponentCount", 0)) > 0
         )
         skeletal_override = frame.get("endpointPreviousSkeletalBoneOverride")
         skeletal_component_count = int(
@@ -3893,7 +3992,7 @@ def validate(
                 else (
                     "independent_slate_game_layer"
                     if modality == "ui_layer"
-                    else f"{modality}_scene_capture"
+                    else "hr_reference_scene_capture" if modality.startswith("hr_reference") else f"{modality}_scene_capture"
                 )
             )
             for modality in actual_modalities
@@ -4289,6 +4388,8 @@ def validate(
             required.extend(SCENE_CAPTURE_LR_COMPARISON_MODALITIES)
         if job.get("bCaptureReferenceHR", False):
             required.extend(REFERENCE_MODALITIES)
+            if job.get("bSaveReferenceSubsamples", False):
+                required.extend(f"reference_subsample_{i:02d}" for i in range(int(job.get("referenceTemporalSamples", 1))))
         if job.get("bCaptureMainViewHUDlessColor", False):
             required.extend(HUDLESS_MODALITIES)
         if job.get("bCaptureUIColorAlpha", False):
@@ -4343,7 +4444,7 @@ def validate(
                     )
                     channel_min = np.min(pixels, axis=(0, 1))
                     channel_max = np.max(pixels, axis=(0, 1))
-                    channel_mean = np.mean(pixels, axis=(0, 1))
+                    channel_mean = np.mean(pixels, axis=(0, 1), dtype=np.float64)
                     stats.setdefault(modality, []).append(
                         {
                             "logicalFrameId": frame_id,
@@ -4368,6 +4469,9 @@ def validate(
                     else hr_size
                 )
             )
+            if modality.startswith("reference_subsample_"):
+                scale = int(job.get("referenceHRScale", 2))
+                expected_size = (hr_size[0] * scale, hr_size[1] * scale)
             add_check(
                 checks,
                 f"frame_{frame_id:06d}.{modality}.size",
@@ -4383,7 +4487,7 @@ def validate(
             )
             channel_min = np.nanmin(pixels, axis=(0, 1))
             channel_max = np.nanmax(pixels, axis=(0, 1))
-            channel_mean = np.nanmean(pixels, axis=(0, 1))
+            channel_mean = np.nanmean(pixels, axis=(0, 1), dtype=np.float64)
             entry = {
                 "logicalFrameId": frame_id,
                 "minRGBA": channel_min.tolist(),
@@ -5272,9 +5376,11 @@ def validate(
     # captures t1 before t0 so the retained View State yields motion_0_to_1.
     for index in range(1, len(temporal_records)):
         frame_id, current, reset = temporal_records[index]
-        _, previous, _ = temporal_records[index - 1]
+        previous_frame_id, previous, _ = temporal_records[index - 1]
         if reset:
             continue
+        matches, metrics = previous_view_matches_saved(current, previous)
+        add_check(checks, f"frame_{frame_id:06d}.previous_view_matches_saved_frame", matches, json.dumps(metrics, sort_keys=True))
         previous_jitter = np.asarray(current.get("jitterPreviousNDC", (math.nan, math.nan)), dtype=np.float64)
         prior_current_jitter = np.asarray(previous.get("jitterCurrentNDC", (math.nan, math.nan)), dtype=np.float64)
         add_check(
@@ -5283,10 +5389,17 @@ def validate(
             bool(np.allclose(previous_jitter, prior_current_jitter, rtol=0.0, atol=1e-7)),
             f"previous={previous_jitter.tolist()} priorCurrent={prior_current_jitter.tolist()}",
         )
+        current_state = int(current.get("stateFrameIndex", -1))
+        previous_state = int(previous.get("stateFrameIndex", -1))
+        state_progression_ok = (
+            ((current_state - previous_state) & 0xFFFFFFFF) == ((frame_id - previous_frame_id) & 0xFFFFFFFF)
+            if job.get("bLockTemporalJitterToLogicalFrame", False)
+            else current_state > previous_state
+        )
         add_check(
             checks,
-            f"frame_{frame_id:06d}.state_frame_monotonic",
-            int(current.get("stateFrameIndex", -1)) > int(previous.get("stateFrameIndex", -1)),
+            f"frame_{frame_id:06d}.state_frame_matches_capture_direction",
+            state_progression_ok,
             f"previous={previous.get('stateFrameIndex')} current={current.get('stateFrameIndex')}",
         )
 
@@ -5660,7 +5773,16 @@ def validate(
                 other_role == replay_role,
                 f"left={replay_role} right={other_role}",
             )
-        if compare_mode == "capture-order":
+        if compare_mode == "image-writer":
+            excluded = {"jobName", "outputDirectory", "bAsyncImageWrites", "maxPendingImageWriteMB"}
+            normalized_left = {k: v for k, v in job.items() if k not in excluded}
+            normalized_right = {k: v for k, v in other_job.items() if k not in excluded}
+            add_check(checks, "image_writer.jobs_equal_except_writer_and_identity", normalized_left == normalized_right, "Only writer mode/budget, name and output may differ")
+            add_check(checks, "image_writer.opposite_modes", {job.get("bAsyncImageWrites"), other_job.get("bAsyncImageWrites")} == {True, False}, "sync versus async")
+            left_provenance = {k: v for k, v in provenance.items() if k != "captureConfigSha1"}
+            right_provenance = {k: v for k, v in other.get("provenance", {}).items() if k != "captureConfigSha1"}
+            add_check(checks, "image_writer.same_renderer_provenance", left_provenance == right_provenance, "Engine, source, shaders, assets, CVars and streaming must match")
+        elif compare_mode == "capture-order":
             other_order = str(other_job.get("auxiliaryCaptureOrder") or "HighResolutionFirst")
             order_pair_valid = {
                 auxiliary_capture_order,
@@ -6571,6 +6693,8 @@ def validate(
         if ".history_rejection_v2." in check["name"]
         or ".disocclusion_" in check["name"]
         or ".history_rejection_reason_" in check["name"]
+        or check["name"] == "temporal.jittered_raster_contract"
+        or check["name"].endswith(".previous_view_matches_saved_frame")
     ]
     disocclusion_gate = (
         "pass"
@@ -6584,7 +6708,10 @@ def validate(
         else "not_run"
     )
     report = {
-        "validatorVersion": 21,
+        "validatorVersion": 23,
+        "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "validatorSourceSha256": validator_source_sha256,
+        "compareManifestSha256": hashlib.sha256(other_manifest_path.read_bytes()).hexdigest() if compare is not None else None,
         "comparisonMode": compare_mode if compare is not None else "none",
         "mainViewSceneCapturePixelDomainGate": pixel_domain_gate,
         "stableInstanceIdGate": stable_instance_gate,
@@ -6631,6 +6758,7 @@ def validate(
         "certificationStatus": manifest.get("certificationStatus"),
         "temporalTrainingCertified": bool(manifest.get("temporalTrainingCertified", False)),
         "formatAndIntegrityGate": "pass" if passed else "fail",
+        "temporalContractGate": "pass" if temporal_contract and passed else "fail" if temporal_contract else "not_run",
         "checksPassed": sum(check["passed"] for check in required_checks),
         "checksTotal": len(required_checks),
         "informationalChecks": len(checks) - len(required_checks),
@@ -6638,7 +6766,7 @@ def validate(
         "statistics": stats,
         "datasetProfile": dataset_profile,
         "replayMetrics": replay_metrics,
-        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. Scene-control preflight evidence inventories and hashes ticking Actors/components, loaded Niagara Data Interfaces and known time/random material inputs; strict jobs reject every unclassified record. The optional Main View/SceneCapture LR gate compares the same AfterDOF linear-HDR stage after independent pre-exposure normalization and metadata-defined subpixel jitter alignment, without an extra render submission or simulation advance. Stable instance-ID jobs finalize a fixed renderable-component topology after warmup/streaming, assign collision-free uint8 Custom Stencil IDs, hash an ID-to-component/Actor/class map, fail on topology or label drift and verify that every nonzero raster value resolves through that map; the uint8/per-component limits remain explicit. Disocclusion v2 independently reconstructs every non-reset reason from current motion/depth/ID plus the previous saved depth/ID buffers; cross-instance and static-depth decisions are valid, while dynamic same-instance or unlabeled motion is conservatively rejected with validity zero. Explicit controllable-state cache jobs store integration-owned canonical payloads by logical frame, apply them after Actor ticks, require byte-exact state readback and compare the restored scene plus images/depth against the recording process; ordinary manifests still persist only state hashes and byte counts. Native Niagara Sim Cache jobs record every attribute for fixed-topology CPU and GPU emitters, perform immediate GPU readback, serialize exact component/system identities and verify record/apply payload metrics plus rendered outputs; custom Niagara Data Interface storage remains disabled and must pass preflight classification. Native Chaos rigid-body cache jobs record fixed-topology UStaticMeshComponent transform tracks after solve, preserve component scale, random-access the cache by logical frame before rendering, and validate a real collision fixture plus record/apply images and depth; velocity, constraints and full solver internals remain explicitly outside this gate. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU/GPU Niagara particle counts and visible AfterDOF VFX probes. Dynamic same-instance surface identity and Main View/reference-HR pixel equivalence remain separate gates.",
+        "note": "This gate validates buffer integrity, replay-role isolation, motion time-span metadata, endpoint skeletal-bone override coverage, matrix/jitter consistency, reversed-Z/view-position reconstruction and tolerance-based replay. Scene-control preflight evidence inventories and hashes ticking Actors/components, loaded Niagara Data Interfaces and known time/random material inputs; strict jobs reject every unclassified record. The optional Main View/SceneCapture LR gate compares the same AfterDOF linear-HDR stage after independent pre-exposure normalization and metadata-defined subpixel jitter alignment, without an extra render submission or simulation advance. Stable instance-ID jobs finalize a fixed renderable-component topology after warmup/streaming, assign collision-free uint8 Custom Stencil IDs, hash an ID-to-component/Actor/class map, fail on topology or label drift and verify that every nonzero raster value resolves through that map; the uint8/per-component limits remain explicit. Disocclusion v3 recovers jittered-raster offsets from saved projection matrices, verifies the actual previous GPU view against the previous saved frame, and reconstructs non-reset reasons from motion/depth/ID plus the previous saved depth/ID buffers; legacy v1/v2 temporal output cannot pass the current correctness gate; cross-instance and static-depth decisions are valid, while dynamic same-instance or unlabeled motion is conservatively rejected with validity zero. Explicit controllable-state cache jobs store integration-owned canonical payloads by logical frame, apply them after Actor ticks, require byte-exact state readback and compare the restored scene plus images/depth against the recording process; ordinary manifests still persist only state hashes and byte counts. Native Niagara Sim Cache jobs record every attribute for fixed-topology CPU and GPU emitters, perform immediate GPU readback, serialize exact component/system identities and verify record/apply payload metrics plus rendered outputs; custom Niagara Data Interface storage remains disabled and must pass preflight classification. Native Chaos rigid-body cache jobs record fixed-topology UStaticMeshComponent transform tracks after solve, preserve component scale, random-access the cache by logical frame before rendering, and validate a real collision fixture plus record/apply images and depth; velocity, constraints and full solver internals remain explicitly outside this gate. The semantic fixture additionally validates rigid, pure-skinning and explicit PreviousFrameSwitch WPO motion, 1/10/100 m depth, transparency, disocclusion, finalized CPU/GPU Niagara particle counts and visible AfterDOF VFX probes. Dynamic same-instance surface identity and Main View/reference-HR pixel equivalence remain separate gates.",
     }
     return report, passed
 
@@ -6649,7 +6777,7 @@ def main() -> int:
     parser.add_argument("--compare", type=Path, help="Second dataset directory or manifest for deterministic hash comparison")
     parser.add_argument(
         "--compare-mode",
-        choices=("exact-replay", "capture-order", "vfx-reverse", "skeletal-reverse", "material-reverse", "state-cache", "niagara-cache", "chaos-cache"),
+        choices=("exact-replay", "image-writer", "capture-order", "vfx-reverse", "skeletal-reverse", "material-reverse", "state-cache", "niagara-cache", "chaos-cache"),
         default="exact-replay",
         help="Comparison contract. Reverse modes compare forward/reverse endpoint roles at identical absolute times.",
     )
@@ -6657,6 +6785,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.compare_mode in (
+        "image-writer",
         "capture-order",
         "vfx-reverse",
         "skeletal-reverse",

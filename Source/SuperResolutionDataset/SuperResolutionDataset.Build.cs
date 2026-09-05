@@ -22,6 +22,7 @@ public class SuperResolutionDataset : ModuleRules
 		{
 			"Json",
 			"JsonUtilities",
+			"ImageWrapper",
 			"Projects",
 			"RenderCore",
 			"Renderer",

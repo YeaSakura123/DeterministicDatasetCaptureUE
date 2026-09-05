@@ -88,34 +88,34 @@ private:
 		FIntPoint DisplaySize,
 		FVector2f& OutDisplayPixels);
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<USceneComponent> SceneRoot;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> MovingCube;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> BackgroundPanel;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> DepthOneMeterPanel;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> DepthTenMetersPanel;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> DepthHundredMetersPanel;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> TranslucentPanel;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UPoseableMeshComponent> SkeletalCube;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> WPOCube;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UNiagaraComponent> NiagaraFixture;
 
 	UPROPERTY(Transient)
@@ -182,10 +182,10 @@ public:
 	virtual void DatasetRestore_Implementation() override;
 
 private:
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<USceneComponent> StateCacheRoot;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> StateCacheProbe;
 
 	FTransform OriginalTransform = FTransform::Identity;
@@ -224,16 +224,16 @@ private:
 		FVector NormalImpulse,
 		const FHitResult& Hit);
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<USceneComponent> PhysicsRoot;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> Ground;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> DynamicCubeA;
 
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Dataset Validation")
 	TObjectPtr<UStaticMeshComponent> DynamicCubeB;
 
 	FTransform InitialTransformA = FTransform::Identity;

@@ -152,7 +152,8 @@ bool FSRDatasetViewExtension::RequestCapture(
 	const FIntPoint ExpectedSize,
 	const FIntPoint DisplaySize,
 	const bool bMainViewOnly,
-	FString& OutError)
+	FString& OutError,
+	const bool bColorOnly)
 {
 	if (CaptureStage != ESRDatasetViewCaptureStage::AfterDOFTemporal)
 	{
@@ -174,6 +175,7 @@ bool FSRDatasetViewExtension::RequestCapture(
 	RequestedSize = ExpectedSize;
 	RequestedDisplaySize = DisplaySize;
 	bRequestedMainViewOnly = bMainViewOnly;
+	bRequestedColorOnly = bColorOnly;
 	bRequestPending = true;
 	OutError.Reset();
 	return true;
@@ -226,19 +228,20 @@ void FSRDatasetViewExtension::SubscribeToPostProcessingPass(
 	FScopeLock Lock(&StateMutex);
 	if (bRequestPending && !bRequestConsumed && InView.bIsSceneCapture != bRequestedMainViewOnly)
 	{
-		InOutPassCallbacks.Add(CaptureStage == ESRDatasetViewCaptureStage::AfterDOFTemporal
+		InOutPassCallbacks.Add(CaptureStage == ESRDatasetViewCaptureStage::AfterDOFTemporal && !bRequestedColorOnly
 			? FPostProcessingPassDelegate::CreateRaw(this, &FSRDatasetViewExtension::CaptureAfterDOF_RenderThread)
-			: FPostProcessingPassDelegate::CreateRaw(this, &FSRDatasetViewExtension::CaptureAfterTonemap_RenderThread));
+			: FPostProcessingPassDelegate::CreateRaw(this, &FSRDatasetViewExtension::CaptureColorOnly_RenderThread));
 	}
 }
 
-FScreenPassTexture FSRDatasetViewExtension::CaptureAfterTonemap_RenderThread(
+FScreenPassTexture FSRDatasetViewExtension::CaptureColorOnly_RenderThread(
 	FRDGBuilder& GraphBuilder,
 	const FSceneView& View,
 	const FPostProcessMaterialInputs& Inputs)
 {
 	const FScreenPassTexture SceneColor(Inputs.GetInput(EPostProcessMaterialInput::SceneColor));
 	FIntPoint OutputSize;
+	FIntPoint DisplaySize;
 	{
 		FScopeLock Lock(&StateMutex);
 		if (!bRequestPending || bRequestConsumed || View.bIsSceneCapture == bRequestedMainViewOnly ||
@@ -249,6 +252,7 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterTonemap_RenderThread(
 		bRequestPending = false;
 		bRequestConsumed = true;
 		OutputSize = RequestedSize;
+		DisplaySize = RequestedDisplaySize;
 	}
 
 	const FRDGTextureDesc OutputDesc = FRDGTextureDesc::Create2D(
@@ -274,7 +278,7 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterTonemap_RenderThread(
 	TShaderMapRef<FSRDatasetCopyColorCS> ComputeShader(GetGlobalShaderMap(View.GetFeatureLevel()));
 	FComputeShaderUtils::AddPass(
 		GraphBuilder,
-		RDG_EVENT_NAME("SRDataset Extract Tonemapped HUD-less Color"),
+		RDG_EVENT_NAME("SRDataset Extract Color Only"),
 		ComputeShader,
 		Parameters,
 		FComputeShaderUtils::GetGroupCount(
@@ -284,6 +288,8 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterTonemap_RenderThread(
 	TUniquePtr<FPendingReadbacks> NewReadbacks = MakeUnique<FPendingReadbacks>();
 	NewReadbacks->Size = OutputSize;
 	NewReadbacks->bColorOnly = true;
+	NewReadbacks->DisplaySize = DisplaySize;
+	NewReadbacks->bCameraCut = View.bCameraCut;
 	NewReadbacks->SceneColor = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetTonemappedHUDlessColor"));
 	NewReadbacks->Metadata = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetTonemappedMetadata"));
 	AddEnqueueCopyPass(GraphBuilder, NewReadbacks->SceneColor.Get(), SceneColorOutput);
@@ -395,6 +401,8 @@ FScreenPassTexture FSRDatasetViewExtension::CaptureAfterDOF_RenderThread(
 	TUniquePtr<FPendingReadbacks> NewReadbacks = MakeUnique<FPendingReadbacks>();
 	NewReadbacks->Size = OutputSize;
 	NewReadbacks->bColorOnly = false;
+	NewReadbacks->DisplaySize = DisplaySize;
+	NewReadbacks->bCameraCut = View.bCameraCut;
 	NewReadbacks->SceneColor = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetSceneColor"));
 	NewReadbacks->VelocityRaw = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetVelocityRaw"));
 	NewReadbacks->MotionFull = MakeUnique<FRHIGPUTextureReadback>(TEXT("SRDatasetMotionFull"));
@@ -446,6 +454,7 @@ bool FSRDatasetViewExtension::WaitAndTakeCapture(FSRDatasetTemporalCaptureResult
 
 			RHICmdList.BlockUntilGPUIdle();
 			Result->Size = Readbacks->Size;
+			Result->DisplaySize = Readbacks->DisplaySize;
 			ReadFloatTexture(*Readbacks->SceneColor, Readbacks->Size, Result->SceneColor);
 			if (!Readbacks->bColorOnly)
 			{
@@ -461,6 +470,7 @@ bool FSRDatasetViewExtension::WaitAndTakeCapture(FSRDatasetTemporalCaptureResult
 			TArray<FLinearColor> MetadataPixels;
 			ReadFloatTexture(*Readbacks->Metadata, FIntPoint(4, 21), MetadataPixels);
 			DecodeMetadata(MetadataPixels, Result->Metadata);
+			Result->Metadata.bCameraCut = Readbacks->bCameraCut;
 		});
 	FlushRenderingCommands();
 

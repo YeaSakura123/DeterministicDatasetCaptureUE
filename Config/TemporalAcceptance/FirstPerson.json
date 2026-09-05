@@ -1,6 +1,6 @@
 {
-  "contractVersion": "nr-sr-data-v2",
-  "jobName": "first_person_production_2x_strict",
+  "contractVersion": "spatial-sr-data-v1",
+  "jobName": "temporal_acceptance_FirstPerson",
   "expectedMap": "/Game/FirstPerson/Lvl_FirstPerson",
   "bUseDeterministicCameraTransform": true,
   "deterministicCameraLocationCm": {
@@ -15,7 +15,7 @@
   },
   "deterministicCameraFOVDegrees": 90.0,
   "startFrame": 0,
-  "endFrame": 1,
+  "endFrame": 63,
   "frameStep": 1,
   "captureFrameRateNumerator": 30,
   "captureFrameRateDenominator": 1,
@@ -35,10 +35,10 @@
   "bAssignStableInstanceIds": true,
   "bCaptureTemporalDiagnostics": true,
   "bCaptureMainViewTemporalDiagnostics": true,
-  "bCaptureReferenceHR": false,
-  "bCaptureMainViewHUDlessColor": true,
-  "bCaptureUIColorAlpha": true,
-  "outputDirectory": "Saved/SRDataset/production_first_person_2x_strict",
+  "bCaptureReferenceHR": true,
+  "bCaptureMainViewHUDlessColor": false,
+  "bCaptureUIColorAlpha": false,
+  "outputDirectory": "Saved/SRDataset/TemporalAcceptance/FirstPerson",
   "bResume": false,
   "bWriteManifestEveryFrame": true,
   "randomSeed": 1337,
@@ -49,7 +49,7 @@
   "bLockExposure": true,
   "bLockTemporalJitterToLogicalFrame": true,
   "temporalJitterSequenceLength": 8,
-  "temporalJitterPhaseOffset": 0,
+  "temporalJitterPhaseOffset": 6,
   "bForceSynchronousRendering": true,
   "bRunSceneControlPreflight": true,
   "bRequireSceneControlPreflight": true,
@@ -72,9 +72,9 @@
   "streamingWaitSeconds": 120.0,
   "bEnableSemanticValidationFixture": false,
   "bAutoQuit": true,
-  "bAllowDynamicInstanceIdTopology": false,
-  "bRejectVisibleWidgetComponents": true,
-  "referenceTemporalSamples": 16,
-  "bAsyncImageWrites": true,
-  "maxPendingImageWriteMB": 512
+  "deterministicCameraTranslationPerLogicalFrameCm": {
+    "x": 0,
+    "y": 1,
+    "z": 0
+  }
 }

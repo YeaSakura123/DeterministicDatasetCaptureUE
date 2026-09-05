@@ -29,6 +29,9 @@ float2 ComputeCameraScreenVelocity(uint2 OutputPixel, float DeviceZ)
 {
 	float2 ViewportUV = (float2(OutputPixel) + 0.5f) / float2(OutputSize);
 	float2 ScreenPos = 2.0f * float2(ViewportUV.x, 1.0f - ViewportUV.y) - 1.0f;
+	// The depth sample lives on the jittered input raster. Camera-only motion
+	// uses unjittered matrices, so first recover its unjittered clip position.
+	ScreenPos -= View.TemporalAAJitter.xy;
 	float4 ThisClip = float4(ScreenPos, DeviceZ, 1.0f);
 	float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
 	float2 PrevScreen = PrevClip.xy / PrevClip.w;
@@ -109,7 +112,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		{
 			float2 ViewportUV = (float2(Pixel) + 0.5f) / float2(OutputSize);
 			float2 ScreenPos = 2.0f * float2(ViewportUV.x, 1.0f - ViewportUV.y) - 1.0f;
-			float4 PreviousClip = mul(float4(ScreenPos, DeviceZ, 1.0f), View.ClipToPrevClip);
+			float4 PreviousClip = mul(float4(ScreenPos, DeviceZ, 1.0f), View.ClipToPrevClipWithAA);
 			if (abs(PreviousClip.w) > 1.0e-8f)
 			{
 				float Candidate = PreviousClip.z / PreviousClip.w;

@@ -33,6 +33,8 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/LocalPlayer.h"
+#include "SceneView.h"
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformMisc.h"
 #include "JsonObjectConverter.h"
@@ -48,7 +50,10 @@
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Misc/SecureHash.h"
+#include "Modules/ModuleManager.h"
+#include "UObject/Package.h"
 #include "Materials/Material.h"
+#include "MaterialShared.h"
 #include "Materials/MaterialExpressionParticleRandom.h"
 #include "Materials/MaterialExpressionPerInstanceRandom.h"
 #include "Materials/MaterialExpressionTime.h"
@@ -91,6 +96,11 @@ DEFINE_LOG_CATEGORY_STATIC(LogSRDataset, Log, All);
 
 namespace SRDataset::Private
 {
+	FString CurrentPluginVersion()
+	{
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("SuperResolutionDataset"));
+		return Plugin ? Plugin->GetDescriptor().VersionName : TEXT("unknown");
+	}
 	const TCHAR* TemporalDiagnosticModalities[] = {
 		TEXT("color_hr_native_scene_hdr"),
 		TEXT("color_lr_scene_hdr"),
@@ -279,6 +289,22 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 	{
 		return false;
 	}
+	if (Job.bResume)
+	{
+		bool bReused = false;
+		if (!TryReuseCompletedSpatialDataset(Job, bReused, OutError))
+		{
+			return false; // Never overwrite an incompatible existing manifest.
+		}
+		if (bReused)
+		{
+			if (Job.bAutoQuit || bCommandLineAutoQuit)
+			{
+				FPlatformMisc::RequestExitWithStatus(false, 0, TEXT("SRDataset verified spatial reuse"));
+			}
+			return true;
+		}
+	}
 
 	ActiveJob = Job;
 	// Project-authored validation Actors and their AnimInstances can consume the
@@ -353,6 +379,109 @@ bool USRDatasetCaptureSubsystem::StartCapture(const FSRDatasetCaptureJob& Job, F
 	}
 
 	UE_LOG(LogSRDataset, Display, TEXT("Started dataset job '%s' at %s"), *ActiveJob.JobName, *ResolvedOutputDirectory);
+	return true;
+}
+
+bool USRDatasetCaptureSubsystem::TryReuseCompletedSpatialDataset(
+	const FSRDatasetCaptureJob& Job, bool& bReused, FString& OutError)
+{
+	bReused = false;
+	const FString RootPath = ResolveOutputDirectory(Job.OutputDirectory);
+	const FString ManifestPath = FPaths::Combine(RootPath, TEXT("manifest.json"));
+	if (!IFileManager::Get().FileExists(*ManifestPath))
+	{
+		TArray<FString> ExistingFiles;
+		IFileManager::Get().FindFilesRecursive(ExistingFiles, *RootPath, TEXT("*"), true, false);
+		if (!ExistingFiles.IsEmpty())
+		{
+			OutError = TEXT("Resume requires an original manifest; orphaned files must not be assigned new metadata.");
+			return false;
+		}
+		return true;
+	}
+	FString Json;
+	TSharedPtr<FJsonObject> Root;
+	if (!FFileHelper::LoadFileToString(Json, *ManifestPath) ||
+		!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Root) || !Root)
+	{
+		OutError = TEXT("Resume rejected: the original manifest is unreadable.");
+		return false;
+	}
+	FString State, Version, Engine, World;
+	const TSharedPtr<FJsonObject>* SavedJobJson = nullptr;
+	const TArray<TSharedPtr<FJsonValue>>* Frames = nullptr;
+	FSRDatasetCaptureJob SavedJob;
+	if (!Root->TryGetStringField(TEXT("state"), State) || State != TEXT("Completed") ||
+		!Root->TryGetStringField(TEXT("pluginVersion"), Version) || Version != SRDataset::Private::CurrentPluginVersion() ||
+		!Root->TryGetStringField(TEXT("engineVersion"), Engine) || Engine != FEngineVersion::Current().ToString() ||
+		!Root->TryGetStringField(TEXT("world"), World) ||
+		World != GetWorld()->GetOutermost()->GetName() ||
+		!Root->TryGetObjectField(TEXT("job"), SavedJobJson) ||
+		!FJsonObjectConverter::JsonObjectToUStruct(SavedJobJson->ToSharedRef(), &SavedJob, 0, 0) ||
+		!Root->TryGetArrayField(TEXT("frames"), Frames))
+	{
+		OutError = TEXT("Safe resume requires a complete spatial dataset from this plugin/engine/world. Recapture incomplete or older output into a new directory.");
+		return false;
+	}
+	FSRDatasetCaptureJob RequestedJob = Job;
+	RequestedJob.bResume = SavedJob.bResume = false;
+	if (!FSRDatasetCaptureJob::StaticStruct()->CompareScriptStruct(&RequestedJob, &SavedJob, 0))
+	{
+		OutError = TEXT("Resume rejected: capture configuration differs from the original dataset (only bResume may change).");
+		return false;
+	}
+	const int32 FirstFrame = Job.StartFrame + Job.CaptureFrameOffset;
+	const int32 ExpectedCount = FirstFrame > Job.EndFrame ? 0 : 1 + (Job.EndFrame - FirstFrame) / Job.FrameStep;
+	if (Frames->Num() != ExpectedCount || ExpectedCount == 0)
+	{
+		OutError = TEXT("Resume rejected: the original frame list is incomplete.");
+		return false;
+	}
+	for (int32 Index = 0; Index < Frames->Num(); ++Index)
+	{
+		const TSharedPtr<FJsonObject> Frame = (*Frames)[Index]->AsObject();
+		const TSharedPtr<FJsonObject>* Files = nullptr;
+		const TSharedPtr<FJsonObject>* Hashes = nullptr;
+		double FrameId = -1;
+		const int32 ExpectedId = FirstFrame + Index * Job.FrameStep;
+		if (!Frame || !Frame->TryGetNumberField(TEXT("logicalFrameId"), FrameId) || FrameId != ExpectedId ||
+			!Frame->TryGetObjectField(TEXT("files"), Files) || !Frame->TryGetObjectField(TEXT("sha1"), Hashes))
+		{
+			OutError = TEXT("Resume rejected: invalid original frame metadata.");
+			return false;
+		}
+		for (const TCHAR* Modality : { TEXT("hr"), TEXT("lr"), TEXT("depth") })
+		{
+			if (FCString::Strcmp(Modality, TEXT("depth")) == 0 && !Job.bCaptureDepth) continue;
+			const TCHAR* Extension = FCString::Strcmp(Modality, TEXT("depth")) == 0 ? TEXT("exr") : TEXT("png");
+			const FString ExpectedPath = FString::Printf(TEXT("%s/frame_%06d.%s"), Modality, ExpectedId, Extension);
+			FString RelativePath, ExpectedHash;
+			if (!(*Files)->TryGetStringField(Modality, RelativePath) || RelativePath != ExpectedPath ||
+				!(*Hashes)->TryGetStringField(Modality, ExpectedHash) ||
+				ExpectedHash.IsEmpty() || HashFile(FPaths::Combine(RootPath, RelativePath)) != ExpectedHash)
+			{
+				OutError = FString::Printf(TEXT("Resume rejected: original file/hash mismatch at %s."), *ExpectedPath);
+				return false;
+			}
+		}
+	}
+	// Preserve the entire original manifest, including frame metadata and source
+	// provenance. The atomic refresh lets the unattended runner observe this run.
+	TArray<uint8> OriginalBytes;
+	const FString TempPath = ManifestPath + TEXT(".part");
+	if (!FFileHelper::LoadFileToArray(OriginalBytes, *ManifestPath) ||
+		!FFileHelper::SaveArrayToFile(OriginalBytes, *TempPath) ||
+		!IFileManager::Get().Move(*ManifestPath, *TempPath, true, true, false, true))
+	{
+		OutError = TEXT("Failed to atomically preserve the verified original manifest.");
+		return false;
+	}
+	Status = FSRDatasetCaptureStatus();
+	Status.State = ESRDatasetCaptureState::Completed;
+	Status.OutputDirectory = RootPath;
+	Status.SkippedSamples = ExpectedCount;
+	bReused = true;
+	UE_LOG(LogSRDataset, Display, TEXT("Reused %d verified spatial samples with their original manifest unchanged."), ExpectedCount);
 	return true;
 }
 
@@ -4163,6 +4292,8 @@ bool USRDatasetCaptureSubsystem::CheckWidgetComponentPolicy(FString& OutError) c
 
 void USRDatasetCaptureSubsystem::SnapshotProvenance()
 {
+	bMaterialShadersReadyAfterWarmup = false;
+	PluginBinarySha1 = HashFile(FModuleManager::Get().GetModuleFilename(TEXT("SuperResolutionDataset")));
 	TSharedRef<FJsonObject> JobObject = MakeShared<FJsonObject>();
 	FJsonObjectConverter::UStructToJsonObject(FSRDatasetCaptureJob::StaticStruct(), &ActiveJob, JobObject, 0, 0);
 	FString NormalizedJobJson;
@@ -4300,6 +4431,45 @@ bool USRDatasetCaptureSubsystem::EnsureStreamingReady(FString& OutError)
 	StreamingStateAfterBarrierSha1 = ComputeStreamingStateSha1(
 		StreamingTextureCountAfterBarrier,
 		PendingStreamingTextureCountAfterBarrier);
+	// Check readiness after warmup, when the renderer has requested the actual
+	// material permutations. Editor camera proxy meshes do not render in game.
+	for (TObjectIterator<UPrimitiveComponent> It; It; ++It)
+	{
+		UPrimitiveComponent* Primitive = *It;
+		if (Primitive->GetWorld() != GetWorld() || !Primitive->IsRegistered() || !Primitive->ShouldRender()) continue;
+		for (int32 Slot = 0; Slot < Primitive->GetNumMaterials(); ++Slot)
+		{
+			UMaterialInterface* Interface = Primitive->GetMaterial(Slot);
+			if (!Interface) continue;
+			const FMaterialResource* Resource = Interface->GetMaterialResource(GMaxRHIShaderPlatform);
+			if (!Resource || !Resource->GetCompileErrors().IsEmpty() || !Resource->GetGameThreadShaderMap() ||
+				!Resource->GetGameThreadShaderMap()->IsValidForRendering())
+			{
+				OutError = FString::Printf(TEXT("Material shader is not ready after warmup; capture would use a fallback: %s"), *Interface->GetPathName());
+				return false;
+			}
+		}
+	}
+	bMaterialShadersReadyAfterWarmup = true;
+	LoadedContentPackageHashes.Reset();
+	TArray<FString> ContentHashLines;
+	for (TObjectIterator<UPackage> It; It; ++It)
+	{
+		const FString PackageName = It->GetName();
+		if (!PackageName.StartsWith(TEXT("/Game/")) && !PackageName.StartsWith(TEXT("/SuperResolutionDataset/"))) continue;
+		FString Filename;
+		if (!FPackageName::DoesPackageExist(PackageName, &Filename)) continue;
+		const FString PackageHash = HashFile(Filename);
+		if (PackageHash.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("Cannot hash loaded source content package: %s"), *PackageName);
+			return false;
+		}
+		LoadedContentPackageHashes.Add(PackageName, PackageHash);
+		ContentHashLines.Add(PackageName + TEXT("=") + PackageHash);
+	}
+	ContentHashLines.Sort([](const FString& A, const FString& B) { return A.Compare(B, ESearchCase::CaseSensitive) < 0; });
+	LoadedContentSha1 = HashString(FString::Join(ContentHashLines, TEXT("\n")));
 	bStreamingBarrierComplete = true;
 	UE_LOG(
 		LogSRDataset,
@@ -4873,6 +5043,15 @@ bool USRDatasetCaptureSubsystem::RunSceneControlPreflight(FString& OutError)
 				{
 					continue;
 				}
+				const FMaterialResource* MaterialResource = MaterialInterface->GetMaterialResource(GMaxRHIShaderPlatform);
+				if (MaterialResource && !MaterialResource->GetCompileErrors().IsEmpty())
+				{
+					const FString CompilerErrors = MaterialResource
+						? FString::Join(MaterialResource->GetCompileErrors(), TEXT("; ")) : TEXT("missing active shader resource");
+					SceneControlPreflight.UncontrolledMaterialInputs.AddUnique(FString::Printf(
+						TEXT("%s|slot=%d|interface=%s|source=material_shader_unavailable|errors=%s"),
+						*Primitive->GetPathName(), MaterialIndex, *MaterialInterface->GetPathName(), *CompilerErrors));
+				}
 
 				const auto RecordMaterialInput = [this, Primitive, MaterialInterface, Material, MaterialIndex](
 					const UMaterialExpression* Expression,
@@ -5043,10 +5222,11 @@ bool USRDatasetCaptureSubsystem::WriteSceneControlPreflightReport(FString& OutEr
 	};
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 1);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.16.0"));
+	Root->SetStringField(TEXT("pluginVersion"), SRDataset::Private::CurrentPluginVersion());
 	Root->SetBoolField(TEXT("ran"), SceneControlPreflight.bRan);
 	Root->SetBoolField(TEXT("required"), ActiveJob.bRequireSceneControlPreflight);
 	Root->SetBoolField(TEXT("passed"), SceneControlPreflight.bPassed);
+	Root->SetBoolField(TEXT("materialCompileErrorsChecked"), true);
 	Root->SetStringField(TEXT("sha1"), SceneControlPreflight.Sha1);
 	Root->SetStringField(
 		TEXT("hashScope"),
@@ -5117,6 +5297,12 @@ void USRDatasetCaptureSubsystem::HandleWorldPreActorTick(UWorld* World, ELevelTi
 {
 	if (World != GetWorld() || !SRDataset::Private::IsRunningState(Status.State))
 	{
+		return;
+	}
+	FString WriterError;
+	if (CaptureRig && !CaptureRig->GetImageWriter().Poll(false, WriterError))
+	{
+		FinishCapture(ESRDatasetCaptureState::Failed, WriterError);
 		return;
 	}
 
@@ -5818,7 +6004,45 @@ bool USRDatasetCaptureSubsystem::UpdateCaptureCamera(
 		return false;
 	}
 
-	CaptureRig->ApplyCameraView(View, ActiveJob.bDisableMotionBlur, ActiveJob.bLockExposure);
+	FMatrix MainViewProjection = FMatrix::Identity;
+	bool bHasMainViewProjection = false;
+	if (ActiveJob.bCaptureMainViewTemporalDiagnostics)
+	{
+		APlayerController* Controller = GetWorld()->GetFirstPlayerController();
+		ULocalPlayer* LocalPlayer = Controller ? Controller->GetLocalPlayer() : nullptr;
+		FSceneViewProjectionData ProjectionData;
+		const bool bProjectionAvailable = LocalPlayer && LocalPlayer->ViewportClient && LocalPlayer->ViewportClient->Viewport &&
+			LocalPlayer->GetProjectionData(LocalPlayer->ViewportClient->Viewport, ProjectionData);
+		if (!bProjectionAvailable && Status.State == ESRDatasetCaptureState::Capturing)
+		{
+			OutError = TEXT("The actual player projection is unavailable for synchronized Main View/HR capture.");
+			return false;
+		}
+		if (bProjectionAvailable && ProjectionData.GetConstrainedViewRect().Size() != ActiveJob.HRResolution &&
+			Status.State == ESRDatasetCaptureState::Capturing)
+		{
+			OutError = TEXT("Main View capture requires one full-size viewport without camera letterboxing or split-screen cropping.");
+			return false;
+		}
+		bHasMainViewProjection = bProjectionAvailable && ProjectionData.GetConstrainedViewRect().Size() == ActiveJob.HRResolution;
+		if (bHasMainViewProjection)
+		{
+			MainViewProjection = ProjectionData.ProjectionMatrix;
+		}
+		if (bHasMainViewProjection && View.ProjectionMode == ECameraProjectionMode::Perspective)
+		{
+			// FMinimalViewInfo::FOV can denote the pre-aspect-adjustment angle.
+			// Use the actual horizontal projection for SceneCapture culling and
+			// the independent fixture's world-to-display motion calculation.
+			const float HorizontalFov = FMath::RadiansToDegrees(2.0 * FMath::Atan(1.0 / MainViewProjection.M[0][0]));
+			// Preserve the authored scalar when inversion differs only through
+			// float projection roundoff. The actual matrix is never rounded.
+			if (!FMath::IsNearlyEqual(View.FOV, HorizontalFov, 1.e-4f)) View.FOV = HorizontalFov;
+			View.AspectRatio = static_cast<float>(ActiveJob.HRResolution.X) / ActiveJob.HRResolution.Y;
+		}
+	}
+	CaptureRig->ApplyCameraView(View, ActiveJob.bDisableMotionBlur, ActiveJob.bLockExposure,
+		bHasMainViewProjection ? &MainViewProjection : nullptr);
 	if (bEvaluateValidationFixture && ValidationFixture)
 	{
 		ValidationFixture->Evaluate(
@@ -5861,52 +6085,6 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 	const double TimeSeconds = FrameNumber * ActiveJob.GetFixedDeltaSeconds();
 	TMap<FString, FString> Hashes;
 	TMap<FString, int64> RenderSubmissions;
-	if (ActiveJob.bResume && IsFrameAlreadyComplete(FrameNumber))
-	{
-		Hashes.Add(TEXT("hr"), HashFile(MakeFramePath(TEXT("hr"), FrameNumber, TEXT("png"))));
-		Hashes.Add(TEXT("lr"), HashFile(MakeFramePath(TEXT("lr"), FrameNumber, TEXT("png"))));
-		if (ActiveJob.bCaptureDepth)
-		{
-			Hashes.Add(TEXT("depth"), HashFile(MakeFramePath(TEXT("depth"), FrameNumber, TEXT("exr"))));
-		}
-		if (ActiveJob.bCaptureTemporalDiagnostics)
-		{
-			for (const TCHAR* Modality : SRDataset::Private::TemporalDiagnosticModalities)
-			{
-				Hashes.Add(Modality, HashFile(MakeFramePath(Modality, FrameNumber, TEXT("exr"))));
-			}
-		}
-		if (ActiveJob.bCaptureSceneCaptureLRComparison)
-		{
-			Hashes.Add(
-				SRDataset::Private::SceneCaptureLRComparisonModality,
-				HashFile(MakeFramePath(
-					SRDataset::Private::SceneCaptureLRComparisonModality,
-					FrameNumber,
-					TEXT("exr"))));
-		}
-		if (ActiveJob.bCaptureReferenceHR)
-		{
-			Hashes.Add(
-				SRDataset::Private::ReferenceHRModality,
-				HashFile(MakeFramePath(SRDataset::Private::ReferenceHRModality, FrameNumber, TEXT("exr"))));
-		}
-		if (ActiveJob.bCaptureMainViewHUDlessColor)
-		{
-			Hashes.Add(
-				SRDataset::Private::HUDlessColorModality,
-				HashFile(MakeFramePath(SRDataset::Private::HUDlessColorModality, FrameNumber, TEXT("exr"))));
-		}
-		if (ActiveJob.bCaptureUIColorAlpha)
-		{
-			Hashes.Add(
-				SRDataset::Private::UIColorAlphaModality,
-				HashFile(MakeFramePath(SRDataset::Private::UIColorAlphaModality, FrameNumber, TEXT("png"))));
-		}
-		++Status.SkippedSamples;
-		AppendFrameManifest(FrameNumber, TimeSeconds, Hashes, RenderSubmissions, true);
-	}
-	else
 	{
 		const auto RecordHighResolutionSubmissions = [&]()
 		{
@@ -5914,6 +6092,8 @@ bool USRDatasetCaptureSubsystem::CaptureCurrentFrame(FString& OutError)
 			if (ActiveJob.bCaptureReferenceHR)
 			{
 				RenderSubmissions.Add(TEXT("hr_reference"), NextRenderSubmissionId++);
+				for (int32 Sample = 1; Sample < ActiveJob.ReferenceTemporalSamples; ++Sample)
+					RenderSubmissions.Add(FString::Printf(TEXT("hr_reference_sample_%02d"), Sample), NextRenderSubmissionId++);
 			}
 		};
 		const auto RecordLowResolutionSubmissions = [&]()
@@ -6204,54 +6384,6 @@ bool USRDatasetCaptureSubsystem::FinalizePendingMainViewCapture(FString& OutErro
 	return true;
 }
 
-bool USRDatasetCaptureSubsystem::IsFrameAlreadyComplete(const int32 FrameNumber) const
-{
-	if (!IFileManager::Get().FileExists(*MakeFramePath(TEXT("hr"), FrameNumber, TEXT("png"))) ||
-		!IFileManager::Get().FileExists(*MakeFramePath(TEXT("lr"), FrameNumber, TEXT("png"))))
-	{
-		return false;
-	}
-	if (ActiveJob.bCaptureDepth && !IFileManager::Get().FileExists(*MakeFramePath(TEXT("depth"), FrameNumber, TEXT("exr"))))
-	{
-		return false;
-	}
-	if (ActiveJob.bCaptureTemporalDiagnostics)
-	{
-		for (const TCHAR* Modality : SRDataset::Private::TemporalDiagnosticModalities)
-		{
-			if (!IFileManager::Get().FileExists(*MakeFramePath(Modality, FrameNumber, TEXT("exr"))))
-			{
-				return false;
-			}
-		}
-	}
-	if (ActiveJob.bCaptureSceneCaptureLRComparison &&
-		!IFileManager::Get().FileExists(*MakeFramePath(
-			SRDataset::Private::SceneCaptureLRComparisonModality, FrameNumber, TEXT("exr"))))
-	{
-		return false;
-	}
-	if (ActiveJob.bCaptureReferenceHR &&
-		!IFileManager::Get().FileExists(*MakeFramePath(
-			SRDataset::Private::ReferenceHRModality, FrameNumber, TEXT("exr"))))
-	{
-		return false;
-	}
-	if (ActiveJob.bCaptureMainViewHUDlessColor &&
-		!IFileManager::Get().FileExists(*MakeFramePath(
-			SRDataset::Private::HUDlessColorModality, FrameNumber, TEXT("exr"))))
-	{
-		return false;
-	}
-	if (ActiveJob.bCaptureUIColorAlpha &&
-		!IFileManager::Get().FileExists(*MakeFramePath(
-			SRDataset::Private::UIColorAlphaModality, FrameNumber, TEXT("png"))))
-	{
-		return false;
-	}
-	return true;
-}
-
 void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	const int32 FrameNumber,
 	const double TimeSeconds,
@@ -6262,6 +6394,9 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	TSharedRef<FJsonObject> Frame = MakeShared<FJsonObject>();
 	const int32 FirstCapturedFrame = GetFirstCapturedFrame();
 	const bool bFirstCapturedFrame = FrameNumber == FirstCapturedFrame;
+	const bool bRendererCameraCut = ActiveJob.bCaptureTemporalDiagnostics && !bResumed &&
+		CaptureRig->GetLastTemporalMetadata().bCameraCut;
+	const bool bReset = bFirstCapturedFrame || bRendererCameraCut;
 	const int32 PreviousCapturedFrame = bFirstCapturedFrame
 		? FrameNumber
 		: GetPreviouslyCapturedFrame(FrameNumber);
@@ -6284,7 +6419,7 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	Frame->SetNumberField(
 		TEXT("motionTimeSpanS"),
 		MotionTimeSpanFrames * ActiveJob.GetFixedDeltaSeconds());
-	Frame->SetBoolField(TEXT("motionTrainingUsable"), !bIntermediateReplay);
+	Frame->SetBoolField(TEXT("motionTrainingUsable"), !bIntermediateReplay && !bReset);
 	Frame->SetBoolField(
 		TEXT("materialTimeLogicalFrameLocked"),
 		ActiveJob.bLockMaterialTimeToLogicalFrame);
@@ -6327,8 +6462,9 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 	Frame->SetStringField(
 		TEXT("logicalEvaluationDirection"),
 		IsReverseEndpointReplay() ? TEXT("decreasing_frame_id") : TEXT("increasing_frame_id"));
-	Frame->SetBoolField(TEXT("reset"), bFirstCapturedFrame);
-	Frame->SetStringField(TEXT("resetReason"), bFirstCapturedFrame ? TEXT("job_start") : TEXT("none"));
+	Frame->SetBoolField(TEXT("reset"), bReset);
+	Frame->SetBoolField(TEXT("rendererCameraCut"), bRendererCameraCut);
+	Frame->SetStringField(TEXT("resetReason"), bFirstCapturedFrame ? TEXT("job_start") : bRendererCameraCut ? TEXT("renderer_camera_cut") : TEXT("none"));
 	Frame->SetNumberField(TEXT("timeSeconds"), TimeSeconds);
 	Frame->SetBoolField(TEXT("resumed"), bResumed);
 	int32 StreamingTextureCount = 0;
@@ -6825,7 +6961,7 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				? TEXT("player_main_view")
 				: (Modality == TEXT("ui_layer")
 					? TEXT("independent_slate_game_layer")
-					: Modality + TEXT("_scene_capture")));
+					: Modality.StartsWith(TEXT("hr_reference")) ? TEXT("hr_reference_scene_capture") : Modality + TEXT("_scene_capture")));
 		SubmissionArray.Add(MakeShared<FJsonValueObject>(Submission));
 	}
 	Frame->SetArrayField(TEXT("renderSubmissions"), SubmissionArray);
@@ -6872,6 +7008,14 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 			FString::Printf(TEXT("%s/frame_%06d.png"), SRDataset::Private::UIColorAlphaModality, FrameNumber));
 	}
 	Frame->SetObjectField(TEXT("files"), Files);
+	if (ActiveJob.bSaveReferenceSubsamples)
+	{
+		for (int32 Index = 0; Index < ActiveJob.ReferenceTemporalSamples; ++Index)
+		{
+			const FString Modality = FString::Printf(TEXT("reference_subsample_%02d"), Index);
+			Files->SetStringField(Modality, FString::Printf(TEXT("%s/frame_%06d.exr"), *Modality, FrameNumber));
+		}
+	}
 
 	TSharedRef<FJsonObject> HashObject = MakeShared<FJsonObject>();
 	TArray<FString> HashKeys;
@@ -7139,7 +7283,9 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 				TEXT("one_rejects_previous_history_at_motion_reprojected_pixel"));
 			Temporal->SetStringField(
 				TEXT("historyRejectionSource"),
-				TEXT("component_identity_and_static_camera_depth_with_conservative_dynamic_uncertainty_v2"));
+				TEXT("component_identity_and_static_camera_depth_on_jittered_rasters_v3"));
+			Temporal->SetBoolField(TEXT("rendererCameraCut"), bRendererCameraCut);
+			Temporal->SetStringField(TEXT("historyRasterMapping"), TEXT("display_motion_scaled_per_axis_plus_previous_minus_current_render_pixel_jitter"));
 			Temporal->SetBoolField(TEXT("historyRejectionTrainingUsable"), true);
 			Temporal->SetBoolField(TEXT("historyRejectionRequiresValidityMask"), true);
 			Temporal->SetBoolField(TEXT("historyRejectionProductionCertified"), false);
@@ -7164,7 +7310,7 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 					: TEXT("dynamic_same_id_and_unlabeled_velocity_covered_geometry_are_conservatively_rejected_with_validity_zero;custom_stencil_uint8_may_not_be_instance_unique"));
 			Temporal->SetNumberField(TEXT("motionPreviousLogicalFrameId"), MotionPreviousFrame);
 			Temporal->SetNumberField(TEXT("motionTimeSpanS"), MotionTimeSpanFrames * ActiveJob.GetFixedDeltaSeconds());
-			Temporal->SetBoolField(TEXT("motionTrainingUsable"), !bIntermediateReplay);
+			Temporal->SetBoolField(TEXT("motionTrainingUsable"), !bIntermediateReplay && !bReset);
 			Temporal->SetBoolField(TEXT("motionIncludesCamera"), true);
 			Temporal->SetBoolField(TEXT("motionJitterRemoved"), true);
 			Temporal->SetStringField(TEXT("transparencyMaskSource"), TEXT("one_minus_post_dof_separate_translucency_transmittance"));
@@ -7303,6 +7449,30 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 					MakeShared<FJsonValueNumber>(ActiveJob.HRResolution.X),
 					MakeShared<FJsonValueNumber>(ActiveJob.HRResolution.Y) });
 				Reference->SetNumberField(TEXT("spatialScalePerAxis"), ActiveJob.ReferenceHRScale);
+				Reference->SetNumberField(TEXT("temporalSamples"), ActiveJob.ReferenceTemporalSamples);
+				Reference->SetStringField(TEXT("sampleTimePolicy"), TEXT("frozen_logical_frame"));
+				Reference->SetStringField(TEXT("samplingPattern"), ActiveJob.ReferenceTemporalSamples == 1 ? TEXT("center") : TEXT("centered_hammersley_pixel"));
+				Reference->SetStringField(TEXT("resolveEquation"), TEXT("arithmetic_mean_linear_scene_rgb_then_spatial_resize"));
+				Reference->SetBoolField(TEXT("subsampleHistoryReset"), ActiveJob.ReferenceTemporalSamples > 1);
+				TArray<TSharedPtr<FJsonValue>> Samples;
+				const auto& SampleMetadata = CaptureRig->GetLastReferenceSampleMetadata();
+				const auto& SampleOffsets = CaptureRig->GetLastReferenceSampleOffsets();
+				for (int32 Index = 0; Index < SampleMetadata.Num(); ++Index)
+				{
+					const auto& SubsampleMetadata = SampleMetadata[Index];
+					TSharedRef<FJsonObject> Sample = MakeShared<FJsonObject>();
+					Sample->SetNumberField(TEXT("index"), Index);
+					Sample->SetNumberField(TEXT("renderSubmissionId"), RenderSubmissions.FindChecked(Index == 0 ? TEXT("hr_reference") : FString::Printf(TEXT("hr_reference_sample_%02d"), Index)));
+					Sample->SetArrayField(TEXT("projectionOffsetRenderPixel"), Vector2Array(SampleOffsets[Index]));
+					Sample->SetArrayField(TEXT("viewToClip"), MatrixArray(SubsampleMetadata.ViewToClipJittered));
+					Sample->SetArrayField(TEXT("worldViewOriginHigh"), Vector3Array(SubsampleMetadata.WorldViewOriginHighCurrent));
+					Sample->SetArrayField(TEXT("worldViewOriginLow"), Vector3Array(SubsampleMetadata.WorldViewOriginLowCurrent));
+					Sample->SetNumberField(TEXT("renderGameTimeS"), SubsampleMetadata.GameTimeSeconds);
+					Sample->SetNumberField(TEXT("preExposure"), SubsampleMetadata.PreExposure);
+					Sample->SetBoolField(TEXT("rendererCameraCut"), SubsampleMetadata.bCameraCut);
+					Samples.Add(MakeShared<FJsonValueObject>(Sample));
+				}
+				Reference->SetArrayField(TEXT("subsamples"), Samples);
 				Reference->SetStringField(
 					TEXT("downsampleFilter"),
 					StaticEnum<ESRDatasetResizeFilter>()->GetNameStringByValue(
@@ -7405,22 +7575,75 @@ void USRDatasetCaptureSubsystem::AppendFrameManifest(
 
 bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 {
+	// Frames remain available in memory for temporal metadata, but publication is
+	// limited to a completed prefix: no pending hash or partially written sample
+	// can enter a dataset index, including snapshots made during capture.
+	TArray<TSharedPtr<FJsonValue>> CommittedFrames;
+	if (CaptureRig && !CaptureRig->GetImageWriter().Poll(false, OutError) && Status.State != ESRDatasetCaptureState::Failed) return false;
+	for (const TSharedPtr<FJsonValue>& Value : ManifestFrames)
+	{
+		const TSharedPtr<FJsonObject> Frame = Value->AsObject();
+		const TSharedPtr<FJsonObject> Files = Frame->GetObjectField(TEXT("files"));
+		const TSharedPtr<FJsonObject> Hashes = Frame->GetObjectField(TEXT("sha1"));
+		bool bComplete = true;
+		for (const auto& File : Files->Values)
+		{
+			FString Hash;
+			if (Hashes->TryGetStringField(File.Key, Hash) && !Hash.IsEmpty()) continue;
+			const FString Path = FPaths::Combine(ResolvedOutputDirectory, File.Value->AsString());
+			const FString* FinishedHash = CaptureRig ? CaptureRig->GetImageWriter().FindHash(Path) : nullptr;
+			if (!FinishedHash) { bComplete = false; break; }
+			Hashes->SetStringField(File.Key, *FinishedHash);
+		}
+		if (!bComplete) break;
+		CommittedFrames.Add(Value);
+	}
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("schemaVersion"), 2);
-	Root->SetStringField(TEXT("pluginVersion"), TEXT("0.16.0"));
+	Root->SetStringField(TEXT("pluginVersion"), SRDataset::Private::CurrentPluginVersion());
 	Root->SetStringField(TEXT("contractVersion"), ActiveJob.ContractVersion);
 	Root->SetStringField(
 		TEXT("replayPass"),
 		StaticEnum<ESRDatasetReplayPass>()->GetNameStringByValue(static_cast<int64>(ActiveJob.ReplayPass)));
-	Root->SetStringField(TEXT("certificationStatus"), TEXT("certified_spatial_only"));
+	Root->SetStringField(TEXT("certificationStatus"), ActiveJob.ContractVersion == TEXT("nr-sr-data-v2") ? TEXT("pending_dataset_validation") : TEXT("certified_spatial_only"));
 	Root->SetBoolField(TEXT("temporalTrainingCertified"), false);
+	if (ActiveJob.bCaptureMainViewTemporalDiagnostics)
+	{
+		TSharedRef<FJsonObject> Inputs = MakeShared<FJsonObject>();
+		Inputs->SetStringField(TEXT("color_lr"), TEXT("color_lr_scene_hdr"));
+		Inputs->SetStringField(TEXT("color_gt"), ActiveJob.bCaptureReferenceHR ? TEXT("color_hr_reference_scene_hdr") : TEXT("color_hr_native_scene_hdr"));
+		Inputs->SetStringField(TEXT("depth"), TEXT("depth_view_linear_meters"));
+		Inputs->SetStringField(TEXT("motion"), TEXT("motion_full_current_to_previous"));
+		Inputs->SetStringField(TEXT("motion_valid"), TEXT("motion_valid"));
+		Inputs->SetStringField(TEXT("depth_valid"), TEXT("depth_valid"));
+		Inputs->SetStringField(TEXT("velocity_coverage"), TEXT("velocity_coverage"));
+		Inputs->SetStringField(TEXT("reactive_mask"), TEXT("reactive_mask"));
+		Inputs->SetStringField(TEXT("transparency_mask"), TEXT("transparency_mask"));
+		Root->SetObjectField(TEXT("trainingInputMapping"), Inputs);
+	}
 	Root->SetBoolField(TEXT("frameGenerationCertified"), false);
 	Root->SetStringField(TEXT("engineVersion"), FEngineVersion::Current().ToString());
 	Root->SetStringField(TEXT("world"), GetWorld() ? GetWorld()->GetOutermost()->GetName() : FString());
 	Root->SetStringField(TEXT("state"), StaticEnum<ESRDatasetCaptureState>()->GetNameStringByValue(static_cast<int64>(Status.State)));
 	Root->SetStringField(TEXT("error"), Status.LastError);
-	Root->SetNumberField(TEXT("capturedSamples"), Status.CapturedSamples);
+	Root->SetNumberField(TEXT("capturedSamples"), CommittedFrames.Num());
+	Root->SetNumberField(TEXT("pendingSamples"), ManifestFrames.Num() - CommittedFrames.Num());
 	Root->SetNumberField(TEXT("skippedSamples"), Status.SkippedSamples);
+	if (CaptureRig)
+	{
+		const FSRDatasetImageWriter& Writer = CaptureRig->GetImageWriter();
+		TSharedRef<FJsonObject> Metrics = MakeShared<FJsonObject>();
+		Metrics->SetBoolField(TEXT("asynchronous"), ActiveJob.bAsyncImageWrites);
+		Metrics->SetNumberField(TEXT("pendingImages"), Writer.GetPendingCount());
+		Metrics->SetNumberField(TEXT("pendingRawBytes"), Writer.GetPendingBytes());
+		Metrics->SetNumberField(TEXT("peakPendingRawBytes"), Writer.GetPeakPendingBytes());
+		Metrics->SetNumberField(TEXT("memoryBudgetBytes"), static_cast<int64>(ActiveJob.MaxPendingImageWriteMB) * 1024 * 1024);
+		Metrics->SetNumberField(TEXT("completedImages"), Writer.GetCompletedCount());
+		Metrics->SetNumberField(TEXT("gameThreadWrites"), Writer.GetGameThreadWrites());
+		Metrics->SetNumberField(TEXT("renderThreadWrites"), Writer.GetRenderThreadWrites());
+		Metrics->SetNumberField(TEXT("backpressureAndDrainSeconds"), Writer.GetWaitSeconds());
+		Root->SetObjectField(TEXT("imageWriter"), Metrics);
+	}
 
 	TSharedRef<FJsonObject> JobObject = MakeShared<FJsonObject>();
 	FJsonObjectConverter::UStructToJsonObject(FSRDatasetCaptureJob::StaticStruct(), &ActiveJob, JobObject, 0, 0);
@@ -7451,6 +7674,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		TEXT("uncontrolledMaterialInputCount"),
 		SceneControlPreflight.UncontrolledMaterialInputs.Num());
 	Root->SetObjectField(TEXT("sceneControlPreflight"), SceneControl);
+	SceneControl->SetBoolField(TEXT("materialCompileErrorsChecked"), SceneControlPreflight.bRan);
 
 	TSharedRef<FJsonObject> StableIds = MakeShared<FJsonObject>();
 	StableIds->SetBoolField(TEXT("enabled"), ActiveJob.bAssignStableInstanceIds);
@@ -7697,6 +7921,13 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 	Provenance->SetStringField(TEXT("cvarProfileSha1"), CaptureCVarProfileSha1);
 	Provenance->SetStringField(TEXT("cvarProfileCanonical"), CaptureCVarProfileCanonical);
 	Provenance->SetStringField(TEXT("contentMapSha1"), ContentMapSha1);
+	Provenance->SetStringField(TEXT("pluginBinarySha1"), PluginBinarySha1);
+	Provenance->SetBoolField(TEXT("materialShadersReadyAfterWarmup"), bMaterialShadersReadyAfterWarmup);
+	Provenance->SetStringField(TEXT("loadedContentSha1"), LoadedContentSha1);
+	Provenance->SetStringField(TEXT("loadedContentHashScope"), TEXT("sorted_disk_packages_loaded_after_streaming_under_Game_and_SuperResolutionDataset; engine_content_bound_to_engine_build"));
+	TSharedRef<FJsonObject> LoadedPackages = MakeShared<FJsonObject>();
+	for (const auto& Entry : LoadedContentPackageHashes) LoadedPackages->SetStringField(Entry.Key, Entry.Value);
+	Provenance->SetObjectField(TEXT("loadedContentPackages"), LoadedPackages);
 	Provenance->SetStringField(TEXT("shaderSourceSha1"), ShaderSourceSha1);
 	Provenance->SetStringField(TEXT("shaderHashScope"), TEXT("SRDatasetExtract.usf_source_not_compiled_bytecode"));
 	Provenance->SetBoolField(TEXT("streamingBarrierEnabled"), ActiveJob.bBlockOnStreamingBeforeCapture);
@@ -7934,7 +8165,7 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		Contract->SetStringField(
 			TEXT("disocclusion"),
 			TEXT("aliases_history_rejection_mask_valid_reason;cross_instance_and_static_depth_exact;dynamic_same_instance_conservative_invalid"));
-		Contract->SetStringField(TEXT("temporalDiagnosticsStatus"), TEXT("experimental_uncertified"));
+		Contract->SetStringField(TEXT("temporalDiagnosticsStatus"), ActiveJob.ContractVersion == TEXT("nr-sr-data-v2") ? TEXT("requires_offline_validation") : TEXT("experimental_uncertified"));
 		Contract->SetStringField(TEXT("temporalDiagnosticsStage"), TEXT("after_dof_before_temporal_upscaler"));
 		Contract->SetStringField(
 			TEXT("gbufferAttributes"),
@@ -7976,9 +8207,11 @@ bool USRDatasetCaptureSubsystem::WriteManifest(FString& OutError) const
 		ActiveJob.bCaptureMainViewTemporalDiagnostics
 			? TEXT("persistent player Main View history is isolated from one persistent SceneCapture component per reference modality")
 			: TEXT("one persistent SceneCapture component per rendered modality"));
-	Contract->SetStringField(TEXT("trainingScope"), TEXT("single-frame spatial super-resolution baseline only"));
+	Contract->SetStringField(TEXT("trainingScope"), ActiveJob.ContractVersion == TEXT("nr-sr-data-v2")
+		? TEXT("consecutive_2x_temporal_sr_with_declared_scene_controls_and_validity_masks; dataset_index_requires_offline_validation")
+		: TEXT("single-frame spatial super-resolution baseline only"));
 	Root->SetObjectField(TEXT("determinismContract"), Contract);
-	Root->SetArrayField(TEXT("frames"), ManifestFrames);
+	Root->SetArrayField(TEXT("frames"), CommittedFrames);
 
 	FString Json;
 	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Json);
@@ -8012,6 +8245,12 @@ void USRDatasetCaptureSubsystem::FinishCapture(const ESRDatasetCaptureState Fina
 	const bool bWasRunning = SRDataset::Private::IsRunningState(Status.State);
 	Status.State = FinalState;
 	Status.LastError = Error;
+	FString WriterError;
+	if (CaptureRig && !CaptureRig->GetImageWriter().Poll(true, WriterError))
+	{
+		Status.State = ESRDatasetCaptureState::Failed;
+		Status.LastError = WriterError;
+	}
 
 	if (ActiveJob.bCaptureTemporalDiagnostics)
 	{
@@ -8064,6 +8303,8 @@ void USRDatasetCaptureSubsystem::FinishCapture(const ESRDatasetCaptureState Fina
 	if (!ResolvedOutputDirectory.IsEmpty() && IFileManager::Get().DirectoryExists(*ResolvedOutputDirectory) && !WriteManifest(ManifestError))
 	{
 		UE_LOG(LogSRDataset, Error, TEXT("%s"), *ManifestError);
+		Status.State = ESRDatasetCaptureState::Failed;
+		Status.LastError = ManifestError;
 	}
 
 	if (CaptureRig)
@@ -8083,7 +8324,7 @@ void USRDatasetCaptureSubsystem::FinishCapture(const ESRDatasetCaptureState Fina
 	SequencePlayer = nullptr;
 	SequenceActor = nullptr;
 
-	if (FinalState == ESRDatasetCaptureState::Completed)
+	if (Status.State == ESRDatasetCaptureState::Completed)
 	{
 		UE_LOG(LogSRDataset, Display, TEXT("Dataset job '%s' completed: %d captured, %d resumed."),
 			*ActiveJob.JobName, Status.CapturedSamples, Status.SkippedSamples);
@@ -8091,14 +8332,14 @@ void USRDatasetCaptureSubsystem::FinishCapture(const ESRDatasetCaptureState Fina
 	else
 	{
 		UE_LOG(LogSRDataset, Error, TEXT("Dataset job '%s' ended as %s: %s"), *ActiveJob.JobName,
-			*StaticEnum<ESRDatasetCaptureState>()->GetNameStringByValue(static_cast<int64>(FinalState)), *Error);
+			*StaticEnum<ESRDatasetCaptureState>()->GetNameStringByValue(static_cast<int64>(Status.State)), *Status.LastError);
 	}
 
 	// Never terminate an interactive editor session. Auto-quit is intended for
 	// unattended workers launched by RunDatasetCapture.ps1/UnrealEditor-Cmd.
 	if ((ActiveJob.bAutoQuit || bCommandLineAutoQuit) && FApp::IsUnattended())
 	{
-		const uint8 ExitCode = FinalState == ESRDatasetCaptureState::Completed ? 0 : 1;
+		const uint8 ExitCode = Status.State == ESRDatasetCaptureState::Completed ? 0 : 1;
 		FPlatformMisc::RequestExitWithStatus(false, ExitCode, TEXT("SRDataset job finished"));
 	}
 }

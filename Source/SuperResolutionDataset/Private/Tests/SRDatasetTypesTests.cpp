@@ -58,14 +58,35 @@ bool FSRDatasetJobValidationTest::RunTest(const FString& Parameters)
 
 	Job = FSRDatasetCaptureJob();
 	Job.ContractVersion = TEXT("nr-sr-data-v2");
-	TestFalse(TEXT("Unimplemented temporal contract is rejected instead of emitting incomplete data"), Job.Validate(Error));
-	TestTrue(TEXT("Temporal rejection explains the certification boundary"), Error.Contains(TEXT("not certified")));
+	TestFalse(TEXT("Temporal contract rejects missing Main View inputs and controls"), Job.Validate(Error));
+	TestTrue(TEXT("Temporal rejection explains mandatory controls"), Error.Contains(TEXT("requires")));
+	Job.bCaptureTemporalDiagnostics = Job.bCaptureMainViewTemporalDiagnostics = Job.bCaptureDepth = true;
+	Job.ExpectedMap = TEXT("/Game/ValidationMap");
+	Job.HRResolution = Job.LRResolution * 2;
+	Job.LRMode = ESRDatasetLRMode::NativeRender;
+	Job.bRequireSceneControlPreflight = Job.bRunSceneControlPreflight = true;
+	Job.bLockExposure = Job.bLockMaterialTimeToLogicalFrame = Job.bLockTemporalJitterToLogicalFrame = true;
+	Job.bForceSynchronousRendering = Job.bAssignStableInstanceIds = Job.bRejectVisibleWidgetComponents = true;
+	Job.bDisableMotionBlur = Job.bBlockOnStreamingBeforeCapture = true;
+	TestTrue(TEXT("Complete strict Main View job can produce a temporal contract pending offline validation"), Job.Validate(Error));
+	Job.bCaptureReferenceHR = true;
+	TestFalse(TEXT("Temporal reference requires at least sixteen frozen samples"), Job.Validate(Error));
+	Job.ReferenceTemporalSamples = 16;
+	TestTrue(TEXT("Temporal reference accepts sixteen frozen samples"), Job.Validate(Error));
+	Job.bAllowDynamicInstanceIdTopology = true;
+	TestFalse(TEXT("Initial temporal contract rejects dynamic ID topology"), Job.Validate(Error));
 
 	Job = FSRDatasetCaptureJob();
 	Job.bCaptureTemporalDiagnostics = true;
 	TestFalse(TEXT("Temporal diagnostics reject derived LR"), Job.Validate(Error));
 	Job.LRMode = ESRDatasetLRMode::NativeRender;
 	TestTrue(TEXT("Temporal diagnostics accept native LR"), Job.Validate(Error));
+	Job.FrameStep = 2;
+	TestFalse(TEXT("Standard temporal sampling cannot skip the renderer's previous frame"), Job.Validate(Error));
+	Job.FrameStep = 1;
+	Job.bResume = true;
+	TestFalse(TEXT("Temporal resume cannot reuse files without rebuilding GPU history"), Job.Validate(Error));
+	Job.bResume = false;
 	Job.bCaptureMainViewTemporalDiagnostics = true;
 	TestTrue(TEXT("Main View diagnostics accept a native LR job"), Job.Validate(Error));
 	Job.bCaptureSceneCaptureLRComparison = true;
