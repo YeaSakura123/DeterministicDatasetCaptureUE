@@ -851,6 +851,26 @@ def validate_temporal_frame(
                 aligned_better = float(aligned_metrics.get("meanAbs", math.inf)) <= (
                     float(opposite_metrics.get("meanAbs", math.inf)) + 1.0e-7
                 )
+                global_aligned_better = aligned_better
+                opaque_alignment = None
+                if pixel_domain_required:
+                    # This gate is authored for the Static opaque chart. AfterDOF
+                    # translucency is not the same correspondence domain; its
+                    # compositing differences must not decide the jitter sign.
+                    # Keep the original whole-image magnitude/PSNR limits below.
+                    fixture = frame.get("semanticValidationFixture", {})
+                    fixture_ids = {int(fixture.get(k, -1)) for k in ("movingObjectId", "backgroundObjectId", "skeletalObjectId", "wpoObjectId")}
+                    fixture_ids.update(int(k) for k in fixture.get("expectedFrontDepthMetersByObjectId", {}))
+                    identities, transparency = pixels.get("object_id"), pixels.get("transparency_mask")
+                    chart = np.zeros(valid.shape, dtype=bool)
+                    if identities is not None and transparency is not None and -1 not in fixture_ids:
+                        chart = np.isin(identities[..., 0], list(fixture_ids)) & (transparency[..., 0] < 0.01) & valid & opposite_valid
+                    covered_ids = set(int(v) for v in np.unique(identities[..., 0][chart])) if identities is not None else set()
+                    chart_valid = fixture.get("motionScenario") == "Static" and int(np.count_nonzero(chart)) >= 100 and fixture_ids <= covered_ids
+                    chart_aligned = numeric_comparison(main_scene_rgb[chart], aligned_scene[chart]) if chart_valid else {}
+                    chart_opposite = numeric_comparison(main_scene_rgb[chart], opposite_scene[chart]) if chart_valid else {}
+                    aligned_better = chart_valid and float(chart_aligned.get("meanAbs", math.inf)) <= float(chart_opposite.get("meanAbs", -math.inf)) + 1e-7
+                    opaque_alignment = {"valid": chart_valid, "scope": "all_known_static_opaque_fixture_ids_excluding_transparency_risk", "comparedPixelCount": int(np.count_nonzero(chart)), "requiredIds": sorted(fixture_ids), "coveredIds": sorted(covered_ids), "aligned": chart_aligned, "oppositeSign": chart_opposite, "alignedSignNoWorse": aligned_better}
                 pixel_metrics = {
                     "valid": bool(aligned_metrics.get("valid", False)),
                     "alignmentShiftRenderPixels": jitter.tolist(),
@@ -860,6 +880,8 @@ def validate_temporal_frame(
                     "aligned": aligned_metrics,
                     "oppositeSign": opposite_metrics,
                     "alignedSignNoWorse": aligned_better,
+                    "globalAlignedSignNoWorse": global_aligned_better,
+                    "opaqueFixtureAlignment": opaque_alignment,
                 }
                 pixel_gate = bool(
                     aligned_metrics.get("valid", False)
@@ -6731,7 +6753,7 @@ def validate(
         else "not_run"
     )
     report = {
-        "validatorVersion": 23,
+        "validatorVersion": 24,
         "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "validatorSourceSha256": validator_source_sha256,
         "compareManifestSha256": hashlib.sha256(other_manifest_path.read_bytes()).hexdigest() if compare is not None else None,

@@ -59,6 +59,10 @@ Compression and atomic writes run on workers. The budget bounds queued raw image
 
 The asset generator creates original textured gallery, courtyard, workshop and unseen atrium maps using Unreal basic meshes, with lighting, occlusion, transparency, WPO material motion and separate camera trajectories. It does not require the author's private project assets.
 
+![Generated Gallery validation scene, native HR preview](Docs/images/gallery-native-preview.png)
+
+The preview is SDR; training color is retained separately as linear HDR EXR. These generated maps validate capture behavior and data delivery.
+
 ```powershell
 & "D:\UE_5.7\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" `
   "D:\Projects\MyProject\MyProject.uproject" `
@@ -75,7 +79,7 @@ python Scripts/RunDatasetBatch.py Jobs/dataset-v1/plan.json `
 python Scripts/DatasetDelivery.py index Jobs/dataset-v1/plan.json `
   --project "D:/Projects/MyProject/MyProject.uproject" --output Delivery/dataset-v1/index.json --purpose temporal-sr
 python Scripts/DatasetDelivery.py pack Delivery/dataset-v1/index.json `
-  --output Delivery/dataset-v1/shards --samples-per-shard 128
+  --output Delivery/dataset-v1/shards --samples-per-shard 128 --profile temporal-sr
 python Scripts/DatasetDelivery.py verify-shards Delivery/dataset-v1/shards/shards.json
 ```
 
@@ -83,9 +87,13 @@ The default plan is 30 × 600 frames at 30 fps: **10 minutes**. This is a planne
 
 Use `--reuse-completed` with the same batch status to verify and skip completed clips. Partial/failed outputs are preserved; recapture into a new output directory.
 
+Large index builds support `--workers 2` (up to 4 independent processes). `--reuse-validation-reports` skips pixel checks only when a passing report still matches the exact manifest and current validator source; it always rechecks every image hash. Start with one worker on memory-constrained machines.
+
 The index command runs validation and binds reports to the manifest and validator source. It refuses failed clips and scene/trajectory split leakage. Its default purpose is `diagnostic`: integrity alone does not certify temporal training. `--purpose temporal-sr` requires `nr-sr-data-v2` and all strict controls and validation gates. The producer marks capture as pending validation; only the admitted index marks these bounded temporal inputs usable for training. Packing rechecks source hashes and publishes `shards.json` only after completion.
 
 Python consumers import `DatasetDelivery.iter_samples(catalog_path, split)`. It yields metadata plus encoded modality bytes, one frame at a time. Preserve clip boundaries and `reset` when constructing temporal windows.
+
+`--profile temporal-sr` packs the contract's HDR inputs/GT, depth, motion, coverage, reactive/transparency and correspondence validity masks, plus object IDs and complete temporal metadata. It checks all master-file hashes while omitting diagnostic previews and duplicate HR variants from the tar. The default `all` profile retains every modality. Keep the master captures for debugging; the sample metadata records their manifest hash and original modality list.
 
 ## Data and support boundaries
 
@@ -106,6 +114,8 @@ Python consumers import `DatasetDelivery.iter_samples(catalog_path, split)`. It 
 Current/previous matrices, jitter units/phases, pre-exposure, sizes, logical time, cuts and render-submission policies are in `manifest.json`. Sampling previous jittered LR requires converting motion to render pixels and adding previous minus current raster jitter, recovered from the matrices. Use the shipped geometry helpers; NDC jitter and raster offsets do not share every sign convention.
 
 Dynamic same-component self-occlusion is rejected with decision validity zero where surface identity is unproven. Respect validity masks in losses and history reuse. Strict preflight rejects unsupported ticking/random state; an allowlist is an audited exception, not proof that the plugin controls that system. Arbitrary external state, custom Niagara Data Interfaces, full Chaos solver state and unrestricted project WPO are not automatically deterministic.
+
+Use transparency/reactive masks when selecting opaque color and correspondence losses: auxiliary capture and Main View can differ in transparent composition. The [pixel comparison and validator baseline notes](Docs/Validation/README.md) record the measured scope and preserved failures. Deterministic replay can also emit per-frame HDR/depth/motion error images with `VerifyTemporalReplay.py <first> <repeat> --report <report.json> --heatmaps <new-directory>`.
 
 FG uses independent forward endpoint, reverse endpoint and real midpoint processes. Reverse motion is rendered, never constructed by negating forward motion. The producer stays pending or explicitly uncertified; the validator admits a bounded capture contract only after all integrity, project WPO, skeletal and animated-material evidence passes. The report records that scope and preserves unknown-pixel validity limits. See [FG acceptance and evidence commands](Docs/FG_ACCEPTANCE.md).
 

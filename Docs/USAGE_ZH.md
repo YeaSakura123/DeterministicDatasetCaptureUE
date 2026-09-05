@@ -76,4 +76,6 @@ python Scripts/VerifyProjectWPO.py `
 
 ## 范围
 
+大规模时间训练分片可使用 `DatasetDelivery.py pack <index.json> --output <new-directory> --profile temporal-sr`，保留契约输入、对应有效性/遮挡掩码和全部时序元数据；诊断预览和重复 HR 继续留在母版。省略 profile 时保留所有模态。打包过程仍核对全部母版文件的哈希。
+
 固定组件拓扑支持最多 255 个实例标签。透明区域输出风险掩码，不承诺透明表面的单层深度/运动真值。严格前检中的精确类白名单是已审计例外，不表示插件控制了该类的任意行为。自定义外部状态、任意 WPO、任意 Niagara DI、完整 Chaos 求解器、cooked IoStore、立体和分屏不在当前已验证范围内。

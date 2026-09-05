@@ -193,11 +193,13 @@ def checked_clips(index_path):
         yield index, clip, root, manifest
 
 
-def pack(index_path, output_dir, samples_per_shard):
+def pack(index_path, output_dir, samples_per_shard, profile="all"):
     if samples_per_shard < 1:
         raise ValueError("samples_per_shard must be positive")
+    if profile not in {"all", "temporal-sr"}:
+        raise ValueError("Unknown packing profile")
     output_dir.mkdir(parents=True, exist_ok=False)
-    catalog = {"schema": "sr-training-shards-v1", "indexSha256": digest(index_path), "shards": []}
+    catalog = {"schema": "sr-training-shards-v1", "indexSha256": digest(index_path), "packingProfile": profile, "shards": []}
     writer, current_path, current_split, in_shard = None, None, None, 0
 
     def close_shard():
@@ -213,14 +215,26 @@ def pack(index_path, output_dir, samples_per_shard):
     try:
         for index, clip, root, manifest in checked_clips(index_path):
             catalog.update(datasetVersion=index["datasetVersion"], purpose=index["purpose"], temporalTrainingCertified=index["temporalTrainingCertified"])
+            mapping = manifest.get("trainingInputMapping", {})
+            selected = None
+            if profile == "temporal-sr":
+                required = {"color_lr", "color_gt", "depth", "motion", "motion_valid", "depth_valid", "velocity_coverage", "reactive_mask", "transparency_mask"}
+                if index["purpose"] != "temporal-sr" or manifest["contractVersion"] != "nr-sr-data-v2" or not required <= set(mapping):
+                    raise ValueError("The temporal-sr profile requires admitted v2 inputs and their complete training mapping")
+                selected = {mapping[k] for k in required} | {"history_rejection_mask", "history_rejection_valid", "disocclusion_mask", "disocclusion_valid", "object_id"}
+            print(f"Packing {clip['id']} ({profile})", flush=True)
             for frame in manifest["frames"]:
+                names = set(frame["files"]) if selected is None else selected
+                if not names <= set(frame["files"]):
+                    raise ValueError(f"Training modalities missing: {sorted(names - set(frame['files']))}")
                 if writer is None or in_shard >= samples_per_shard or current_split != clip["split"]:
                     close_shard()
                     current_split, in_shard = clip["split"], 0
                     current_path = output_dir / f"{current_split}-{len(catalog['shards']):05d}.tar.part"
                     writer = tarfile.open(current_path, "w", format=tarfile.PAX_FORMAT)
                 key = f"{clip['id']}_{int(frame['logicalFrameId']):08d}"
-                metadata = {"clipId": clip["id"], "split": clip["split"], "map": clip["map"], "sequence": clip["sequence"], "manifestSha256": clip["manifestSha256"], "contractVersion": manifest["contractVersion"], "trainingInputMapping": manifest.get("trainingInputMapping", {}), "job": manifest["job"], "frame": frame}
+                packed_frame = {**frame, "files": {k: v for k, v in frame["files"].items() if k in names}, "sha1": {k: v for k, v in frame["sha1"].items() if k in names}}
+                metadata = {"clipId": clip["id"], "split": clip["split"], "map": clip["map"], "sequence": clip["sequence"], "manifestSha256": clip["manifestSha256"], "contractVersion": manifest["contractVersion"], "trainingInputMapping": mapping, "packingProfile": profile, "sourceModalities": sorted(frame["files"]), "job": manifest["job"], "frame": packed_frame}
                 for name, filename in sorted(frame["files"].items()):
                     if not re.fullmatch(r"[A-Za-z0-9_]+", name):
                         raise ValueError(f"Invalid modality name: {name}")
@@ -228,6 +242,8 @@ def pack(index_path, output_dir, samples_per_shard):
                     payload = source.read_bytes()
                     if hashlib.sha1(payload).hexdigest().upper() != frame["sha1"][name].upper():
                         raise ValueError(f"Source image changed before packing: {source}")
+                    if name not in names:
+                        continue
                     info = tarfile.TarInfo(f"{key}.{name}{source.suffix}")
                     info.size = len(payload)
                     writer.addfile(info, io.BytesIO(payload))
@@ -302,6 +318,7 @@ def main():
     packer.add_argument("index", type=Path)
     packer.add_argument("--output", required=True, type=Path)
     packer.add_argument("--samples-per-shard", type=int, default=128)
+    packer.add_argument("--profile", choices=("all", "temporal-sr"), default="all", help="all retains diagnostics/previews; temporal-sr retains HDR training inputs, correspondence masks and all frame metadata")
     checker = commands.add_parser("verify-shards")
     checker.add_argument("catalog", type=Path)
     args = parser.parse_args()
@@ -309,7 +326,7 @@ def main():
         result = build_index(args.plan.resolve(), args.project.resolve(), args.output.resolve(), args.purpose, args.workers, args.reuse_validation_reports)
         print(json.dumps(result["totals"], indent=2))
     elif args.command == "pack":
-        result = pack(args.index.resolve(), args.output.resolve(), args.samples_per_shard)
+        result = pack(args.index.resolve(), args.output.resolve(), args.samples_per_shard, args.profile)
         print(f"Packed {len(result['shards'])} verified shards")
     else:
         count = sum(1 for _ in iter_samples(args.catalog.resolve()))
